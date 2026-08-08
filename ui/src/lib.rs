@@ -9,6 +9,7 @@
 //! bearing. Here it observes a snapshot and emits commands; the proxy runs on its own thread
 //! and never calls into it, so a wedged message loop cannot stop traffic.
 
+pub mod lang;
 pub mod model;
 
 #[cfg(windows)]

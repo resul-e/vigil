@@ -10,6 +10,7 @@ pub mod engage;
 pub mod envproxy;
 pub mod envreg;
 pub mod instance;
+pub mod locale;
 pub mod owner;
 pub mod paths;
 pub mod process;

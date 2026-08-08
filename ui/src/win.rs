@@ -32,7 +32,24 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use vigil_core::calibrate::Cache;
 use vigil_proxy::{Config, Mode as ProxyMode, Server, Stats};
 
+use crate::lang::{t, tf, Lang};
 use crate::model::{self, Command, Snapshot};
+
+/// The language the interface speaks, decided once and then remembered.
+///
+/// Windows' UI language cannot change under a running process, so asking the operating system
+/// on every repaint would be a syscall in the message loop for a constant. `VIGIL_LANG`
+/// overrides it, which is how the other language gets tested without changing Windows' own
+/// settings.
+fn lang() -> Lang {
+    static CHOSEN: std::sync::OnceLock<Lang> = std::sync::OnceLock::new();
+    *CHOSEN.get_or_init(|| {
+        let from_os = vigil_platform::locale::ui_langid()
+            .map(Lang::from_windows_langid)
+            .unwrap_or_default();
+        from_os.override_from_env(vigil_platform::locale::lang_override().as_deref())
+    })
+}
 
 /// The message the tray icon sends us. Anything at or above `WM_APP` is ours to define.
 const WM_TRAY: u32 = WM_APP + 1;
@@ -100,6 +117,7 @@ impl App {
             })
             .unwrap_or_default();
         Snapshot {
+            lang: lang(),
             listen: self.listen.clone(),
             engaged: self.engaged,
             listening: self.serving.load(AtomicOrdering::Relaxed),
@@ -315,7 +333,7 @@ unsafe fn paint_mini(hwnd: HWND) {
             y += line;
         }
         y += model::scale(6, dpi);
-        draw("Sağ tık: menü  ·  Esc: kapat", 0x00707070, y);
+        draw(t(lang(), "window.popup_hint"), 0x00707070, y);
     }
 
     let _ = unsafe { EndPaint(hwnd, &ps) };
@@ -476,7 +494,7 @@ fn apply(cmd: Command) -> bool {
                 None => return true,
             };
             if let Err(e) = vigil_platform::autostart::set(!on, &exe) {
-                message_box(&format!("Windows ile başlatma ayarlanamadı:\n{e}"));
+                message_box(&tf(lang(), "err.autostart", &[("error", &e.to_string())]));
             }
             if let Some(snap) = snapshot_now() {
                 unsafe { refresh_tray(owner, &snap) };
@@ -505,7 +523,7 @@ fn apply(cmd: Command) -> bool {
                         }
                     });
                 }
-                Err(e) => message_box(&format!("DNS ayarlanamadı:\n{e}")),
+                Err(e) => message_box(&tf(lang(), "err.dns", &[("error", &e.to_string())])),
             }
             if let (Some((owner, _, _)), Some(snap)) = (handles(), snapshot_now()) {
                 unsafe { refresh_tray(owner, &snap) };
@@ -523,7 +541,7 @@ fn apply(cmd: Command) -> bool {
             // and `model::tests::every_offered_mode_parses_and_round_trips` exists so it
             // cannot. Saying so beats silently doing nothing if that test is ever weakened.
             let Some(want) = want else {
-                message_box(&format!("Bu mod tanınmadı: {m}"));
+                message_box(&tf(lang(), "err.unknown_mode", &[("mode", &m.to_string())]));
                 return true;
             };
             with_app(|a| a.server.set_mode(want));
@@ -899,8 +917,10 @@ pub fn run() {
     let listener = match server.bind() {
         Ok(l) => l,
         Err(e) => {
-            message_box(&format!(
-                "vigil {listen} adresini dinleyemedi:\n{e}\n\nBaşka bir vigil çalışıyor olabilir."
+            message_box(&tf(
+                lang(),
+                "err.listen",
+                &[("listen", listen), ("error", &e.to_string())],
             ));
             // Returning *here* matters more than it looks. The restore at the end of this
             // function would otherwise run in a second copy of the application and disengage
@@ -949,7 +969,7 @@ pub fn run() {
         let class = model::wide("vigil_tray");
         let mini_class = model::wide("vigil_mini");
         let full_class = model::wide("vigil_full");
-        let full_title = model::wide("vigil — ayrıntılar");
+        let full_title = model::wide(t(lang(), "window.details_title"));
 
         RegisterClassW(&WNDCLASSW {
             lpfnWndProc: Some(wndproc),

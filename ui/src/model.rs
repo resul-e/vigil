@@ -7,6 +7,8 @@
 
 use core::fmt;
 
+use crate::lang::{t, tf, Lang};
+
 /// Everything the interface shows, taken from the running proxy in one go.
 ///
 /// A snapshot rather than live references, so the interface can never hold a lock while it
@@ -42,6 +44,10 @@ pub struct Snapshot {
     /// `(host, strategy)` pairs the calibrator has settled on.
     pub learned: Vec<(String, String)>,
     pub exclude_patterns: Vec<String>,
+    /// Which language to say all of it in. Decided once at startup from the operating system
+    /// (`vigil_platform::locale`), carried in the snapshot so every rendering function below
+    /// stays a pure function of its input — including the language.
+    pub lang: Lang,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -53,10 +59,23 @@ pub enum Mode {
     Fixed(String),
 }
 
+impl Mode {
+    /// How the mode is named on screen. `Auto` is a word and gets translated; a strategy spec
+    /// is a strategy spec in every language.
+    pub fn label(&self, lang: Lang) -> String {
+        match self {
+            Mode::Auto => t(lang, "mode.auto").to_string(),
+            Mode::Fixed(s) => s.clone(),
+        }
+    }
+}
+
 impl fmt::Display for Mode {
+    /// The machine-readable form, used in logs and by the command line. Never shown in the
+    /// interface — that is [`Mode::label`], which knows what language the user reads.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Mode::Auto => f.write_str("otomatik"),
+            Mode::Auto => f.write_str("auto"),
             Mode::Fixed(s) => f.write_str(s),
         }
     }
@@ -83,11 +102,11 @@ impl Health {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            Health::Protecting => "Koruma açık",
-            Health::Idle => "Kapalı",
-            Health::Stranded => "SORUN: sistem proxy'si bize bakıyor ama dinlemiyoruz",
+            Health::Protecting => t(lang, "health.protecting"),
+            Health::Idle => t(lang, "health.idle"),
+            Health::Stranded => t(lang, "health.stranded"),
         }
     }
 }
@@ -126,14 +145,11 @@ pub enum Command {
 /// last entry turns the transform off without stopping the proxy, which is what tells a user
 /// whether vigil is the thing breaking a site.
 pub const MODES: &[(&str, Option<&str>)] = &[
-    ("Mod: otomatik (öğren)", None),
-    (
-        "Mod: tlsrec:64+split:1 (varsayılan)",
-        Some("tlsrec:64+split:1"),
-    ),
-    ("Mod: split:1 (Türk Telekom)", Some("split:1")),
-    ("Mod: tlsrec:64 (Superonline)", Some("tlsrec:64")),
-    ("Mod: dokunma (düz aktarım)", Some("none")),
+    ("menu.mode_auto", None),
+    ("menu.mode_default", Some("tlsrec:64+split:1")),
+    ("menu.mode_split", Some("split:1")),
+    ("menu.mode_tlsrec", Some("tlsrec:64")),
+    ("menu.mode_passthrough", Some("none")),
 ];
 
 /// The mode an entry of [`MODES`] means.
@@ -204,9 +220,9 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
             ..MenuItem::item(
                 id::TOGGLE,
                 if s.engaged {
-                    "Korumayı kapat"
+                    t(s.lang, "menu.protect_off")
                 } else {
-                    "Korumayı aç"
+                    t(s.lang, "menu.protect_on")
                 },
                 // Engaging is pointless when nothing is listening, and would be the very act
                 // that strands the machine.
@@ -214,8 +230,8 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
             )
         },
         MenuItem::sep(),
-        MenuItem::item(id::MINI, "Durum", true),
-        MenuItem::item(id::FULL, "Ayrıntılar…", true),
+        MenuItem::item(id::MINI, t(s.lang, "section.status"), true),
+        MenuItem::item(id::FULL, t(s.lang, "menu.details"), true),
         MenuItem::sep(),
     ]
     .into_iter()
@@ -223,13 +239,13 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
     // that says what the proxy is doing is the same place that changes it.
     .chain(MODES.iter().enumerate().map(|(i, (label, _))| MenuItem {
         checked: mode_at(i).as_ref() == Some(&s.mode),
-        ..MenuItem::item(id::MODE_BASE + i as u16, *label, true)
+        ..MenuItem::item(id::MODE_BASE + i as u16, t(s.lang, label), true)
     }))
     .chain([
         MenuItem::sep(),
         MenuItem {
             checked: s.autostart,
-            ..MenuItem::item(id::AUTOSTART, "Windows ile başlat", true)
+            ..MenuItem::item(id::AUTOSTART, t(s.lang, "menu.autostart"), true)
         },
         // Offered only when we are actually answering DNS. Pointing the machine at a resolver
         // that is not listening is the one change here that takes *all* name resolution down,
@@ -239,9 +255,9 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
             ..MenuItem::item(
                 id::SYSDNS,
                 if s.dns_engaged {
-                    "DNS'i vigil'e verme (geri al)"
+                    t(s.lang, "menu.dns_take_back")
                 } else {
-                    "DNS'i de vigil'e ver (yönetici sorar)"
+                    t(s.lang, "menu.dns_give")
                 },
                 s.dns_serving,
             )
@@ -251,11 +267,11 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
         // settings vigil never touched.
         MenuItem::item(
             id::REPAIR,
-            "Proxy ayarlarını onar",
+            t(s.lang, "menu.repair"),
             health == Health::Stranded,
         ),
         MenuItem::sep(),
-        MenuItem::item(id::QUIT, "Çıkış", true),
+        MenuItem::item(id::QUIT, t(s.lang, "menu.quit"), true),
     ])
     .collect()
 }
@@ -299,11 +315,16 @@ fn clip(s: &str, max: usize) -> String {
 
 pub fn tooltip(s: &Snapshot) -> String {
     let body = match Health::of(s) {
-        Health::Stranded => format!("vigil — {}", Health::Stranded.label()),
-        Health::Idle => format!("vigil — kapalı ({})", s.listen),
-        Health::Protecting => format!(
-            "vigil — açık, {} · {} bağlantı, {} dönüştürüldü",
-            s.mode, s.accepted, s.transformed
+        Health::Stranded => format!("vigil — {}", Health::Stranded.label(s.lang)),
+        Health::Idle => tf(s.lang, "tooltip.off", &[("listen", &s.listen)]),
+        Health::Protecting => tf(
+            s.lang,
+            "tooltip.on",
+            &[
+                ("strategy", &s.mode.label(s.lang)),
+                ("connections", &s.accepted.to_string()),
+                ("transformed", &s.transformed.to_string()),
+            ],
         ),
     };
     clip(&body, TOOLTIP_MAX)
@@ -312,37 +333,66 @@ pub fn tooltip(s: &Snapshot) -> String {
 /// The one-line summary at the top of both windows.
 pub fn status_line(s: &Snapshot) -> String {
     match Health::of(s) {
-        Health::Stranded => Health::Stranded.label().to_string(),
-        Health::Idle => format!("Kapalı — {} dinleniyor", s.listen),
-        Health::Protecting => format!("Koruma açık — {} · strateji: {}", s.listen, s.mode),
+        Health::Stranded => Health::Stranded.label(s.lang).to_string(),
+        Health::Idle => tf(s.lang, "status.off", &[("listen", &s.listen)]),
+        Health::Protecting => tf(
+            s.lang,
+            "status.on",
+            &[("listen", &s.listen), ("strategy", &s.mode.label(s.lang))],
+        ),
     }
 }
 
 /// Label, value. What the mini window shows.
 pub fn counters(s: &Snapshot) -> Vec<(String, String)> {
     vec![
-        ("Bağlantı".into(), s.accepted.to_string()),
-        ("Dönüştürülen".into(), s.transformed.to_string()),
-        ("Öğrenilen site".into(), s.learned.len().to_string()),
+        (
+            t(s.lang, "section.connection").into(),
+            s.accepted.to_string(),
+        ),
+        (
+            t(s.lang, "counter.transformed").into(),
+            s.transformed.to_string(),
+        ),
+        (
+            t(s.lang, "section.learned_host").into(),
+            s.learned.len().to_string(),
+        ),
     ]
 }
 
 /// The fuller breakdown, for the details window. Anything that is zero and uninteresting is
 /// still shown, because a counter that vanishes when it is zero is a counter nobody trusts.
 pub fn detail_counters(s: &Snapshot) -> Vec<(String, String)> {
+    let l = s.lang;
     vec![
-        ("Kabul edilen".into(), s.accepted.to_string()),
-        ("Tamamlanan".into(), s.completed.to_string()),
-        ("Dönüştürülen".into(), s.transformed.to_string()),
-        ("Dokunulmayan (liste dışı)".into(), s.excluded.to_string()),
-        ("SOCKS5".into(), s.by_socks5.to_string()),
-        ("SOCKS4".into(), s.by_socks4.to_string()),
-        ("HTTP CONNECT".into(), s.by_http_connect.to_string()),
-        ("El sıkışma hatası".into(), s.handshake_errors.to_string()),
-        ("Bağlantı hatası".into(), s.upstream_errors.to_string()),
-        ("DNS başarısız".into(), s.dns_failures.to_string()),
+        (t(l, "counter.accepted").into(), s.accepted.to_string()),
+        (t(l, "counter.completed").into(), s.completed.to_string()),
         (
-            "Tekrar gönderilen".into(),
+            t(l, "counter.transformed").into(),
+            s.transformed.to_string(),
+        ),
+        (t(l, "counter.untouched").into(), s.excluded.to_string()),
+        (t(l, "counter.socks5").into(), s.by_socks5.to_string()),
+        (t(l, "counter.socks4").into(), s.by_socks4.to_string()),
+        (
+            t(l, "counter.http_connect").into(),
+            s.by_http_connect.to_string(),
+        ),
+        (
+            t(l, "counter.handshake_errors").into(),
+            s.handshake_errors.to_string(),
+        ),
+        (
+            t(l, "counter.upstream_errors").into(),
+            s.upstream_errors.to_string(),
+        ),
+        (
+            t(l, "counter.dns_failures").into(),
+            s.dns_failures.to_string(),
+        ),
+        (
+            t(l, "counter.retries").into(),
             s.first_flight_retries.to_string(),
         ),
     ]
@@ -551,25 +601,29 @@ fn reading(text: impl Into<String>) -> Row {
 /// way to understand why the menu item is available.
 pub fn dns_line(s: &Snapshot) -> &'static str {
     match (s.dns_serving, s.dns_engaged) {
-        (false, _) => "kapalı",
-        (true, false) => "hazır — sistem henüz kullanmıyor",
-        (true, true) => "sistem vigil'i kullanıyor",
+        (false, _) => t(s.lang, "dns.off"),
+        (true, false) => t(s.lang, "dns.ready_unused"),
+        (true, true) => t(s.lang, "dns.in_use"),
     }
 }
 
 pub fn full_view(s: &Snapshot) -> Vec<Section> {
     let mut out = vec![
         Section {
-            title: "Durum".into(),
+            title: t(s.lang, "section.status").into(),
             rows: vec![
                 reading(status_line(s)),
-                reading(format!("Adres: {}", s.listen)),
-                reading(format!("Strateji: {}", s.mode)),
-                reading(format!("DNS: {}", dns_line(s))),
+                reading(tf(s.lang, "line.address", &[("listen", &s.listen)])),
+                reading(tf(
+                    s.lang,
+                    "line.strategy",
+                    &[("strategy", &s.mode.label(s.lang))],
+                )),
+                reading(tf(s.lang, "line.dns", &[("state", dns_line(s))])),
             ],
         },
         Section {
-            title: "Sayaçlar".into(),
+            title: t(s.lang, "section.counters").into(),
             rows: detail_counters(s)
                 .into_iter()
                 .map(|(k, v)| reading(format!("{k}: {v}")))
@@ -587,22 +641,22 @@ pub fn full_view(s: &Snapshot) -> Vec<Section> {
         .collect();
     if learned.is_empty() {
         // A section that vanishes when empty makes a user wonder whether it ever existed.
-        learned.push(reading("(henüz bir şey öğrenilmedi)"));
+        learned.push(reading(t(s.lang, "placeholder.nothing_learned")));
     } else {
         learned.push(Row {
-            text: "Hepsini unut".into(),
+            text: t(s.lang, "menu.forget_all").into(),
             action: Some(Command::ForgetAll),
         });
     }
     out.push(Section {
-        title: "Öğrenilen stratejiler  (tıkla: unut)".into(),
+        title: t(s.lang, "section.learned").into(),
         rows: learned,
     });
 
     out.push(Section {
-        title: "Hiç dokunulmayan alan adları".into(),
+        title: t(s.lang, "section.excluded").into(),
         rows: if s.exclude_patterns.is_empty() {
-            vec![reading("(liste boş)")]
+            vec![reading(t(s.lang, "placeholder.list_empty"))]
         } else {
             s.exclude_patterns.iter().map(reading).collect()
         },
@@ -688,6 +742,14 @@ pub fn clamp_scroll(offset: i32, content: i32, view: i32) -> i32 {
 mod tests {
     use super::*;
 
+    /// The same snapshot in a chosen language. Text assertions below say which language they
+    /// are about rather than depending on whatever `Default` happens to be — and most of them
+    /// run in both, because the bug this guards against is a string that was only wired up in
+    /// one.
+    fn snap_in(lang: Lang) -> Snapshot {
+        Snapshot { lang, ..snap() }
+    }
+
     fn snap() -> Snapshot {
         Snapshot {
             listen: "127.0.0.1:1080".into(),
@@ -731,7 +793,10 @@ mod tests {
         };
         assert_eq!(Health::of(&s), Health::Stranded);
         assert_ne!(Health::of(&s), Health::Idle);
-        assert!(status_line(&s).contains("SORUN"));
+        for lang in [Lang::Turkish, Lang::English] {
+            let s = Snapshot { lang, ..s.clone() };
+            assert_eq!(status_line(&s), t(lang, "health.stranded"));
+        }
     }
 
     /// A listener that is down while nothing points at us is not an emergency.
@@ -749,18 +814,20 @@ mod tests {
 
     #[test]
     fn the_menu_offers_the_opposite_of_the_current_state() {
-        let on = context_menu(&snap());
-        let toggle = on.iter().find(|i| i.id == id::TOGGLE).unwrap();
-        assert_eq!(toggle.label, "Korumayı kapat");
-        assert!(toggle.checked);
+        for lang in [Lang::Turkish, Lang::English] {
+            let on = context_menu(&snap_in(lang));
+            let toggle = on.iter().find(|i| i.id == id::TOGGLE).unwrap();
+            assert_eq!(toggle.label, t(lang, "menu.protect_off"));
+            assert!(toggle.checked);
 
-        let off = context_menu(&Snapshot {
-            engaged: false,
-            ..snap()
-        });
-        let toggle = off.iter().find(|i| i.id == id::TOGGLE).unwrap();
-        assert_eq!(toggle.label, "Korumayı aç");
-        assert!(!toggle.checked);
+            let off = context_menu(&Snapshot {
+                engaged: false,
+                ..snap_in(lang)
+            });
+            let toggle = off.iter().find(|i| i.id == id::TOGGLE).unwrap();
+            assert_eq!(toggle.label, t(lang, "menu.protect_on"));
+            assert!(!toggle.checked);
+        }
     }
 
     /// Engaging while nothing is listening is the act that strands a machine. The menu must
@@ -981,37 +1048,50 @@ mod tests {
 
     #[test]
     fn the_tooltip_says_what_state_it_is_in() {
-        assert!(tooltip(&snap()).contains("açık"));
-        assert!(tooltip(&Snapshot {
-            engaged: false,
-            ..snap()
-        })
-        .contains("kapalı"));
-        assert!(tooltip(&Snapshot {
-            listening: false,
-            ..snap()
-        })
-        .contains("SORUN"));
+        for (lang, on, off, bad) in [
+            (Lang::Turkish, "açık", "kapalı", "SORUN"),
+            (Lang::English, " on,", "off", "PROBLEM"),
+        ] {
+            assert!(tooltip(&snap_in(lang)).contains(on), "{lang:?}");
+            assert!(
+                tooltip(&Snapshot {
+                    engaged: false,
+                    ..snap_in(lang)
+                })
+                .contains(off),
+                "{lang:?}"
+            );
+            assert!(
+                tooltip(&Snapshot {
+                    listening: false,
+                    ..snap_in(lang)
+                })
+                .contains(bad),
+                "{lang:?}"
+            );
+        }
     }
 
     /// Windows silently truncates a tooltip at 128 characters. Ours must fit whatever it is
     /// handed, including an absurd strategy string.
     #[test]
     fn the_tooltip_always_fits_what_windows_will_show() {
-        let s = Snapshot {
-            mode: Mode::Fixed("x".repeat(500)),
-            accepted: usize::MAX,
-            transformed: usize::MAX,
-            listen: "y".repeat(200),
-            ..snap()
-        };
-        let t = tooltip(&s);
-        assert!(
-            t.chars().count() <= TOOLTIP_MAX,
-            "{} chars is longer than Windows will show",
-            t.chars().count()
-        );
-        assert!(t.ends_with('…'), "truncation should be visible: {t}");
+        for lang in [Lang::Turkish, Lang::English] {
+            let s = Snapshot {
+                mode: Mode::Fixed("x".repeat(500)),
+                accepted: usize::MAX,
+                transformed: usize::MAX,
+                listen: "y".repeat(200),
+                ..snap_in(lang)
+            };
+            let tip = tooltip(&s);
+            assert!(
+                tip.chars().count() <= TOOLTIP_MAX,
+                "{lang:?}: {} chars is longer than Windows will show",
+                tip.chars().count()
+            );
+            assert!(tip.ends_with('…'), "truncation should be visible: {tip}");
+        }
     }
 
     #[test]
@@ -1078,7 +1158,7 @@ mod tests {
             .find(|m| m.id == id::SYSDNS)
             .expect("item");
         assert!(item.enabled);
-        assert!(item.label.contains("ver"), "{}", item.label);
+        assert_eq!(item.label, t(s.lang, "menu.dns_give"));
 
         s.dns_engaged = true;
         let item = context_menu(&s)
@@ -1089,7 +1169,7 @@ mod tests {
             item.checked,
             "the tick is the only thing that says it is on"
         );
-        assert!(item.label.contains("geri al"), "{}", item.label);
+        assert_eq!(item.label, t(s.lang, "menu.dns_take_back"));
     }
 
     #[test]
@@ -1105,14 +1185,29 @@ mod tests {
     /// tell a resolver that is ready from one that is not running.
     #[test]
     fn the_dns_line_distinguishes_ready_from_off_and_from_in_use() {
-        let mut s = snap();
+        let mut s = snap_in(Lang::Turkish);
         s.dns_serving = false;
         s.dns_engaged = false;
-        assert_eq!(dns_line(&s), "kapalı");
+        assert_eq!(dns_line(&s), t(Lang::Turkish, "dns.off"));
         s.dns_serving = true;
-        assert!(dns_line(&s).contains("hazır"));
+        assert_eq!(dns_line(&s), t(Lang::Turkish, "dns.ready_unused"));
         s.dns_engaged = true;
-        assert!(dns_line(&s).contains("kullanıyor"));
+        assert_eq!(dns_line(&s), t(Lang::Turkish, "dns.in_use"));
+        // The three states must be three distinct phrases in English too, or the distinction
+        // exists only for Turkish readers.
+        let en: Vec<&str> = [(false, false), (true, false), (true, true)]
+            .iter()
+            .map(|(serving, engaged)| {
+                dns_line(&Snapshot {
+                    dns_serving: *serving,
+                    dns_engaged: *engaged,
+                    ..snap_in(Lang::English)
+                })
+            })
+            .collect();
+        assert_eq!(en.len(), 3);
+        assert_ne!(en[0], en[1]);
+        assert_ne!(en[1], en[2]);
 
         // and it reaches the window
         let text: String = full_view(&s)[0]
@@ -1379,11 +1474,15 @@ mod tests {
 
     #[test]
     fn the_full_view_shows_every_section() {
-        let v = full_view(&snap());
-        let titles: Vec<&str> = v.iter().map(|s| s.title.as_str()).collect();
-        assert_eq!(titles.len(), 4);
-        assert!(titles[0].starts_with("Durum"));
-        assert!(titles[2].contains("Öğrenilen"));
+        for lang in [Lang::Turkish, Lang::English] {
+            let v = full_view(&snap_in(lang));
+            let titles: Vec<&str> = v.iter().map(|s| s.title.as_str()).collect();
+            assert_eq!(titles.len(), 4, "{lang:?}");
+            assert_eq!(titles[0], t(lang, "section.status"));
+            assert_eq!(titles[1], t(lang, "section.counters"));
+            assert_eq!(titles[2], t(lang, "section.learned"));
+            assert_eq!(titles[3], t(lang, "section.excluded"));
+        }
     }
 
     #[test]
@@ -1419,15 +1518,20 @@ mod tests {
     /// A section that disappears when empty makes a user wonder whether it ever existed.
     #[test]
     fn empty_sections_say_so_rather_than_vanishing() {
-        let v = full_view(&Snapshot::default());
-        assert_eq!(v.len(), 4);
-        assert!(!v[2].rows.is_empty());
-        assert!(v[2].rows[0].text.contains("henüz"));
-        assert_eq!(
-            v[2].rows[0].action, None,
-            "the placeholder must not be clickable"
-        );
-        assert!(v[3].rows[0].text.contains("boş"));
+        for lang in [Lang::Turkish, Lang::English] {
+            let v = full_view(&Snapshot {
+                lang,
+                ..Default::default()
+            });
+            assert_eq!(v.len(), 4);
+            assert!(!v[2].rows.is_empty());
+            assert_eq!(v[2].rows[0].text, t(lang, "placeholder.nothing_learned"));
+            assert_eq!(
+                v[2].rows[0].action, None,
+                "the placeholder must not be clickable"
+            );
+            assert_eq!(v[3].rows[0].text, t(lang, "placeholder.list_empty"));
+        }
     }
 
     /// With nothing learned there is nothing to forget, so the button must not be offered.

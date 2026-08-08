@@ -84,6 +84,11 @@ Turkcell Superonline (AS34984)     doğrudan     vigil'den
 
 Hız, doğrudan bağlantıyla aynı seviyede: **80.8 MB/s** (vigil) — **78.2 MB/s** (doğrudan).
 
+### 🌍 Dil
+
+Arayüz **Windows'un dilini** takip eder: sistem Türkçeyse Türkçe, **başka herhangi bir dilse
+İngilizce.** Ayar ekranı yok, seçim yok. Zorlamak istersen `VIGIL_LANG=tr` veya `VIGIL_LANG=en`.
+
 ### 🖱️ Menüde ne var?
 
 | | |
@@ -93,6 +98,7 @@ Hız, doğrudan bağlantıyla aynı seviyede: **80.8 MB/s** (vigil) — **78.2 M
 | **DNS'i de vigil'e ver** | Yönetici izni sorar. Proxy ayarını okumayan programlar için |
 | **Windows ile başlat** | İsteğe bağlı |
 | **Ayrıntılar…** | Sayaçlar ve her site için öğrenilmiş yöntem |
+| **Proxy ayarlarını onar** | Sadece onarılacak bir şey varken tıklanabilir |
 
 ### 🌐 DNS
 
@@ -154,7 +160,7 @@ files; delete it and nothing is left behind.
    * `vigil.exe` — the same engine on the command line
    * `vigil-repair.exe` — **the emergency tool**
 4. **Run** `vigil-app.exe`. A shield icon appears in the system tray.
-5. **Turn it on:** right-click the icon → **"Korumayı aç"** (turn protection on).
+5. **Turn it on:** right-click the icon → **"Turn protection on"**.
 
 > **⚠️ Do not delete `vigil-repair.exe`.** If the program is killed rather than closed, Windows may
 > still point at a proxy that is no longer running and it will look like your internet is gone.
@@ -212,15 +218,22 @@ Turkcell Superonline (AS34984)       direct      via vigil
 Throughput is at parity with a direct connection: **80.8 MB/s** through vigil, **78.2 MB/s**
 direct.
 
+### 🌍 Language
+
+The interface follows **Windows' own UI language**: Turkish if the system is Turkish, **English
+for anything else.** No settings screen, no picker. Force it with `VIGIL_LANG=tr` or
+`VIGIL_LANG=en` if you want the other one.
+
 ### 🖱️ The tray menu
 
 | | |
 |---|---|
-| **Korumayı aç / kapat** | System proxy + `HTTPS_PROXY` |
-| **Mod** | automatic *(recommended)* · `tlsrec:64+split:1` · `split:1` · `tlsrec:64` · passthrough |
-| **DNS'i de vigil'e ver** | Asks for administrator rights. For programs that ignore the proxy |
-| **Windows ile başlat** | Optional |
-| **Ayrıntılar…** | Counters, and the strategy learned for each host |
+| **Turn protection on / off** | System proxy + `HTTPS_PROXY` |
+| **Mode** | automatic *(recommended)* · `tlsrec:64+split:1` · `split:1` · `tlsrec:64` · passthrough |
+| **Use vigil for DNS too** | Asks for administrator rights. For programs that ignore the proxy |
+| **Start with Windows** | Optional |
+| **Details…** | Counters, and the strategy learned for each host |
+| **Repair proxy settings** | Offered only when there is something to repair |
 
 ### 🌐 DNS
 
@@ -228,7 +241,7 @@ On some lines the ISP resolves blocked names to the **wrong address** (measured:
 `195.175.254.2`, the block page). vigil uses its own resolver, so anything going through the proxy
 is unaffected.
 
-The **"DNS'i de vigil'e ver"** option fixes it for programs that never use the proxy either. It is
+The **"Use vigil for DNS too"** option fixes it for programs that never use the proxy either. It is
 the one action that needs administrator rights, because it writes to a Windows network setting. It
 restores on exit and always writes a public fallback (`9.9.9.9`) behind itself, so a stopped vigil
 still leaves the machine resolving names.
