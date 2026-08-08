@@ -307,6 +307,13 @@ fn now_secs() -> u64 {
 /// Deliberately over plain HTTP and deliberately without the `query` field, so the answer we
 /// record is the network's identity and never the address it was learned from. Failure is not
 /// an error: the scan is still worth running, the report just says "unknown".
+/// Which ISP this is, and nothing more.
+///
+/// **Not the city, and not the district.** It asked for `city` until 2026-08-08 and put the
+/// answer in the report header, so a volunteer's report read `Kadıköy / SUPERONLINE / AS34984`
+/// — a district, an ISP and a timestamp, in a file whose own header promises "no personal
+/// data", written to be forwarded to somebody else. The ASN and the ISP name are what every
+/// measurement in this project actually uses; the city was never read by anything.
 fn network_identity() -> String {
     let Ok(addrs) = resolve("ip-api.com", 80) else {
         return "unknown".into();
@@ -320,7 +327,7 @@ fn network_identity() -> String {
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     use std::io::{Read, Write};
     if s.write_all(
-        b"GET /line/?fields=as,isp,city HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n",
+        b"GET /line/?fields=as,isp HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n",
     )
     .is_err()
     {
