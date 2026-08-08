@@ -1,0 +1,13 @@
+[package]
+name = "probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vigil-core = { path = "../core" }
+vigil-proxy = { path = "../proxy" }
+rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true

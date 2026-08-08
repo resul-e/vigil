@@ -1,0 +1,19 @@
+[package]
+name = "vigil-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vigil"
+path = "src/main.rs"
+
+[lib]
+name = "vigil_proxy"
+path = "src/lib.rs"
+
+[dependencies]
+vigil-core = { path = "../core" }
+# Pure on Linux (the registry calls are cfg(windows) stubs), so the proxy still tests in WSL.
+vigil-platform = { path = "../platform" }

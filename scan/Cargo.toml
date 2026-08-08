@@ -1,0 +1,22 @@
+[package]
+name = "vigil-scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Handed to someone else to run on their own machine, so it stays small and readable. It is
+# no longer *inert*, and pretending otherwise would be the dishonest option: the second half
+# starts the proxy and engages the system's proxy settings, because "does this actually fix
+# the machine" cannot be answered without doing that. `--no-apps` gets the inert half alone.
+[dependencies]
+vigil-core = { path = "../core" }
+vigil-proxy = { path = "../proxy" }
+vigil-platform = { path = "../platform" }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[[bin]]
+name = "vigil-scan"
+path = "src/main.rs"

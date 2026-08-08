@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["core", "platform", "probe", "proxy", "scan", "ui"]
+
+[workspace.package]
+# One version for the whole workspace, so every binary and every report names the same build.
+# It was not here until 2026-08-08, and the cost was measured: a volunteer re-sent a report
+# from a superseded build and neither the tool nor the report could tell the two apart.
+version = "0.6.3"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT"
+
+[workspace.dependencies]
+rustls = "0.23"
+rustls-pki-types = "1"
+webpki-roots = "1"
+
+[profile.release]
+opt-level = 2

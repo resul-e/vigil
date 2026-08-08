@@ -1,0 +1,22 @@
+# Rust
+target/
+**/target/
+Cargo.lock.bak
+
+# Archive: text records are tracked, large blobs are not.
+# They live on disk only — see archive/RESTORE.md.
+archive/binaries/
+archive/*.tar.gz
+archive/*.tar.gz.sha256
+
+# Local tooling / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code local overrides (permissions are machine-specific)
+.claude/settings.local.json
+
+# Windows cross-build output
+target/x86_64-pc-windows-msvc/

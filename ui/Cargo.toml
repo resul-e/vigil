@@ -1,0 +1,33 @@
+[package]
+name = "vigil-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The model layer is pure and has no dependencies, so it builds and tests on Linux like the
+# rest of the project. Only the Win32 shell is platform-bound, and only on Windows.
+[dependencies]
+vigil-core = { path = "../core" }
+vigil-proxy = { path = "../proxy" }
+vigil-platform = { path = "../platform" }
+
+# Only the shell needs Windows, and only on Windows. `model` stays pure so the whole crate
+# still builds and tests on Linux, which is where the fast loop runs.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lib]
+name = "vigil_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vigil-app"
+path = "src/bin/app.rs"

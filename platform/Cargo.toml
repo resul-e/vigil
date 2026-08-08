@@ -1,0 +1,25 @@
+[package]
+name = "vigil-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Pure decision logic, so it builds and tests on Linux. The Windows-only calls live behind
+# cfg(windows) and are deliberately thin.
+[dependencies]
+
+# Only Windows needs registry access; Linux builds and tests stay dependency-free so the
+# fast loop keeps running in WSL.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+# Two calls' worth: broadcasting WM_SETTINGCHANGE so a newly set environment variable reaches
+# processes the user starts next. `ui` already depends on the same crate and version.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[bin]]
+name = "vigil-repair"
+path = "src/bin/repair.rs"

@@ -1,0 +1,10 @@
+[package]
+name = "vigil-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Deliberately dependency-free and OS-agnostic: this crate must compile and test
+# natively on Linux so the fast loop runs in WSL. See CLAUDE.md.
+[dependencies]

@@ -1,0 +1,6 @@
+# Windows binaries are handed to people who did not build them, so they must not depend on a
+# Visual C++ Redistributable being installed. Without this the exe imports VCRUNTIME140.dll
+# and a clean Windows refuses to start it at all — which, for a tool a favour-doing friend
+# runs once, is the whole experiment lost to a dialog box.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
