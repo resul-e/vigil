@@ -115,6 +115,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -290,7 +296,12 @@ dependencies = [
 name = "vigil-update"
 version = "0.6.3"
 dependencies = [
+ "minisign-verify",
+ "rustls",
+ "rustls-pki-types",
  "vigil-core",
+ "vigil-proxy",
+ "webpki-roots",
 ]
 
 [[package]]
