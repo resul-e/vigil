@@ -16,6 +16,7 @@ pub mod clienthello;
 pub mod dnsmsg;
 pub mod hostlist;
 pub mod reader;
+pub mod sha256;
 pub mod split;
 pub mod strategy;
 pub mod synth;

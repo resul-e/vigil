@@ -398,3 +398,49 @@ fn record_lengths(b: &[u8]) -> Vec<usize> {
 fn record_count(b: &[u8]) -> usize {
     record_lengths(b).len()
 }
+
+/// The cross-check that matters for `sha256`: real files, and digests that came from
+/// `sha256sum` rather than from this implementation.
+///
+/// The published NIST vectors are in the module's own tests and cover the algorithm. This covers
+/// the thing the algorithm is *for*: hashing a file off disk, in chunks, and getting the same
+/// answer as the tool everybody else uses. It was also verified once by hand against all six
+/// release binaries — 730 KB to 2.8 MB, byte-identical on every one — but those live under
+/// `target/` and cannot be a test. Fixtures can.
+#[test]
+fn hashing_a_real_file_agrees_with_sha256sum() {
+    use vigil_core::sha256::{hex, Sha256};
+
+    let expected: &[(&str, &str)] = &[
+        (
+            "chrome__discord.com",
+            "8bf082bcd940bff733f10a3bc1bcb69efc339d61df6026d1ab2bee8a9dfa998b",
+        ),
+        (
+            "discord-updater__updates.discord.com",
+            "07f03bef7625960c57d1759a7cf772619c79d71482cdcd05ee7d53478c0ac834",
+        ),
+        (
+            "curl__discord.com",
+            "930fa1a11b0edccf8e6b76397e3bf79a1516ea652a62bfeffe9d53ba9fc0f779",
+        ),
+    ];
+    let fx = fixtures();
+    for (name, want) in expected {
+        let (_, bytes) = fx
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("fixture {name} is missing"));
+
+        // In one call, and again in awkward chunks, because the update path has three branches
+        // and a release will hash a 2.5 MB file in 64 KB pieces.
+        assert_eq!(&hex(&vigil_core::sha256::hash(bytes)), want, "{name}");
+        for chunk in [1usize, 7, 64, 65, 1024] {
+            let mut s = Sha256::new();
+            for part in bytes.chunks(chunk) {
+                s.update(part);
+            }
+            assert_eq!(&hex(&s.finish()), want, "{name} in {chunk}-byte chunks");
+        }
+    }
+}
