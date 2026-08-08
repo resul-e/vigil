@@ -26,6 +26,40 @@ pub fn ui_langid() -> Option<u16> {
     imp::ui_langid()
 }
 
+/// Where the chosen language is remembered, beside the strategy cache and the settings
+/// snapshots. One file, one line, `tr` or `en`.
+pub fn lang_file() -> Option<std::path::PathBuf> {
+    crate::paths::state_dir().map(|d| d.join("lang.txt"))
+}
+
+/// The language the user picked from the menu, if they ever picked one.
+///
+/// Persisted on purpose, and worth saying why given that the *mode* deliberately is not: a mode
+/// like passthrough is a diagnostic, and a diagnostic that quietly survives a reboot is a trap.
+/// A language is not a diagnostic — it is the language the person reads, and asking them to
+/// choose it again on every launch would be the bug.
+pub fn saved_lang() -> Option<String> {
+    let p = lang_file()?;
+    let s = std::fs::read_to_string(p).ok()?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Remember the chosen language. Best effort: failing to write a preference must never take the
+/// interface down, and the worst case is that the next launch follows the system again.
+pub fn save_lang(tag: &str) -> std::io::Result<()> {
+    let Some(p) = lang_file() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no state directory",
+        ));
+    };
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(p, tag)
+}
+
 /// The `VIGIL_LANG` value, if the user set one.
 pub fn lang_override() -> Option<String> {
     std::env::var(LANG_ENV)
@@ -73,5 +107,38 @@ mod tests {
     #[test]
     fn off_windows_it_declines_rather_than_guessing() {
         assert_eq!(ui_langid(), None);
+    }
+
+    /// A real round trip through a real file, in a temporary state directory.
+    ///
+    /// The parse rule matters — a blank or half-written file is not a choice — but so does the
+    /// part no unit test of a closure can reach: that the directory is created, that the write
+    /// lands, and that reading it back gives the same tag.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_saved_language_survives_a_round_trip_and_blank_is_not_a_choice() {
+        let dir = std::env::temp_dir().join(format!("vigil-locale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        assert_eq!(saved_lang(), None, "nothing saved yet");
+        save_lang("tr").expect("write");
+        assert_eq!(saved_lang().as_deref(), Some("tr"));
+        save_lang("en").expect("overwrite");
+        assert_eq!(saved_lang().as_deref(), Some("en"));
+
+        // What a half-written file looks like.
+        let f = lang_file().expect("path");
+        std::fs::write(&f, "  \n").expect("write blank");
+        assert_eq!(saved_lang(), None, "blank must not count as a choice");
+        std::fs::write(&f, " tr \n").expect("write padded");
+        assert_eq!(
+            saved_lang().as_deref(),
+            Some("tr"),
+            "surrounding space is not part of it"
+        );
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

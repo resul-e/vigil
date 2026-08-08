@@ -117,6 +117,8 @@ impl Health {
 /// these and hands it back; it never decides what a click does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Read the interface in another language, and remember the choice.
+    SetLang(Lang),
     /// Engage or disengage the system proxy.
     Toggle,
     ShowMini,
@@ -152,6 +154,19 @@ pub const MODES: &[(&str, Option<&str>)] = &[
     ("menu.mode_passthrough", Some("none")),
 ];
 
+/// The languages the menu offers, in order. Ticked like the modes are, because it is the same
+/// kind of choice: one of a short list, and the tick is the only thing that says which.
+///
+/// Each entry is a key and the language it selects. Both labels are written in their **own**
+/// language and never translated — a person looking for English should not have to already read
+/// Turkish to find it, and the reverse.
+pub const LANGS: &[(&str, Lang)] = &[("lang.tr", Lang::Turkish), ("lang.en", Lang::English)];
+
+/// The language an entry of [`LANGS`] means.
+pub fn lang_at(i: usize) -> Option<Lang> {
+    LANGS.get(i).map(|(_, l)| *l)
+}
+
 /// The mode an entry of [`MODES`] means.
 pub fn mode_at(i: usize) -> Option<Mode> {
     MODES.get(i).map(|(_, spec)| match spec {
@@ -171,6 +186,9 @@ pub mod id {
     pub const FORGET_ALL: u16 = 0x105;
     pub const AUTOSTART: u16 = 0x106;
     pub const SYSDNS: u16 = 0x107;
+    /// The language entries, in [`super::LANGS`] order. Between the modes and the learned
+    /// hosts, and like the modes it must stay below `FORGET_BASE`.
+    pub const LANG_BASE: u16 = 0x120;
     /// The mode entries take ids from here upward, in `MODES` order. Deliberately **below**
     /// `FORGET_BASE`: the forget ids are unbounded (one per learned host), so anything placed
     /// above them could collide once enough hosts are learned.
@@ -241,6 +259,10 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
         checked: mode_at(i).as_ref() == Some(&s.mode),
         ..MenuItem::item(id::MODE_BASE + i as u16, t(s.lang, label), true)
     }))
+    .chain(LANGS.iter().enumerate().map(|(i, (key, l))| MenuItem {
+        checked: *l == s.lang,
+        ..MenuItem::item(id::LANG_BASE + i as u16, t(s.lang, key), true)
+    }))
     .chain([
         MenuItem::sep(),
         MenuItem {
@@ -289,6 +311,9 @@ pub fn command_for(id: u16, learned: &[(String, String)]) -> Option<Command> {
         id::SYSDNS => Some(Command::ToggleSystemDns),
         n if n >= id::MODE_BASE && (n as usize) < id::MODE_BASE as usize + MODES.len() => {
             mode_at((n - id::MODE_BASE) as usize).map(Command::SetMode)
+        }
+        n if n >= id::LANG_BASE && (n as usize) < id::LANG_BASE as usize + LANGS.len() => {
+            lang_at((n - id::LANG_BASE) as usize).map(Command::SetLang)
         }
         n if n >= id::FORGET_BASE => {
             let i = (n - id::FORGET_BASE) as usize;
@@ -919,6 +944,60 @@ mod tests {
         );
     }
 
+    /// The same promise the modes make: exactly one language is ticked, and it is the one being
+    /// read. Without the tick there is nothing on screen that says which language is in force,
+    /// and a person who cannot read the current one has no way to tell.
+    #[test]
+    fn exactly_one_language_is_ticked_and_it_is_the_current_one() {
+        for want in [Lang::Turkish, Lang::English] {
+            let menu = context_menu(&snap_in(want));
+            let on: Vec<u16> = menu
+                .iter()
+                .filter(|m| {
+                    m.checked
+                        && m.id >= id::LANG_BASE
+                        && (m.id as usize) < id::LANG_BASE as usize + LANGS.len()
+                })
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(on.len(), 1, "{want:?}");
+            assert_eq!(command_for(on[0], &[]), Some(Command::SetLang(want)));
+        }
+    }
+
+    /// Both languages are named in their own language, always. Somebody looking for English must
+    /// not have to read Turkish to find it, and the reverse.
+    #[test]
+    fn each_language_is_named_in_its_own_language() {
+        for reading in [Lang::Turkish, Lang::English] {
+            let menu = context_menu(&snap_in(reading));
+            let labels: Vec<&str> = menu
+                .iter()
+                .filter(|m| {
+                    m.id >= id::LANG_BASE && (m.id as usize) < id::LANG_BASE as usize + LANGS.len()
+                })
+                .map(|m| m.label.as_str())
+                .collect();
+            assert_eq!(labels, vec!["Türkçe", "English"], "reading {reading:?}");
+        }
+    }
+
+    /// The language ids must not collide with the modes below them or the learned hosts above.
+    #[test]
+    fn the_language_ids_sit_in_their_own_gap() {
+        assert!(id::MODE_BASE as usize + MODES.len() <= id::LANG_BASE as usize);
+        assert!(id::LANG_BASE as usize + LANGS.len() <= id::FORGET_BASE as usize);
+        for i in 0..LANGS.len() {
+            let id = id::LANG_BASE + i as u16;
+            assert_eq!(
+                command_for(id, &[]),
+                Some(Command::SetLang(lang_at(i).unwrap()))
+            );
+        }
+        // One past the end is nobody's.
+        assert_eq!(command_for(id::LANG_BASE + LANGS.len() as u16, &[]), None);
+    }
+
     /// Exactly one mode is ticked, whichever the proxy reports.
     #[test]
     fn exactly_one_mode_is_ticked_for_any_mode_the_proxy_can_report() {
@@ -928,7 +1007,11 @@ mod tests {
             let menu = context_menu(&s);
             let on: Vec<u16> = menu
                 .iter()
-                .filter(|m| m.checked && m.id >= id::MODE_BASE)
+                .filter(|m| {
+                    m.checked
+                        && m.id >= id::MODE_BASE
+                        && (m.id as usize) < id::MODE_BASE as usize + MODES.len()
+                })
                 .map(|m| m.id)
                 .collect();
             assert_eq!(on, vec![id::MODE_BASE + i as u16], "mode {i}");
@@ -938,9 +1021,11 @@ mod tests {
         // than ticking the wrong entry.
         let mut s = snap();
         s.mode = Mode::Fixed("split:1,2,3".into());
-        assert!(context_menu(&s)
-            .iter()
-            .all(|m| !m.checked || m.id < id::MODE_BASE));
+        assert!(context_menu(&s).iter().all(|m| {
+            !m.checked
+                || m.id < id::MODE_BASE
+                || (m.id as usize) >= id::MODE_BASE as usize + MODES.len()
+        }));
     }
 
     /// A learned-host id must never be read as a mode, however many hosts are learned.

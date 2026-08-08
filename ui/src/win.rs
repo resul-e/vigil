@@ -42,13 +42,47 @@ use crate::model::{self, Command, Snapshot};
 /// overrides it, which is how the other language gets tested without changing Windows' own
 /// settings.
 fn lang() -> Lang {
-    static CHOSEN: std::sync::OnceLock<Lang> = std::sync::OnceLock::new();
-    *CHOSEN.get_or_init(|| {
-        let from_os = vigil_platform::locale::ui_langid()
-            .map(Lang::from_windows_langid)
-            .unwrap_or_default();
-        from_os.override_from_env(vigil_platform::locale::lang_override().as_deref())
-    })
+    match CURRENT_LANG.load(std::sync::atomic::Ordering::Relaxed) {
+        LANG_UNSET => {
+            let chosen = decide_lang();
+            set_lang(chosen);
+            chosen
+        }
+        LANG_TURKISH => Lang::Turkish,
+        _ => Lang::English,
+    }
+}
+
+/// Where the language decision is made, in precedence order:
+///
+/// 1. `VIGIL_LANG`, an explicit override for this run — a developer or a curious user.
+/// 2. What the user last picked from the menu, remembered on disk.
+/// 3. Windows' own UI language.
+///
+/// The environment wins over the saved choice on purpose: it is the escape hatch, and an escape
+/// hatch that a stored preference can veto is not one.
+fn decide_lang() -> Lang {
+    Lang::decide(
+        vigil_platform::locale::ui_langid(),
+        vigil_platform::locale::saved_lang().as_deref(),
+        vigil_platform::locale::lang_override().as_deref(),
+    )
+}
+
+/// The language in force right now. An atomic rather than a `OnceLock`, because the menu can
+/// change it while the program runs and every window has to start reading the other language
+/// from the next repaint onward.
+static CURRENT_LANG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(LANG_UNSET);
+const LANG_UNSET: u8 = 0;
+const LANG_TURKISH: u8 = 1;
+const LANG_ENGLISH: u8 = 2;
+
+fn set_lang(l: Lang) {
+    let v = match l {
+        Lang::Turkish => LANG_TURKISH,
+        Lang::English => LANG_ENGLISH,
+    };
+    CURRENT_LANG.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The message the tray icon sends us. Anything at or above `WM_APP` is ours to define.
@@ -483,6 +517,32 @@ fn apply(cmd: Command) -> bool {
             set_engaged(false);
             if let (Some((owner, _, _)), Some(snap)) = (handles(), snapshot_now()) {
                 unsafe { refresh_tray(owner, &snap) };
+            }
+        }
+        Command::SetLang(l) => {
+            if l != lang() {
+                set_lang(l);
+                // Best effort. A preference that fails to save is a preference the user sets
+                // again next time; refusing to change the language over it would be worse.
+                let _ = vigil_platform::locale::save_lang(l.tag());
+                // Everything on screen is now in the wrong language: the tooltip, the popup and
+                // the details window all re-render from the snapshot, and the menu is rebuilt
+                // the next time it is opened.
+                if let (Some((owner, mini, _)), Some(snap)) = (handles(), snapshot_now()) {
+                    unsafe {
+                        refresh_tray(owner, &snap);
+                        let _ = InvalidateRect(Some(mini), None, true);
+                    }
+                }
+                if let Some(full) = full_window() {
+                    // The details window carries its language in its title bar as well as its
+                    // body, and a title is set once at creation rather than painted.
+                    let title = model::wide(t(l, "window.details_title"));
+                    unsafe {
+                        let _ = SetWindowTextW(full, PCWSTR(title.as_ptr()));
+                        let _ = InvalidateRect(Some(full), None, true);
+                    }
+                }
             }
         }
         Command::ToggleAutostart => {

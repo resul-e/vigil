@@ -84,6 +84,29 @@ impl Lang {
         }
     }
 
+    /// The whole language decision, in one pure function.
+    ///
+    /// Precedence, and the reason for each:
+    ///
+    /// 1. `env` — `VIGIL_LANG`, an explicit override for this run. It wins over everything,
+    ///    because an escape hatch a stored preference can veto is not an escape hatch.
+    /// 2. `saved` — what the user last picked from the menu. It beats the operating system
+    ///    because picking a language is exactly the act of disagreeing with the operating system.
+    /// 3. `os` — the Windows UI LANGID. The default for everyone who never picks.
+    /// 4. Nothing at all — English, which is the "otherwise" half of the product's rule.
+    ///
+    /// Written as a function of its three inputs so the order can be tested on Linux. It used to
+    /// live inside the Win32 shell, where none of it could be.
+    pub fn decide(os: Option<u16>, saved: Option<&str>, env: Option<&str>) -> Lang {
+        let from_os = os.map(Lang::from_windows_langid).unwrap_or_default();
+        let from_saved = saved
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(Lang::from_tag)
+            .unwrap_or(from_os);
+        from_saved.override_from_env(env)
+    }
+
     /// The two-letter tag.
     pub fn tag(self) -> &'static str {
         match self {
@@ -138,6 +161,9 @@ pub const STRINGS: &[Entry] = &[
     Entry { key: "health.protecting",         tr: "Koruma açık",                 en: "Protection on" },
     Entry { key: "health.stranded",           tr: "SORUN: sistem proxy'si bize bakıyor ama dinlemiyoruz",
                                               en: "PROBLEM: the system points at us and we are not listening" },
+
+    Entry { key: "lang.en",                   tr: "English",                     en: "English" },
+    Entry { key: "lang.tr",                   tr: "Türkçe",                      en: "Türkçe" },
 
     Entry { key: "line.address",              tr: "Adres: {{listen}}",           en: "Address: {{listen}}" },
     Entry { key: "line.dns",                  tr: "DNS: {{state}}",              en: "DNS: {{state}}" },
@@ -252,6 +278,8 @@ mod tests {
             "counter.socks4",
             "counter.socks5",
             "counter.http_connect",
+            "lang.en",
+            "lang.tr",
             "line.dns",
             "line.learned_row",
             "menu.mode_split",
@@ -380,6 +408,45 @@ mod tests {
             Lang::Turkish.override_from_env(Some("klingon")),
             Lang::Turkish
         );
+    }
+
+    /// The order matters more than any single rule in it, so it is tested as an order.
+    #[test]
+    fn the_language_decision_follows_its_precedence() {
+        const TR_OS: Option<u16> = Some(0x041F);
+        const EN_OS: Option<u16> = Some(0x0409);
+
+        // Nothing chosen: the system decides.
+        assert_eq!(Lang::decide(TR_OS, None, None), Lang::Turkish);
+        assert_eq!(Lang::decide(EN_OS, None, None), Lang::English);
+        // No system either: English, the "otherwise" half of the rule.
+        assert_eq!(Lang::decide(None, None, None), Lang::English);
+
+        // A saved choice beats the system, in both directions. Picking a language *is* the act
+        // of disagreeing with the operating system, so this is the whole feature.
+        assert_eq!(Lang::decide(TR_OS, Some("en"), None), Lang::English);
+        assert_eq!(Lang::decide(EN_OS, Some("tr"), None), Lang::Turkish);
+
+        // The environment beats the saved choice.
+        assert_eq!(Lang::decide(TR_OS, Some("tr"), Some("en")), Lang::English);
+        assert_eq!(Lang::decide(EN_OS, Some("en"), Some("tr")), Lang::Turkish);
+
+        // A blank or truncated file is not a choice — it is what a half-written file looks
+        // like — so the system decides again rather than the parser deciding for it.
+        for junk in ["", "   ", "\n"] {
+            assert_eq!(
+                Lang::decide(TR_OS, Some(junk), None),
+                Lang::Turkish,
+                "{junk:?}"
+            );
+            assert_eq!(
+                Lang::decide(EN_OS, Some(junk), None),
+                Lang::English,
+                "{junk:?}"
+            );
+        }
+        // Unreadable content is a choice we cannot honour; falling back beats guessing.
+        assert_eq!(Lang::decide(TR_OS, Some("klingon"), None), Lang::English);
     }
 
     #[test]
