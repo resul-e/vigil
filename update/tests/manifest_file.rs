@@ -26,12 +26,19 @@ fn the_committed_manifest_parses_and_is_internally_consistent() {
 
     let m = manifest::parse(&text).expect("the release script must write a manifest we can parse");
 
-    // The version in the manifest is the version of this workspace. If they drift, the release
-    // script hashed one build and described another.
-    assert_eq!(
-        m.version,
-        Version::running(),
-        "the manifest names {} but this workspace is {}",
+    // The committed manifest describes the **last release**, and the workspace version is what the
+    // *next* one will be, so between releases they legitimately differ.
+    //
+    // This used to be `assert_eq!(m.version, Version::running())`, which deadlocked the release
+    // process: bumping the workspace turned this test red, `release.sh` refuses to publish while the
+    // tests are red, and the only thing that could update the manifest was the release. The fix is
+    // not to weaken the check but to check the right thing — the manifest may lag the workspace, and
+    // may never lead it.
+    assert!(
+        m.version <= Version::running(),
+        "the committed manifest names {} but this workspace is {} — a manifest from the future means \
+         a release was published from a tree that was then reverted, and the fallback endpoint is \
+         now serving binaries no build here can produce",
         m.version,
         Version::running()
     );
@@ -69,13 +76,35 @@ fn the_committed_manifest_parses_and_is_internally_consistent() {
         assert!(f.size > 0);
     }
 
-    // And it must be trustworthy to a client running this version, with a floor below its serial.
+    // And it must be trustworthy **now**, to a client running the version it claims to serve.
+    //
+    // `now` was a frozen `2026-08-08T00:00:00Z`, which meant the one thing this check could never
+    // notice was the one thing that actually happens with time: the committed manifest expiring.
+    // That state is real breakage — `raw.githubusercontent.com` is the fallback endpoint, and an
+    // expired manifest there is refused by every client, so the second chance a censored line depends
+    // on silently becomes no chance at all.
+    //
+    // If this goes red because the manifest has expired, the fix is to re-sign: run
+    // `scripts/release.sh` again for the current version. It advances the serial, writes a fresh
+    // expiry, and the release upload is idempotent, so it is safe to repeat.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs();
     let trust = manifest::Trust {
-        now: vigil_core::clock::parse_utc("2026-08-08T00:00:00Z").expect("a fixed now"),
+        now,
         serial_floor: m.serial - 1,
-        running: Version::running(),
+        running: m.min_version,
     };
-    manifest::check_trust(&m, &trust).expect("a freshly written manifest must be trusted");
+    manifest::check_trust(&m, &trust).unwrap_or_else(|e| {
+        panic!(
+            "the committed manifest is not trustworthy today: {e:?}\n\
+             It expires {} and now is {}.\n\
+             Re-sign it: scripts/release.sh (same version — it advances the serial and the expiry).",
+            vigil_core::clock::iso8601(m.expires),
+            vigil_core::clock::iso8601(now)
+        )
+    });
 }
 
 /// The base URL must point at the release for *this* version, or the client downloads the previous

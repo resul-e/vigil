@@ -22,10 +22,14 @@
 //! ## What the signature does and does not cover
 //!
 //! minisign signs the **exact bytes** of the file, so there is no canonical form to argue about.
-//! It also signs a *trusted comment*, and that is more useful than it looks: the release process
-//! puts the serial in it, so the serial is stated twice — once in the body and once inside the
-//! signed comment. A body edited by anybody who cannot sign will disagree with the comment.
-//! [`verify`] returns the trusted comment for exactly that cross-check.
+//! It also signs a *trusted comment*, and the release process puts the serial in it, so the serial
+//! is stated twice. [`verify`] returns it, and the release script prints it — **for a person to
+//! read, not for the code to cross-check.** That distinction was wrong here until 2026-08-08: a
+//! reviewer read `minisign-verify` and pointed out that the trusted comment is covered by a second
+//! signature under the *same* key, so comparing the serial in the comment against the serial in the
+//! body weighs one authenticated value against another authenticated value from the same signature.
+//! It would read like defence in depth and add none. There is no reachable state in which the
+//! comment is attacker-controlled while the body is not.
 //!
 //! The **untrusted** comment is not signed and is therefore worth nothing. A test asserts that
 //! editing it changes nothing, so nobody is tempted to read anything out of it.
@@ -34,12 +38,23 @@ use minisign_verify::{PublicKey, Signature};
 
 /// The production public keys, in the binary.
 ///
-/// Empty during development, and that is deliberate rather than unfinished: the private halves
-/// belong to whoever cuts releases and must not be generated as a side effect of writing this
-/// module. [`keys_are_configured`] answers whether a build can update itself, the release script
-/// refuses to publish while it is false, and every test here brings its own keys — so the logic
-/// below is fully exercised without a production key existing anywhere.
-pub const PUBLIC_KEYS: [&str; 2] = ["", ""];
+/// Generated 2026-08-09 by the person who cuts releases; the private halves have never been on any
+/// machine that builds this, and key B's is kept off it entirely. They were deliberately *not*
+/// generated as a side effect of writing this module — a key created by the code that checks it
+/// belongs to nobody.
+///
+/// These are compiled in, and that is the whole point: a key fetched over the network is worthless,
+/// because whoever can serve a forged update can serve a forged key with it. The consequence to
+/// respect is that a build shipped with the placeholder can **never** be given keys afterwards — it
+/// reports `nokeys` for the life of that install. `keys_are_configured` answers whether a build can
+/// update itself, `scripts/release.sh` refuses to publish while it is false, and
+/// `the_keys_that_ship_are_two_real_and_different_keys` guards the constant itself.
+pub const PUBLIC_KEYS: [&str; 2] = [
+    // key A — minisign key id 967CE701B683EE3D
+    "RWQ97oO2Aed8lgUoDCOPmtccFe9Y6PUWECT7YTLfFd8mmrUfZgrAx/bV",
+    // key B — minisign key id 3756C4BE817EF52D, secret half kept off the build machine
+    "RWQt9X6BvsRWN5H2bY6mp5XiwpQXDclYEQV4TBdE+jNVXqF6m+qRWmsf",
+];
 
 /// How many signatures must verify. Both, always.
 pub const REQUIRED: usize = 2;
@@ -175,15 +190,92 @@ RUT0GYJVxnOeVJ6yDhOnaOZlENyCCscOHZB4LQVESpeXMc5CdNLyCLD37+rHf+kx/lUoRMBMEi6E6LZq
 trusted comment: vigil manifest serial=7\n\
 lB2rVqk3G2HszXjcLi5TcU184tPA9qGGLucX1SRZPCEC6iuEq1YJAmViERC0LsL0kblJWMyK2HcXeRyLC7WzAA==\n";
 
+    /// The shipped constant itself, guarded permanently.
+    ///
+    /// Every way this can be wrong locks the whole fleet out of updates with no recovery, and none
+    /// of the other tests touch it — they all bring their own keys, deliberately, so that the logic
+    /// could be exercised before a production key existed. That left the one value that actually
+    /// ships as the only unchecked thing in the module.
+    ///
+    /// Three failure modes, all of which a person pasting base64 at midnight can produce, and all of
+    /// which would have been discovered by the first user who never got an update:
+    ///
+    /// - a placeholder or blank entry — the build cannot verify anything, permanently, because these
+    ///   are compiled in and cannot be delivered later;
+    /// - a truncated or mistyped key — parses as nothing, so no signature ever satisfies it;
+    /// - **the same key twice** — looks like two keys and is one, so a single compromise produces
+    ///   signatures every client accepts. `verify_with` refuses this at runtime, which would show up
+    ///   as a release that cannot be published. Better to fail here.
+    #[test]
+    fn the_keys_that_ship_are_two_real_and_different_keys() {
+        assert!(
+            keys_are_configured(),
+            "PUBLIC_KEYS is the placeholder. A build that ships this reports `nokeys` for the life \
+             of the install — the keys are compiled in, so they cannot be supplied afterwards."
+        );
+
+        for (i, k) in PUBLIC_KEYS.iter().enumerate() {
+            PublicKey::from_base64(k.trim())
+                .unwrap_or_else(|e| panic!("PUBLIC_KEYS[{i}] is not a minisign public key: {e}"));
+        }
+
+        // Compared as strings because `minisign_verify` does not expose the key id, and because for
+        // keys `rsign` produced the comparison is exact anyway: its base64 is canonical, so the same
+        // key is always the same string and two different keys can never collide. The ids themselves
+        // were decoded and checked when these were pasted in — 967CE701B683EE3D and 3756C4BE817EF52D.
+        assert_ne!(
+            PUBLIC_KEYS[0].trim(),
+            PUBLIC_KEYS[1].trim(),
+            "both entries are the same key. Two copies of one signature is not two signatures, and \
+             the whole point of two keys is that one compromise produces nothing a client accepts."
+        );
+
+        // No stray whitespace: `verify` trims, but a key with a newline in the middle of it would
+        // trim to something that still fails, and the failure would arrive as "not signed by us".
+        for (i, k) in PUBLIC_KEYS.iter().enumerate() {
+            assert_eq!(k.trim(), *k, "PUBLIC_KEYS[{i}] has surrounding whitespace");
+            assert!(!k.contains('\n'), "PUBLIC_KEYS[{i}] spans lines");
+        }
+    }
+
+    /// A stranger's signatures must be refused by the keys that ship.
+    ///
+    /// The positive direction cannot be tested here — signing needs the secret halves, which are not
+    /// in this repository and never will be, and `scripts/release.sh` checks it at the only moment it
+    /// can: with `vigil-update verify`, over the files it just signed. So what is asserted here is the
+    /// half that can be: real, well-formed signatures made by keys that are not ours get nowhere.
+    #[test]
+    fn signatures_from_keys_that_are_not_ours_are_refused_by_the_shipped_constant() {
+        let e = verify(MSG, &[SIG_A, SIG_B]).expect_err("the test keys are not the release keys");
+        assert!(
+            matches!(e, VerifyError::NotSignedBy { .. }),
+            "expected NotSignedBy, got {e:?}"
+        );
+    }
+
     #[test]
     fn a_build_without_keys_says_so_rather_than_calling_the_update_forged() {
-        // The shipped constant is empty in development, which must be reported as its own thing.
-        assert!(!keys_are_configured());
-        assert_eq!(verify(MSG, &[SIG_A]), Err(VerifyError::NoKeysConfigured));
-        // And the message must not read as an accusation about the update.
+        // Written when `PUBLIC_KEYS` was the placeholder, and it asserted that fact directly. Keys
+        // shipped on 2026-08-09, so the *state* is now tested where it can be — through the explicit
+        // form — while the property it exists for is unchanged: a build that cannot check must say
+        // "I cannot check", never "this is not genuine". The distinction is the difference between a
+        // user updating by hand and a user believing they are under attack.
+        assert!(
+            keys_are_configured(),
+            "the shipped build has keys; the keyless case is exercised explicitly below"
+        );
+        for keyless in [["", ""], [" ", "\t"]] {
+            assert_eq!(
+                verify_with(&keyless, MSG, &[SIG_A]),
+                Err(VerifyError::KeyUnreadable { index: 0 }),
+                "an empty key cannot parse, and that is a build mistake rather than a verdict"
+            );
+        }
+        // And the message the *product* path produces must not read as an accusation.
         assert!(VerifyError::NoKeysConfigured
             .to_string()
             .contains("cannot verify"));
+        assert!(!VerifyError::NoKeysConfigured.to_string().contains("forged"));
     }
 
     #[test]
@@ -364,15 +456,28 @@ lB2rVqk3G2HszXjcLi5TcU184tPA9qGGLucX1SRZPCEC6iuEq1YJAmViERC0LsL0kblJWMyK2HcXeRyL
         }
     }
 
+    /// `keys_are_configured` must need **both** halves, because a release that pasted one key and
+    /// left the other blank is a build that can never verify anything and would otherwise look
+    /// finished.
     #[test]
     fn keys_are_configured_needs_both_halves() {
-        // The shipped constant, and the shapes a half-finished release would produce.
-        assert!(!keys_are_configured());
-        for pair in [["", ""], [PUB_A, ""], ["", PUB_B], ["  ", PUB_B]] {
-            assert!(
-                pair.iter().any(|k| k.trim().is_empty()),
-                "this test's own premise"
-            );
+        // The real constant has both, which is the only acceptable shipped state.
+        assert!(keys_are_configured());
+
+        // The predicate itself, over the shapes a half-finished release produces. Tested against the
+        // same expression the constant uses rather than by mutating a `const`, which cannot be done —
+        // the earlier version of this test could only assert its own premise, and did.
+        let configured = |pair: [&str; 2]| pair.iter().all(|k| !k.trim().is_empty());
+        for half in [
+            ["", ""],
+            [PUB_A, ""],
+            ["", PUB_B],
+            ["  ", PUB_B],
+            [PUB_A, "\n"],
+        ] {
+            assert!(!configured(half), "{half:?} must not count as configured");
         }
+        assert!(configured([PUB_A, PUB_B]));
+        assert!(configured([PUBLIC_KEYS[0], PUBLIC_KEYS[1]]));
     }
 }

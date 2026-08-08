@@ -142,8 +142,13 @@ pub enum UpdateState {
         critical: bool,
     },
     /// Downloaded, signature verified, waiting for the user to say yes.
+    ///
+    /// Carries `critical` because a staged urgent update is still urgent. It did not, so an update
+    /// marked critical lost that fact the moment it finished downloading — which is the only moment
+    /// it matters, since that is when the user is asked.
     Staged {
         version: String,
+        critical: bool,
     },
     /// The check itself failed. On this line that is a finding, not a shrug.
     Unreachable {
@@ -173,7 +178,11 @@ impl UpdateState {
     /// urgent — a critical update — because an indicator that is always on is an indicator nobody
     /// reads.
     pub fn wants_attention(&self) -> bool {
-        matches!(self, UpdateState::Available { critical: true, .. })
+        matches!(
+            self,
+            UpdateState::Available { critical: true, .. }
+                | UpdateState::Staged { critical: true, .. }
+        )
     }
 
     /// The one line the details window shows.
@@ -192,7 +201,15 @@ impl UpdateState {
                 },
                 &[("version", version)],
             ),
-            UpdateState::Staged { version } => tf(lang, "update.staged", &[("version", version)]),
+            UpdateState::Staged { version, critical } => tf(
+                lang,
+                if *critical {
+                    "update.staged_critical"
+                } else {
+                    "update.staged"
+                },
+                &[("version", version)],
+            ),
             UpdateState::Unreachable { why } => tf(lang, "update.unreachable", &[("why", why)]),
             UpdateState::FolderNotWritable => t(lang, "update.folder_readonly").into(),
             UpdateState::NoKeys => t(lang, "update.no_keys").into(),
@@ -226,7 +243,12 @@ impl UpdateState {
         match status {
             "current" => UpdateState::UpToDate,
             "available" if !version.is_empty() => UpdateState::Available { version, critical },
-            "staged" if !version.is_empty() => UpdateState::Staged { version },
+            "staged" if !version.is_empty() => UpdateState::Staged { version, critical },
+            // An apply that stopped part way. The bytes are staged and verified and some files are
+            // already replaced, so the only useful thing to offer is "finish it" — and until this
+            // arm existed, `Interrupted` was a state the interface could display and nothing could
+            // ever produce, so a half-updated folder reported itself up to date instead.
+            "interrupted" => UpdateState::Interrupted,
             "readonly" => UpdateState::FolderNotWritable,
             "nokeys" => UpdateState::NoKeys,
             "unreachable" | "badsig" | "badmanifest" | "untrusted" => UpdateState::Unreachable {
@@ -250,7 +272,7 @@ impl UpdateState {
     /// The label for the menu item that acts on this state, when there is one.
     pub fn action_label(&self, lang: Lang) -> Option<String> {
         match self {
-            UpdateState::Available { version, .. } | UpdateState::Staged { version } => {
+            UpdateState::Available { version, .. } | UpdateState::Staged { version, .. } => {
                 Some(tf(lang, "update.install_now", &[("version", version)]))
             }
             UpdateState::Interrupted => Some(t(lang, "update.interrupted").into()),
@@ -540,6 +562,15 @@ pub fn tooltip(s: &Snapshot) -> String {
                 ("transformed", &s.transformed.to_string()),
             ],
         ),
+    };
+    // The one place `wants_attention` is consumed. It had none: the method existed, one test asserted
+    // it, and no interface element ever asked — so a `critical=1` release, the whole point of the
+    // flag, reached the user as an ordinary "there is an update" and nothing more. The tooltip is the
+    // right consumer because it is what a user sees without clicking anything.
+    let body = if s.update.wants_attention() {
+        format!("{body}\n{}", t(s.lang, "tooltip.critical"))
+    } else {
+        body
     };
     clip(&body, TOOLTIP_MAX)
 }
@@ -2085,6 +2116,11 @@ mod update_tests {
             },
             UpdateState::Staged {
                 version: "0.7.0".into(),
+                critical: false,
+            },
+            UpdateState::Staged {
+                version: "0.7.0".into(),
+                critical: true,
             },
             UpdateState::Unreachable {
                 why: "silently dropped".into(),
@@ -2192,7 +2228,11 @@ mod update_tests {
     #[test]
     fn only_a_critical_update_asks_for_attention() {
         for st in all_states() {
-            let want = matches!(st, UpdateState::Available { critical: true, .. });
+            let want = matches!(
+                st,
+                UpdateState::Available { critical: true, .. }
+                    | UpdateState::Staged { critical: true, .. }
+            );
             assert_eq!(st.wants_attention(), want, "{st:?}");
         }
     }
@@ -2296,7 +2336,19 @@ mod status_line_tests {
                 "vigil-update-status status=staged version=0.7.0 critical=0"
             ),
             UpdateState::Staged {
-                version: "0.7.0".into()
+                version: "0.7.0".into(),
+                critical: false
+            }
+        );
+        // A staged update keeps its urgency. It used to lose it here: the `staged` status line
+        // carried `critical=` and this arm dropped it on the floor.
+        assert_eq!(
+            UpdateState::from_status_line(
+                "vigil-update-status status=staged version=0.7.1 critical=1"
+            ),
+            UpdateState::Staged {
+                version: "0.7.1".into(),
+                critical: true
             }
         );
         assert_eq!(
@@ -2353,6 +2405,27 @@ mod status_line_tests {
                 "{line:?} became {st:?}, which is not a complaint"
             );
             assert_ne!(st, UpdateState::UpToDate, "{line:?}");
+        }
+    }
+
+    /// An apply that stopped part way must arrive as `Interrupted`, and `Interrupted` must be
+    /// actionable — otherwise a half-updated folder has no route back to being whole.
+    ///
+    /// This state existed in the interface from the first commit and **nothing produced it**: the
+    /// updater printed no such status and this parser had no arm for it, so a folder with some files
+    /// replaced and some not reported itself up to date. Four of six adversarial reviewers found that
+    /// independently, which is a fair measure of how invisible a dead enum variant is.
+    #[test]
+    fn an_interrupted_apply_is_actionable_rather_than_up_to_date() {
+        let st = UpdateState::from_status_line(
+            "vigil-update-status status=interrupted version=0.7.0 outstanding=2",
+        );
+        assert_eq!(st, UpdateState::Interrupted);
+        assert_ne!(st, UpdateState::UpToDate, "the whole point");
+        assert!(st.actionable(), "there must be something to click");
+        for lang in [Lang::Turkish, Lang::English] {
+            assert!(st.action_label(lang).is_some(), "{lang:?}");
+            assert!(!st.line(lang).is_empty(), "{lang:?}");
         }
     }
 

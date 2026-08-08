@@ -153,7 +153,19 @@ mod tests {
         let a = l.local_addr().unwrap();
         std::thread::spawn(move || {
             if let Ok((mut c, _)) = l.accept() {
+                // Read the greeting before answering, the way any server does, and stay open until
+                // the client has finished. Both halves are needed on Windows: answering a peer that
+                // has not spoken yet, and then closing while the reply is still in flight, made the
+                // client read a reset instead of the reply — `Error::Io` where this test is about
+                // `Error::Protocol`. Measured on the Windows target: 2 failures in 5 runs originally,
+                // 1 in 8 with only the second half. Linux passed every time, which is how it survived
+                // this long. The trailing read returns 0 the moment the client drops its end, so this
+                // waits no longer than the test does.
+                let mut greeting = [0u8; 3];
+                let _ = c.read_exact(&mut greeting);
                 let _ = c.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+                let mut sink = [0u8; 1];
+                let _ = c.read(&mut sink);
             }
         });
         let err = connect(a, "example.com", 443, Duration::from_secs(2)).unwrap_err();

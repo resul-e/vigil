@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! vigil-update --version
+//! vigil-update verify MANIFEST SIG_A SIG_B   what a client will do, on local files
 //! vigil-update fetch URL [TRIALS]        measure the transport, change nothing
 //! vigil-update --apply [--parent PID] [--die-after BOUNDARY]
 //! ```
@@ -31,11 +32,13 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") | Some("-V") => version(),
+        Some("verify") => verify_cmd(&args[1..]),
         Some("fetch") => fetch_cmd(&args[1..]),
         Some("--check") => check_cmd(&args[1..]),
         Some("--apply") => apply_cmd(&args[1..]),
         _ => {
             eprintln!("usage: vigil-update --version");
+            eprintln!("       vigil-update verify MANIFEST SIG_A SIG_B");
             eprintln!("       vigil-update --check [--dry-run]");
             eprintln!("       vigil-update fetch URL [TRIALS]");
             eprintln!("       vigil-update --apply [--parent PID] [--die-after BOUNDARY]");
@@ -54,6 +57,64 @@ fn version() -> std::process::ExitCode {
             "NOT CONFIGURED — this build cannot verify an update"
         }
     );
+    std::process::ExitCode::SUCCESS
+}
+
+/// Do to three local files exactly what a client does to three downloaded ones, and say so.
+///
+/// The decision is [`vigil_update::release::check`], which is pure and tested with real signatures;
+/// this is reading three files and printing. Called by `scripts/release.sh`, which used to "verify"
+/// by grepping `--version` for a compile-time constant — see that module for what that cost.
+fn verify_cmd(args: &[String]) -> std::process::ExitCode {
+    let [manifest, sig_a, sig_b] = args else {
+        eprintln!("usage: vigil-update verify MANIFEST SIG_A SIG_B");
+        return std::process::ExitCode::from(2);
+    };
+
+    let read = |path: &String| match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("verify: cannot read {path}: {e}");
+            None
+        }
+    };
+    let (Some(text), Some(a), Some(b)) = (read(manifest), read(sig_a), read(sig_b)) else {
+        return std::process::ExitCode::from(3);
+    };
+
+    // The keys that ship, not a pair passed in on the command line: the point is to exercise the
+    // constant the field will use.
+    let r = match vigil_update::release::check(
+        &vigil_update::verify::PUBLIC_KEYS,
+        &text,
+        &a,
+        &b,
+        now_secs(),
+    ) {
+        Ok(r) => r,
+        Err(e @ vigil_update::release::Problem::NoKeysConfigured) => {
+            eprintln!("verify: {e}.");
+            eprintln!("        PUBLIC_KEYS in update/src/verify.rs is still the placeholder.");
+            return std::process::ExitCode::from(3);
+        }
+        Err(e) => {
+            eprintln!("verify: REFUSED — {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+
+    let m = &r.manifest;
+    println!("signature: ok, two distinct keys — {}", r.trusted_comment);
+    println!(
+        "manifest:  serial {} version {} min_version {} critical {} — {} files",
+        m.serial,
+        m.version,
+        m.min_version,
+        u8::from(m.critical),
+        m.files.len()
+    );
+    println!("expires:   {}", vigil_core::clock::iso8601(m.expires));
+    println!("base:      {}", m.base);
     std::process::ExitCode::SUCCESS
 }
 
@@ -168,16 +229,47 @@ fn check_cmd(args: &[String]) -> std::process::ExitCode {
     // A leftover runner from a previous update. Its own process could not delete it.
     apply::sweep_old_runner(&folder);
 
+    // An apply that did not finish is answered here, **before the network and before any version
+    // comparison**. Both orderings matter. The bytes are already staged and were already verified,
+    // so there is nothing to fetch; and asking "is the manifest newer than me" first is exactly the
+    // bug — this binary is manifest order 4 and `vigil-app.exe` is order 5, so after a crash between
+    // them the updater is already the new version and would answer "current" forever, with the
+    // finishing bytes sitting untouched one directory down.
+    if let Some((text, sigs)) = stage::load_inputs(&folder) {
+        let refs: Vec<&str> = sigs.iter().map(String::as_str).collect();
+        let verified = vigil_update::verify::verify(text.as_bytes(), &refs).is_ok();
+        if let Ok(m) = vigil_update::manifest::parse(&text) {
+            let required = m.files.iter().filter(|f| f.required).count();
+            let left = apply::outstanding(&folder, &m).len();
+            if let apply::Resume::Finishable { outstanding } =
+                apply::resume_state(verified, required, left)
+            {
+                println!(
+                    "{}",
+                    status_line(
+                        "interrupted",
+                        &[
+                            ("version", &m.version.to_string()),
+                            ("outstanding", &outstanding.to_string()),
+                        ]
+                    )
+                );
+                return std::process::ExitCode::SUCCESS;
+            }
+        }
+    }
+
     let resolver = vigil_proxy::Resolver::default();
     let dl = Deadlines::default();
 
-    // The manifest, then its two signatures, from whichever endpoint answers first.
-    let Some((text, sigs)) = fetch_manifest(&resolver, dl) else {
-        println!(
-            "{}",
-            status_line("unreachable", &[("why", "no_endpoint_answered")])
-        );
-        return std::process::ExitCode::SUCCESS;
+    // The manifest and both its signatures, from the first endpoint that serves a triple which
+    // verifies. A partial answer is a failed endpoint, not a committed one.
+    let (text, sigs) = match fetch_manifest(&resolver, dl) {
+        Ok(v) => v,
+        Err(why) => {
+            println!("{}", status_line("unreachable", &[("why", why)]));
+            return std::process::ExitCode::SUCCESS;
+        }
     };
 
     let refs: Vec<&str> = sigs.iter().map(String::as_str).collect();
@@ -192,14 +284,27 @@ fn check_cmd(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::from(4);
         }
     };
+    // The floor is this machine's own history, not a hard-coded 0. With 0 the ceiling guarded
+    // nothing and a superseded-but-genuine manifest could be replayed here forever.
+    let prefs = vigil_platform::prefs::read();
     let trust = vigil_update::manifest::Trust {
         now: now_secs(),
-        serial_floor: 0,
+        serial_floor: vigil_platform::prefs::serial_floor(&prefs),
         running: vigil_update::Version::running(),
     };
     if let Err(e) = vigil_update::manifest::check_trust(&m, &trust) {
         println!("{}", status_line("untrusted", &[("why", &e.to_string())]));
         return std::process::ExitCode::from(4);
+    }
+    // Accepted, so the floor moves up. Written here rather than after a successful install: what
+    // this records is "a manifest with this serial verified against our keys and passed every trust
+    // check", which is true whether or not the user goes on to install it, and recording it later
+    // would leave the floor behind on every machine that checks and declines.
+    if prefs.last_serial.is_none_or(|s| m.serial > s) {
+        let _ = vigil_platform::prefs::write(&vigil_platform::prefs::Prefs {
+            last_serial: Some(m.serial),
+            ..prefs
+        });
     }
     if !vigil_update::manifest::is_newer_than(&m, vigil_update::Version::running()) {
         println!("{}", status_line("current", &[]));
@@ -247,11 +352,56 @@ fn check_cmd(args: &[String]) -> std::process::ExitCode {
     }
 }
 
-/// Try each endpoint in turn, and take the first that yields a manifest and at least one signature.
+/// Stop, say why, and **bring vigil back**.
+///
+/// Every non-success exit from `apply_cmd` goes through here. Before this existed, one of the ten
+/// exits relaunched the application and nine did not — including the designed "the new repair tool
+/// does not run, roll it back and stop safely" path. Their user-visible result was: tray icon gone,
+/// protection off, nothing comes back, and no message anywhere, after a consent dialog that had said
+/// in writing that vigil would close, update and *reopen*. The settings are already restored by then,
+/// so the internet works; what is lost is the protection, silently, which on a censored line is the
+/// thing the user actually came for.
+///
+/// `relaunch` is false for the two cases where a vigil is already running — starting a second one
+/// would be worse than starting none.
+fn bail(folder: &Path, code: u8, why: &str, relaunch: bool) -> std::process::ExitCode {
+    println!("{why}");
+    let _ = std::fs::write(folder.join(stage::LAST_ERROR), format!("{why}\n"));
+    if relaunch {
+        let app = folder.join(plan::APP);
+        if app.exists() {
+            match guard::relaunch(&app) {
+                Ok(()) => println!("restarted {}", app.display()),
+                Err(e) => println!("could not restart it: {e} — start it yourself"),
+            }
+        } else {
+            println!("{} is not in the folder — nothing to restart", plan::APP);
+        }
+    }
+    std::process::ExitCode::from(code)
+}
+
+/// Try each endpoint in turn, and take the first that yields a manifest **and both** signatures that
+/// together verify.
+///
+/// It used to accept "at least one signature", which made the endpoint a trap: an endpoint serving a
+/// manifest and one signature would be committed to, `verify` would then refuse it for having only
+/// one, and the second endpoint — the whole point of having two — was never tried. On this line that
+/// is not a hypothetical: GitHub Releases and raw.githubusercontent are blocked independently, and a
+/// partial answer from a censored path is the ordinary case rather than the strange one.
+///
+/// So the unit of success is the whole verifiable triple. Verification happens here, and the caller
+/// verifies again — deliberately: this decides *which endpoint*, and the caller decides *whether to
+/// trust*, and collapsing the two would make a future edit to either one silently weaken the other.
 fn fetch_manifest(
     resolver: &vigil_proxy::Resolver,
     dl: Deadlines,
-) -> Option<(String, Vec<String>)> {
+) -> Result<(String, Vec<String>), &'static str> {
+    // Which failure to report when every endpoint failed. "Nothing answered" and "something answered
+    // and it did not verify" are very different situations on a censored line — one is a blocked
+    // download, the other is a manifest that is not ours — and collapsing them would throw away the
+    // only clue in a log a user pastes into a message.
+    let mut answered = false;
     for base in MANIFEST_URLS {
         let Ok(url) = Url::parse(base) else { continue };
         let Ok(body) = fetch::get(&url, resolver, dl) else {
@@ -260,6 +410,7 @@ fn fetch_manifest(
         let Ok(text) = String::from_utf8(body.body) else {
             continue;
         };
+        answered = true;
         let mut sigs = Vec::new();
         for suffix in [".minisig", ".minisig2"] {
             if let Ok(u) = Url::parse(&format!("{base}{suffix}")) {
@@ -270,11 +421,16 @@ fn fetch_manifest(
                 }
             }
         }
-        if !sigs.is_empty() {
-            return Some((text, sigs));
+        let refs: Vec<&str> = sigs.iter().map(String::as_str).collect();
+        if vigil_update::verify::verify(text.as_bytes(), &refs).is_ok() {
+            return Ok((text, sigs));
         }
     }
-    None
+    Err(if answered {
+        "no_endpoint_served_a_verifiable_manifest"
+    } else {
+        "no_endpoint_answered"
+    })
 }
 
 /// Seconds since the Unix epoch. The one place in this binary that reads a clock; everything it
@@ -321,6 +477,16 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
         eprintln!("--die-after needs one of: nothing aside repair verified file0..3 app cleanup");
         return std::process::ExitCode::from(2);
     }
+    // The address vigil serves on, handed over by the application that spawned us. The guard needs it
+    // to ask "does the machine point at **us**" instead of "at anything on this host" — and only the
+    // application knows the answer, because it is the thing listening. The fallback is the documented
+    // default rather than a guess: it is the value `sysproxy::settings_for` writes.
+    let listen = args
+        .iter()
+        .position(|a| a == "--listen")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:1080".to_string());
 
     println!("folder: {}", folder.display());
 
@@ -328,17 +494,26 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
     //    of these renames wants an idle target.
     if let Some(pid) = parent {
         if !guard::wait_for_exit(pid, PARENT_WAIT) {
-            println!("parent {pid} is still running after {PARENT_WAIT:?} — changing nothing");
-            return std::process::ExitCode::from(3);
+            return bail(
+                &folder,
+                3,
+                &format!("parent {pid} is still running after {PARENT_WAIT:?} — changing nothing"),
+                false,
+            );
         }
         println!("parent {pid} has exited");
     }
 
     // 2. The independent check, in this process rather than the one that disengaged.
-    let g = guard::check();
+    let g = guard::check(&listen);
     println!("guard: {}", g.explain());
     if !g.may_proceed() {
-        return std::process::ExitCode::from(3);
+        return bail(
+            &folder,
+            3,
+            &format!("guard: {} — changing nothing", g.explain()),
+            false,
+        );
     }
     if g == Guard::StrandedRestoreFirst {
         // The OLD repair tool, before anything is replaced: the one that has been on this machine
@@ -346,10 +521,32 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
         match guard::repair_settings(&folder.join(plan::REPAIR)) {
             Ok(()) => println!("settings repaired"),
             Err(e) => {
-                println!("could not repair the settings: {e} — changing nothing");
-                return std::process::ExitCode::from(3);
+                return bail(
+                    &folder,
+                    3,
+                    &format!("could not repair the settings: {e} — changing nothing"),
+                    true,
+                );
             }
         }
+        // And **read the machine back**, rather than taking an exit status as proof. Everything else
+        // in this project reads back after writing; this was the one place that did not, on the one
+        // path where being wrong means somebody has no internet. `vigil-repair` prints its failures
+        // to a stdout nobody reads and still exits 0, so its exit code is not the evidence it looks
+        // like.
+        let after = guard::check(&listen);
+        if after != Guard::Clear {
+            return bail(
+                &folder,
+                3,
+                &format!(
+                    "the settings still point at a vigil after repairing ({}) — changing nothing",
+                    after.explain()
+                ),
+                true,
+            );
+        }
+        println!("guard: confirmed clear after repair");
     }
 
     // 3. Verify again, offline. The staging folder has been sitting on disk since phase A and
@@ -363,15 +560,23 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
     match vigil_update::verify::verify(text.as_bytes(), &refs) {
         Ok(v) => println!("signature: ok — {}", v.trusted_comment),
         Err(e) => {
-            println!("signature: {e} — changing nothing");
-            return std::process::ExitCode::from(4);
+            return bail(
+                &folder,
+                4,
+                &format!("signature: {e} — changing nothing"),
+                true,
+            );
         }
     }
     let m = match vigil_update::manifest::parse(&text) {
         Ok(m) => m,
         Err(e) => {
-            println!("manifest: {e} — changing nothing");
-            return std::process::ExitCode::from(4);
+            return bail(
+                &folder,
+                4,
+                &format!("manifest: {e} — changing nothing"),
+                true,
+            );
         }
     };
 
@@ -382,8 +587,7 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
     let p = match plan::plan(&m, &on_disk, &staged) {
         Ok(p) => p,
         Err(e) => {
-            println!("plan: {e} — changing nothing");
-            return std::process::ExitCode::from(4);
+            return bail(&folder, 4, &format!("plan: {e} — changing nothing"), true);
         }
     };
     if p.nothing_to_do() {
@@ -403,11 +607,15 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
     // 5. Replace.
     let mut check = |path: &Path| guard::run_repair_version(path);
     match apply::apply(&folder, &p, &mut check, die_after) {
-        Err(e) => {
-            println!("FAILED {e}");
-            println!("outstanding: {:?}", apply::outstanding(&folder, &m));
-            std::process::ExitCode::from(5)
-        }
+        Err(e) => bail(
+            &folder,
+            5,
+            &format!(
+                "FAILED {e}\noutstanding: {:?}",
+                apply::outstanding(&folder, &m)
+            ),
+            true,
+        ),
         Ok(out) => {
             for name in &out.replaced {
                 println!("  replaced {name}");

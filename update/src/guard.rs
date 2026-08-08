@@ -71,25 +71,38 @@ mod imp {
     use std::path::Path;
 
     /// Read the machine and decide. Windows-only; the decision is [`super::decide`].
-    pub fn check() -> Guard {
-        let points_at_us = registry_points_at_loopback() || env_points_at_loopback();
+    ///
+    /// `listen` is the address vigil serves on, so the question can be "does the machine point at
+    /// **us**" rather than "at anything on this host". Those are different questions and answering
+    /// the second one is how a user's own local proxy gets mistaken for a stranded vigil.
+    pub fn check(listen: &str) -> Guard {
+        let points_at_us = registry_points_at_us(listen) || env_points_at_us(listen);
         let owner_alive = lock_owner_alive();
         super::decide(points_at_us, owner_alive)
     }
 
-    fn registry_points_at_loopback() -> bool {
+    /// Both arms used to match `contains("127.0.0.1")`, and the environment arm scanned **every**
+    /// variable — including `NO_PROXY`, whose value `envproxy::NO_PROXY_VALUE` literally begins
+    /// `localhost,127.0.0.1,…`. So the bypass list, which exists to say "do *not* proxy these", was
+    /// read as evidence that the machine was proxying through us.
+    ///
+    /// The consequences interlock, which is why both arms and `vigil-repair` were changed together:
+    /// a third-party `HTTPS_PROXY=http://127.0.0.1:8888` made this true, the lock file is absent, so
+    /// the guard decided `StrandedRestoreFirst` and ran the old `vigil-repair` — which, finding no
+    /// snapshot (because vigil correctly never wrote one over somebody else's setting), cleared all
+    /// four variables. It destroyed a configuration it had nothing to restore from, hitting precisely
+    /// the user the "somebody else owns this" branch exists to protect.
+    ///
+    /// `points_at_us` compares the listen address and is tested in `vigil_platform`.
+    fn registry_points_at_us(listen: &str) -> bool {
         vigil_platform::registry::read_current()
-            .map(|c| c.enabled && c.server.contains("127.0.0.1"))
+            .map(|c| vigil_platform::sysproxy::points_at_us(&c, listen))
             .unwrap_or(false)
     }
 
-    fn env_points_at_loopback() -> bool {
+    fn env_points_at_us(listen: &str) -> bool {
         vigil_platform::envreg::read_current()
-            .map(|e| {
-                e.pairs()
-                    .iter()
-                    .any(|(_, v)| v.as_deref().is_some_and(|v| v.contains("127.0.0.1")))
-            })
+            .map(|e| vigil_platform::envproxy::points_at_us(&e, listen))
             .unwrap_or(false)
     }
 
@@ -168,8 +181,19 @@ mod imp {
     }
 
     /// Start the application again, detached, so the updater can exit.
+    /// Start the application again, detached, so the updater can exit.
+    ///
+    /// **Detached means the handles too.** A plain `spawn()` gives the child this process's stdin,
+    /// stdout and stderr, and `vigil-app.exe` then holds that stdout pipe for as long as it runs —
+    /// which is until the user quits it, possibly days. Anything reading the runner's output waits
+    /// for the pipe to close and therefore waits forever. That is not theoretical: it hung a test
+    /// the first time this path was exercised from one, and the same shape would hang any tooling
+    /// that captured an `--apply` run.
     pub fn relaunch(app: &Path) -> Result<(), String> {
         std::process::Command::new(app)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -183,7 +207,7 @@ mod imp {
 
     /// Off Windows there is nothing to guard against and no settings to hold. Reported as clear so
     /// the tests can exercise the rest of the flow.
-    pub fn check() -> Guard {
+    pub fn check(_listen: &str) -> Guard {
         Guard::Clear
     }
     pub fn repair_settings(_repair_exe: &Path) -> Result<(), String> {

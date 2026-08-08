@@ -84,7 +84,7 @@ fn check_for_updates_in_background(owner: HWND) {
     set_update_state(UpdateState::Checking);
     let hwnd = owner.0 as isize;
     std::thread::spawn(move || {
-        let out = std::process::Command::new(&exe).arg("--check").output();
+        let out = no_window(std::process::Command::new(&exe).arg("--check")).output();
         let state = match out {
             Err(e) => UpdateState::Unreachable {
                 why: format!("could not run the updater: {e}"),
@@ -132,10 +132,42 @@ const WM_APP_UPDATE: u32 = 0x0400 + 17;
 /// The order is the whole safety argument: disengage, **read it back**, and only then spawn. A
 /// process that replaces these binaries while the system still points at this one is the 2026-08-06
 /// stranding failure with extra steps.
+/// How often the background thread wakes to ask whether a check is due.
+///
+/// Short enough that a machine left on picks up a release the same day, long enough that the thread
+/// is doing nothing measurable. The wake is not the check — `prefs.last_check` decides that.
+const CHECK_TICK: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long between checks, wall-clock, across restarts.
+///
+/// Six hours rather than a day: on this line a release can be the difference between a program
+/// working and not, and a check is one small request through a proxy that is already running. Rather
+/// than per-launch, because "once per start" punishes exactly the machines that stay on and rewards
+/// the ones that reboot constantly, which is backwards.
+const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Start a child process without a console window.
+///
+/// `vigil-app.exe` is a `windows_subsystem = "windows"` binary, so it has no console of its own — and
+/// that means every console child it spawns **allocates a new one**, which appears on the user's
+/// desktop as a black rectangle that flashes up and vanishes. The automatic update check does this
+/// once or twice a minute after startup, unasked, and a tool whose whole promise is "it sits quietly
+/// in the background" cannot be blinking a terminal at people.
+///
+/// `CREATE_NO_WINDOW` is the documented flag for exactly this. It does not affect stdout capture,
+/// which is how the status line still gets read.
+fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
 fn install_update(lang: Lang) {
     let state = update_state();
     let version = match &state {
-        UpdateState::Available { version, .. } | UpdateState::Staged { version } => version.clone(),
+        UpdateState::Available { version, .. } | UpdateState::Staged { version, .. } => {
+            version.clone()
+        }
         UpdateState::Interrupted => String::new(),
         _ => return,
     };
@@ -146,20 +178,64 @@ fn install_update(lang: Lang) {
         return;
     }
 
-    // 1. Give the settings back, and check that they went.
+    // 1. Give the settings back, and check that they went — **both** of them, and against our own
+    //    listen address rather than against "any loopback address".
+    //
+    //    The old test was `c.enabled && c.server.contains("127.0.0.1")`. That is not "the machine
+    //    still points at us", it is "the machine points at something on this host", and the two
+    //    differ for exactly the people who most need this to work: a user with their own local proxy
+    //    (Clash, v2rayN, Fiddler, ByeDPI) has a restored, correct, *foreign* setting that matches
+    //    the old predicate, so the update aborted every time with a dialog accusing their machine of
+    //    being stranded. `points_at_us` compares the listen address, and it is already tested.
+    //
+    //    The environment arm was missing entirely, while `docs/18` §6 claimed both were read back —
+    //    and the environment is the half that matters for Roblox, which ignores the registry
+    //    setting. A `HTTPS_PROXY` left naming a vigil that is about to be replaced is the 2026-08-06
+    //    failure in the variables instead of the registry.
     let listen = with_app(|a| a.listen.clone()).unwrap_or_default();
     let _ = engage(false, &listen);
     set_engaged(false);
-    let still_ours = vigil_platform::registry::read_current()
-        .map(|c| c.enabled && c.server.contains("127.0.0.1"))
+
+    let registry_ours = vigil_platform::registry::read_current()
+        .map(|c| vigil_platform::sysproxy::points_at_us(&c, &listen))
         .unwrap_or(false);
-    if still_ours {
-        message_box(&tf(
-            lang,
-            "update.failed",
-            &[("why", "the proxy setting would not come back")],
-        ));
+    let env_ours = vigil_platform::envreg::read_current()
+        .map(|e| vigil_platform::envproxy::points_at_us(&e, &listen))
+        .unwrap_or(false);
+    if registry_ours || env_ours {
+        let which = match (registry_ours, env_ours) {
+            (true, true) => "the proxy setting and the environment variables would not come back",
+            (true, false) => "the proxy setting would not come back",
+            _ => "the proxy environment variables would not come back",
+        };
+        message_box(&tf(lang, "update.failed", &[("why", which)]));
+        // Nothing has been replaced and nothing is staged differently, so the honest thing is to go
+        // back to protecting the user rather than leaving them disengaged after a refused update.
+        let _ = engage(true, &listen);
+        set_engaged(true);
         return;
+    }
+
+    // 1b. Give the resolver back too, **before** the runner exists.
+    //
+    //     This is the one operation in the shutdown path that can block on a UAC prompt, and the
+    //     runner starts a 30-second wait for this process to exit the moment it is spawned. Doing it
+    //     afterwards — which is what `restore_host()` on the way out amounts to — puts a consent
+    //     dialog the user may not answer inside that window: the runner gives up, changes nothing,
+    //     and the user is left disengaged with an update that did not happen. Doing it here costs the
+    //     same prompt at a moment when nothing is waiting on it.
+    if with_app(|a| a.dns_engaged).unwrap_or(false) {
+        if let Err(e) = set_system_dns(false) {
+            message_box(&tf(lang, "update.failed", &[("why", &e)]));
+            let _ = engage(true, &listen);
+            set_engaged(true);
+            return;
+        }
+        APP.with(|a| {
+            if let Some(app) = a.borrow_mut().as_mut() {
+                app.dns_engaged = false;
+            }
+        });
     }
 
     // 2. Copy the updater into the staging folder and run *that*, so the one beside us is idle and
@@ -183,7 +259,9 @@ fn install_update(lang: Lang) {
     // 3. Hand over. It waits for this process to exit before it touches anything.
     let pid = std::process::id().to_string();
     match std::process::Command::new(&runner)
-        .args(["--apply", "--parent", &pid])
+        // `--listen` so the runner's independent guard can ask whether the machine points at *us*
+        // rather than at any loopback address. Only this process knows what it was serving on.
+        .args(["--apply", "--parent", &pid, "--listen", &listen])
         .spawn()
     {
         Ok(_) => {
@@ -1386,6 +1464,39 @@ pub fn run() {
                     WPARAM(0),
                     LPARAM(0),
                 );
+                // And keep looking. This thread used to sleep once, post once and die, so a machine
+                // that stays on — which is most of them — checked exactly once ever, at startup. A
+                // release cut on Tuesday reached it on the next reboot and not before, which for a
+                // tool whose whole point is delivering fixes to a censored line is most of the
+                // feature missing. `prefs.last_check` was written after every check and read by
+                // nothing; now it is what decides whether the interval has passed, so a machine
+                // rebooted hourly does not check hourly either.
+                loop {
+                    std::thread::sleep(CHECK_TICK);
+                    let p = vigil_platform::prefs::read();
+                    if !p.enabled {
+                        continue; // Switched off while running. Keep ticking; it can come back on.
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let due = match p.last_check {
+                        None => true,
+                        Some(t) => now.saturating_sub(t) >= CHECK_INTERVAL.as_secs(),
+                    };
+                    if due
+                        && PostMessageW(
+                            Some(HWND(owner_bits as *mut _)),
+                            WM_APP_START_CHECK,
+                            WPARAM(0),
+                            LPARAM(0),
+                        )
+                        .is_err()
+                    {
+                        return; // The window is gone; so is the reason to keep asking.
+                    }
+                }
             });
         } else {
             set_update_state(UpdateState::Off);
@@ -1407,13 +1518,26 @@ pub fn run() {
 /// Put every host setting back. Idempotent, because it runs from two places that can both
 /// happen: the ordinary exit, and Windows telling us the session is ending.
 fn restore_host() {
-    // The resolver first, and then the proxy. A machine still asking a vigil that has already
-    // put the proxy back cannot resolve anything at all — the loudest failure of the three,
-    // and the one that must not outlive the process by even a moment.
+    // **The proxy first.** This ordering was the other way round, justified by calling a dead
+    // resolver "the loudest failure of the three" — and that reasoning does not survive contact with
+    // what the two operations actually cost.
+    //
+    // The proxy restore is what the comment below claims: a handful of registry writes, microseconds,
+    // no prompt. The DNS restore is not. `set_system_dns(false)` shells out to a cold `powershell.exe`
+    // to enumerate adapters, then to a **second** one running `Start-Process -Verb RunAs -Wait` — a
+    // UAC consent dialog on the secure desktop, waited on synchronously. Inside
+    // `WM_QUERYENDSESSION`, against Windows' 5-second `HungAppTimeout`, that is an invitation to be
+    // force-terminated; and a force-terminated process gets **no** `WM_ENDSESSION` and no
+    // `WM_DESTROY`, so the two second chances this function was given never run either. The machine
+    // then boots with `ProxyEnable=1`, `ProxyServer=https=127.0.0.1:1080` and no vigil: verbatim the
+    // 2026-08-06 failure that cost a reboot with no internet.
+    //
+    // The priority is also backwards on its own terms. A stopped vigil leaves `9.9.9.9` written after
+    // it precisely so name resolution survives — the DNS half has a safety net, deliberately. The
+    // proxy half has none. So the operation without a fallback goes first, and the one with a
+    // fallback goes second, where being killed costs a working resolver rather than a working machine.
+    let _ = repair();
     if with_app(|a| a.dns_engaged).unwrap_or(false) {
         let _ = set_system_dns(false);
     }
-    // And leaving the system proxy pointed at a process that has exited is the least visible
-    // way to break a machine, so it goes back on the way out.
-    let _ = repair();
 }

@@ -259,8 +259,14 @@ pub fn apply(
     }
 
     // The staging folder has done its job. Left behind on any failure, so a resume can use it.
+    //
+    // `cleaned` reports what actually happened rather than that it was attempted. It was set to `true`
+    // unconditionally, and in production it is usually **false**: the runner is executing from inside
+    // this very directory, so Windows refuses to delete it, and `sweep_old_runner` on the next start
+    // is what finishes the job. A field that always says yes is not a field, and this one appears in
+    // output people paste into messages.
     let _ = crate::stage::discard(app_folder);
-    out.cleaned = true;
+    out.cleaned = !crate::stage::staging_dir(app_folder).exists();
     if stop_at == Some(Boundary::AfterCleanup) {
         out.stopped_at = stop_at;
     }
@@ -309,6 +315,41 @@ pub fn outstanding(app_folder: &Path, m: &Manifest) -> Vec<String> {
         .collect()
 }
 
+/// What a folder says about an apply that did not finish — decided without asking the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    /// Some files have been replaced and some have not: an `--apply` finishes the job.
+    Finishable { outstanding: usize },
+    /// A verified set is staged and nothing has been replaced yet. Normal, not an interruption:
+    /// this is what a folder looks like between the download and the user clicking install.
+    NotStarted,
+    /// Nothing to resume — nothing staged, or the folder already matches.
+    Nothing,
+}
+
+/// Decide from three numbers, so the decision is readable and the reading is elsewhere.
+///
+/// **Why this exists.** Four of six adversarial reviewers independently found that a half-applied
+/// update reported "up to date" forever. `--check` asked `is_newer_than(m, Version::running())`, and
+/// `Version::running()` is the *updater's* own version — which is manifest order 4, replaced before
+/// `vigil-app.exe` at order 5. So a crash between those two renames leaves a folder where the
+/// updater is new, the application is old, and the updater answers "I am already the new version",
+/// without ever looking at the staging folder holding the bytes that would finish the job.
+///
+/// `UpdateState::Interrupted` existed in the interface and was constructed nowhere. This is what
+/// constructs it.
+///
+/// The `NotStarted` arm is the one that stops this being a false alarm on the ordinary path: a
+/// freshly staged set also has every file outstanding, and that is not an interruption.
+pub fn resume_state(verified: bool, required: usize, outstanding: usize) -> Resume {
+    match (verified, required, outstanding) {
+        (false, _, _) => Resume::Nothing,
+        (_, _, 0) => Resume::Nothing,
+        (true, r, o) if o >= r => Resume::NotStarted,
+        (true, _, o) => Resume::Finishable { outstanding: o },
+    }
+}
+
 /// The runner: a copy of this executable inside the staging folder, so the one in the application
 /// folder is idle and can be replaced like any other file.
 pub fn runner_path(app_folder: &Path) -> PathBuf {
@@ -327,6 +368,50 @@ pub fn place_runner(app_folder: &Path, me: &Path) -> Result<PathBuf, ApplyError>
 /// is the next run's job — measured: refused while alive, fine once it has exited.
 pub fn sweep_old_runner(app_folder: &Path) {
     let _ = std::fs::remove_file(runner_path(app_folder));
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    /// The whole table. Three numbers, four outcomes, and the one that four independent adversarial
+    /// reviewers found missing.
+    #[test]
+    fn the_resume_table_separates_an_interruption_from_a_fresh_download() {
+        // Nothing verified: nothing to resume, whatever the folder looks like.
+        assert_eq!(resume_state(false, 6, 3), Resume::Nothing);
+        assert_eq!(resume_state(false, 6, 6), Resume::Nothing);
+        assert_eq!(resume_state(false, 6, 0), Resume::Nothing);
+
+        // Already done. Cleanup may still be pending; that is not a resume.
+        assert_eq!(resume_state(true, 6, 0), Resume::Nothing);
+
+        // Every file still outstanding: staged and never started. This is the ordinary state between
+        // the download and the user clicking install, and reporting it as an interruption would put
+        // a false alarm in front of every user who staged an update and went to bed.
+        assert_eq!(resume_state(true, 6, 6), Resume::NotStarted);
+
+        // Some replaced, some not. **This** is the interruption.
+        for left in 1..6 {
+            assert_eq!(
+                resume_state(true, 6, left),
+                Resume::Finishable { outstanding: left },
+                "{left} of 6 outstanding is a half-applied folder"
+            );
+        }
+    }
+
+    /// A manifest can name optional files, so `outstanding` (required only) can exceed nothing and
+    /// still be below the required count — and it can also, in a folder somebody has edited, exceed
+    /// the required count. Neither may be read as an interruption.
+    #[test]
+    fn more_outstanding_than_required_is_not_an_interruption() {
+        assert_eq!(resume_state(true, 3, 4), Resume::NotStarted);
+        assert_eq!(resume_state(true, 0, 0), Resume::Nothing);
+        // Zero required files with something outstanding cannot happen from `outstanding()`, which
+        // counts only required ones — but if it ever does, the safe reading is "not started".
+        assert_eq!(resume_state(true, 0, 1), Resume::NotStarted);
+    }
 }
 
 #[cfg(test)]

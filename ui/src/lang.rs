@@ -206,6 +206,7 @@ pub const STRINGS: &[Entry] = &[
     Entry { key: "status.on",                 tr: "Koruma açık — {{listen}} · strateji: {{strategy}}",
                                               en: "Protection on — {{listen}} · strategy: {{strategy}}" },
 
+    Entry { key: "tooltip.critical",          tr: "Önemli bir güncelleme bekliyor", en: "An important update is waiting" },
     Entry { key: "tooltip.off",               tr: "vigil — kapalı ({{listen}})", en: "vigil — off ({{listen}})" },
     Entry { key: "tooltip.on",                tr: "vigil — açık, {{strategy}} · {{connections}} bağlantı, {{transformed}} dönüştürüldü",
                                               en: "vigil — on, {{strategy}} · {{connections}} connections, {{transformed}} transformed" },
@@ -227,6 +228,7 @@ pub const STRINGS: &[Entry] = &[
     Entry { key: "update.off",                tr: "Otomatik güncelleme kapalı",  en: "Automatic updates are off" },
     Entry { key: "update.section",            tr: "Güncelleme",                  en: "Update" },
     Entry { key: "update.staged",             tr: "{{version}} hazır — kurmak için tıkla", en: "{{version}} is ready — click to install" },
+    Entry { key: "update.staged_critical",    tr: "ÖNEMLİ: {{version}} hazır — kurmak için tıkla", en: "IMPORTANT: {{version}} is ready — click to install" },
     Entry { key: "update.toggle_auto",        tr: "Otomatik güncellemeleri denetle", en: "Check for updates automatically" },
     Entry { key: "update.unreachable",        tr: "Denetlenemedi: {{why}}",      en: "Could not check: {{why}}" },
     Entry { key: "update.up_to_date",         tr: "Güncel",                      en: "Up to date" },

@@ -17,6 +17,7 @@ pub mod guard;
 pub mod http;
 pub mod manifest;
 pub mod plan;
+pub mod release;
 pub mod stage;
 pub mod verify;
 pub mod version;

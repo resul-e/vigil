@@ -35,6 +35,14 @@ use crate::plan::Digests;
 pub const STAGING: &str = ".vigil-update";
 /// Written last. Its presence means every file staged and verified.
 pub const READY: &str = "ready.txt";
+
+/// Where the runner records why an update stopped, so the application can say so on next start.
+///
+/// Beside the binaries rather than in a log directory: it travels with the folder, and the folder is
+/// what a user zips up and sends when they are asking for help. In the application folder, not the
+/// staging one, because a successful apply deletes the staging folder and the reason a *failed* one
+/// leaves behind has to outlive that.
+pub const LAST_ERROR: &str = ".vigil-update-last-error.txt";
 /// The manifest and its signatures, kept beside the staged files.
 ///
 /// So that phase B can **verify again, offline**, rather than trusting that the staging folder was

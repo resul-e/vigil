@@ -245,3 +245,100 @@ fn a_runner_inside_staging_can_replace_the_binary_above_it() {
     apply::sweep_old_runner(sb.path());
     assert!(!placed.exists(), "a leftover runner must be sweepable");
 }
+
+/// The **binary's** `--apply`, run as a process. Everything above tests the library.
+///
+/// This gap was found by review and it is the kind that hides other findings: the whole gate resumes
+/// by calling `apply::apply` in-process, so `apply_cmd` — the argument parsing, the guard, the offline
+/// re-verification, the ordering of the two — had no test at all. Its offline signature check could
+/// have been deleted and every one of the 40 boundary runs would still have passed.
+///
+/// What is asserted here is the refusal, not the success: a staged set whose signatures do not verify
+/// must leave the folder alone. Success needs signatures over a manifest describing real binaries,
+/// which needs a key; refusal needs neither, and refusal is the half that matters — a phase B that
+/// applies unverified bytes is the one bug in this design that cannot be recovered from.
+#[test]
+fn the_binary_refuses_to_apply_a_staged_set_whose_signatures_do_not_verify() {
+    let sb = Sandbox::ready("applycmd");
+    let m = sb.manifest();
+    sb.mark_ready(&m);
+
+    // A complete, correctly hashed staging set — and inputs that are not signatures at all. This is
+    // the shape an attacker with write access to the folder produces: right bytes, right hashes,
+    // no signature. The per-file hashes all match, so **only** the signature check stands between
+    // this and a swap.
+    stage::save_inputs(
+        sb.path(),
+        "schema=1\nnot a real manifest\n",
+        &["not a signature".to_string(), "nor this".to_string()],
+    )
+    .expect("saves inputs");
+
+    // Take `vigil-app.exe` out of the folder first, so the refusal path has nothing to relaunch.
+    //
+    // Not to dodge the relaunch — that is desired behaviour and this asserts it reports itself — but
+    // because a test must not start a tray application on the machine running it. This project has
+    // already shipped one testbench that interfered with programs somebody was using, and a suite
+    // that leaves a GUI behind on every run is the same mistake in miniature. The "nothing moved"
+    // assertion still covers the three files that remain, and `vigil-app.exe` is the one file the
+    // ordering replaces *last*, so it is the least interesting one to watch here.
+    std::fs::remove_file(sb.path().join(plan::APP)).expect("removes the app");
+
+    let before: Vec<Option<_>> = NAMES
+        .iter()
+        .map(|(n, _)| stage::hash_file(&sb.path().join(n)))
+        .collect();
+
+    // Run it the way production does: as the runner **inside** the staging folder. `app_folder` is
+    // derived from `current_exe()`, not the working directory, and steps up out of `.vigil-update/` —
+    // so a copy placed anywhere else would quietly operate on its own directory instead. The first
+    // version of this test learned that by pointing the release binary at its own folder and being
+    // told "nothing staged".
+    let runner = apply::place_runner(sb.path(), &release_dir().join("vigil-update.exe"))
+        .expect("places the runner");
+    let out = std::process::Command::new(&runner)
+        .arg("--apply")
+        .output()
+        .expect("runs");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains(&sb.path().display().to_string()),
+        "the runner must operate on the folder above it, not on {}: {said}",
+        runner.display()
+    );
+
+    assert!(
+        !out.status.success(),
+        "it must refuse. It said:\n{said}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("signature") || said.contains("manifest"),
+        "the refusal must name its reason: {said}"
+    );
+    // And it says what it did about restarting, rather than being silent about it. Every failure path
+    // used to be silent; that is the finding this test also covers.
+    assert!(
+        said.contains("nothing to restart"),
+        "a refusal must account for the application: {said}"
+    );
+    // The reason is left in the folder, so the next start can show it and a user who zips the folder
+    // up and sends it has brought the explanation with them.
+    let recorded = std::fs::read_to_string(sb.path().join(stage::LAST_ERROR))
+        .expect("the reason must be written next to the binaries");
+    assert!(
+        recorded.contains("signature") || recorded.contains("manifest"),
+        "{recorded}"
+    );
+
+    // And nothing moved. This is the assertion the whole ordering exists to protect.
+    let after: Vec<Option<_>> = NAMES
+        .iter()
+        .map(|(n, _)| stage::hash_file(&sb.path().join(n)))
+        .collect();
+    assert_eq!(
+        before, after,
+        "a refused apply must change no file:\n{said}"
+    );
+    assert_repair_works(sb.path(), "after a refused apply");
+}

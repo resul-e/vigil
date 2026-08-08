@@ -1,11 +1,13 @@
-//! The two things about updating that have to survive a restart.
+//! The things about updating that have to survive a restart.
 //!
-//! Whether to check at all, and when we last did. One file, `key=value`, the same shape as every
-//! other thing this project writes to disk.
+//! Whether to check at all, when we last did, and the highest manifest serial this machine has
+//! accepted. One file, `key=value`, the same shape as every other thing this project writes to disk.
 //!
 //! Kept apart from the strategy cache and the settings snapshots on purpose: those are state the
-//! tool manages for itself, and these two are *the user's answer to a question*. A file whose whole
-//! content is a decision somebody made should be findable and editable by the person who made it.
+//! tool manages for itself, and the first two here are *the user's answer to a question*. A file
+//! whose content is a decision somebody made should be findable and editable by the person who made
+//! it. The serial is the exception — it is bookkeeping, and it lives here because it is the only
+//! per-machine thing an update needs to remember, and one file is better than two.
 
 use std::path::PathBuf;
 
@@ -29,6 +31,29 @@ pub struct Prefs {
     /// "no updates" apart from "not looking", and those are very different situations on a line
     /// that may be blocking the download.
     pub last_check: Option<u64>,
+    /// The highest manifest serial this machine has ever accepted. `None` means never accepted one.
+    ///
+    /// This is the rollback defence, and until 2026-08-08 it did not exist: `Trust::serial_floor`
+    /// was passed a hard-coded `0`, so `SERIAL_WINDOW` guarded nothing and a signed-but-superseded
+    /// manifest could be replayed at a client forever. Three of six adversarial reviewers found it
+    /// independently.
+    ///
+    /// Kept here rather than compiled in because the useful floor is *this machine's* history: a
+    /// constant in the binary can only say what was true when it was built, and it is replaced by
+    /// the very updates it is meant to bound.
+    pub last_serial: Option<u64>,
+}
+
+/// The floor to hand [`Trust::serial_floor`], derived from what this machine has accepted.
+///
+/// **One below** the highest accepted serial, not equal to it. `check_trust` refuses
+/// `serial <= floor`, so a floor equal to the last accepted serial would refuse *that same
+/// manifest* the next time it was fetched — and re-fetching the current manifest is completely
+/// ordinary: it happens whenever a user deletes the staging folder, or a download is interrupted,
+/// or they simply check twice. Writing the obvious thing here turns a replay defence into a
+/// permanent lockout, which is the same shape of mistake as the bug it is fixing.
+pub fn serial_floor(p: &Prefs) -> u64 {
+    p.last_serial.map(|s| s.saturating_sub(1)).unwrap_or(0)
 }
 
 impl Default for Prefs {
@@ -36,6 +61,7 @@ impl Default for Prefs {
         Prefs {
             enabled: true,
             last_check: None,
+            last_serial: None,
         }
     }
 }
@@ -57,6 +83,7 @@ pub fn parse(text: &str) -> Prefs {
             match k.trim() {
                 "enabled" => p.enabled = v.trim() != "0",
                 "last_check" => p.last_check = v.trim().parse().ok(),
+                "last_serial" => p.last_serial = v.trim().parse().ok(),
                 _ => {}
             }
         }
@@ -69,6 +96,9 @@ pub fn render(p: &Prefs) -> String {
     s.push_str(&format!("enabled={}\n", u8::from(p.enabled)));
     if let Some(t) = p.last_check {
         s.push_str(&format!("last_check={t}\n"));
+    }
+    if let Some(n) = p.last_serial {
+        s.push_str(&format!("last_serial={n}\n"));
     }
     s
 }
@@ -149,13 +179,61 @@ mod tests {
         let p = Prefs {
             enabled: false,
             last_check: Some(42),
+            last_serial: None,
         };
         assert_eq!(parse(&render(&p)), p);
         let never = Prefs {
             enabled: true,
             last_check: None,
+            last_serial: None,
         };
         assert_eq!(parse(&render(&never)), never);
+    }
+
+    /// The floor must be one **below** the highest accepted serial, so re-fetching the manifest a
+    /// machine already has still works. Getting this off by one converts the replay defence into a
+    /// permanent lockout — the same class of bug as the missing floor it replaces.
+    #[test]
+    fn the_serial_floor_still_admits_the_manifest_already_accepted() {
+        let never = Prefs::default();
+        assert_eq!(
+            serial_floor(&never),
+            0,
+            "nothing accepted yet admits serial 1"
+        );
+
+        let seen = |n: u64| Prefs {
+            last_serial: Some(n),
+            ..Prefs::default()
+        };
+        assert_eq!(serial_floor(&seen(7)), 6);
+        // The point: serial 7 is still above the floor, so the same manifest is re-acceptable.
+        assert!(
+            7 > serial_floor(&seen(7)),
+            "the manifest we have must re-verify"
+        );
+        // And anything strictly older is not.
+        assert!(6 <= serial_floor(&seen(7)), "serial 6 must be refused");
+
+        // No underflow at the bottom, which is where an off-by-one would panic in release mode's
+        // sibling and silently wrap here.
+        assert_eq!(serial_floor(&seen(0)), 0);
+        assert_eq!(serial_floor(&seen(1)), 0);
+        assert_eq!(serial_floor(&seen(u64::MAX)), u64::MAX - 1);
+    }
+
+    #[test]
+    fn the_accepted_serial_round_trips_and_a_bad_one_is_simply_absent() {
+        assert_eq!(parse("last_serial=7").last_serial, Some(7));
+        assert_eq!(parse("last_serial=").last_serial, None);
+        assert_eq!(parse("last_serial=lots").last_serial, None);
+        assert_eq!(parse("last_serial=-1").last_serial, None);
+        let p = Prefs {
+            enabled: true,
+            last_check: Some(9),
+            last_serial: Some(12),
+        };
+        assert_eq!(parse(&render(&p)), p);
     }
 
     #[test]
@@ -181,6 +259,7 @@ mod tests {
         let p = Prefs {
             enabled: false,
             last_check: Some(1_760_000_000),
+            last_serial: Some(3),
         };
         write_in(&dir, &p).expect("writes");
         assert_eq!(read_in(&dir), p);

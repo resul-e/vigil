@@ -66,25 +66,52 @@ fn main() -> ExitCode {
     // until 2026-08-05 — means the quieter two are never even looked at.
     if !force && !sysproxy::is_stranded(&current, "127.0.0.1:") {
         println!("proxy: nothing to repair (not pointing at vigil)");
-        repair_env(force);
-        repair_dns(force);
+        let ok = both(repair_env(force), repair_dns(force));
         println!("(use --force to disable the proxy anyway)");
-        return ExitCode::SUCCESS;
+        return exit_for(ok);
     }
 
     // Prefer restoring exactly what was there before vigil started.
-    let target = snapshot
+    let previous = snapshot
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| sysproxy::snapshot_from_text(&t))
-        .map(|prev| {
+        .and_then(|t| sysproxy::snapshot_from_text(&t));
+
+    // No snapshot means one of two very different things, and this used to treat them the same.
+    //
+    // If the setting names *our* address, there was a vigil here and its snapshot is missing or was
+    // already consumed: disabling the proxy is right, and it is what saves a stranded machine.
+    //
+    // If it names some other local proxy — Clash, v2rayN, Fiddler, ByeDPI on another port — then
+    // vigil deliberately never wrote a snapshot, because `envproxy::start`/`sysproxy` refuse to take
+    // over a setting somebody else owns. Writing `disabled()` there does not repair anything: it
+    // silently destroys a configuration this tool never touched, with nothing to restore it from.
+    // An adversarial review reached that state through the updater's guard, which is the same
+    // "loopback" / "us" confusion in a third place. Refusing is the only safe answer, and `--force`
+    // remains for the user who really does want the proxy off.
+    let target = match (previous, sysproxy::is_stranded(&current, "127.0.0.1:")) {
+        (Some(prev), _) => {
             println!("restoring the snapshot taken before vigil started");
             sysproxy::rollback_to(&prev)
-        })
-        .unwrap_or_else(|| {
+        }
+        (None, _) if force => {
+            println!("no snapshot, but --force was given; disabling the proxy");
+            sysproxy::disabled()
+        }
+        (None, true) => {
             println!("no usable snapshot; disabling the proxy instead");
             sysproxy::disabled()
-        });
+        }
+        (None, false) => {
+            println!(
+                "proxy: {} is not vigil and there is no snapshot",
+                current.server
+            );
+            println!("       leaving it alone — vigil never wrote this and cannot restore it.");
+            println!("       (use --force to disable the proxy anyway)");
+            return exit_for(both(repair_env(force), repair_dns(force)));
+        }
+    };
 
     match registry::apply(&target) {
         Ok(()) => {
@@ -92,9 +119,7 @@ fn main() -> ExitCode {
             if let Some(p) = &snapshot {
                 let _ = std::fs::remove_file(p);
             }
-            repair_env(force);
-            repair_dns(force);
-            ExitCode::SUCCESS
+            exit_for(both(repair_env(force), repair_dns(force)))
         }
         Err(e) => {
             eprintln!("could not write the settings: {e}");
@@ -104,46 +129,85 @@ fn main() -> ExitCode {
     }
 }
 
+/// Both, and **both actually run**. `a && b` would skip the second when the first failed, and the
+/// three things vigil can leave behind are independent: a machine can have clean environment
+/// variables and a resolver pointing at a vigil that is gone. An early exit through the quieter
+/// halves is the bug this file already fixed once, on 2026-08-05.
+fn both(a: bool, b: bool) -> bool {
+    a && b
+}
+
+/// What the exit code means, which until now was "the process reached the end".
+///
+/// `repair_env` and `repair_dns` returned `()`, so their failures printed to a stdout nobody reads
+/// and the process still exited 0. That mattered beyond tidiness: `vigil-update` ran this tool and
+/// took its exit status as proof the settings were restored, on the one path where being wrong means
+/// somebody has no internet. The updater now re-reads the machine as well — belt and braces — but the
+/// safety net's own contract should be true on its own.
+fn exit_for(ok: bool) -> ExitCode {
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        eprintln!();
+        eprintln!("something could not be restored. Read the lines above: each says which of the");
+        eprintln!("three (proxy, environment variables, DNS) failed and how to undo it by hand.");
+        ExitCode::from(1)
+    }
+}
+
 /// The other half of a stranded machine, and the quieter one.
 ///
 /// `HTTP_PROXY` and friends are read by `git`, `pip`, `npm` and every script that shells out
 /// to `curl`. Left pointing at a listener that is gone they fail with connection-refused and
 /// nothing on screen mentions a proxy, so this is arguably the harder half to diagnose by
 /// hand. Repaired on the same rules: restore the snapshot if there is one, otherwise clear.
-fn repair_env(force: bool) {
+fn repair_env(force: bool) -> bool {
     use vigil_platform::{envproxy, envreg};
 
     let current = match envreg::read_current() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("cannot read the proxy environment variables: {e}");
-            return;
+            eprintln!("environment: cannot read the proxy variables: {e}");
+            return false;
         }
     };
     if !force && !envproxy::is_stranded(&current, "127.0.0.1:") {
         println!("environment: nothing to repair");
-        return;
+        return true;
     }
-    let target = env_snapshot_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| {
+    // Same rule as the registry half, and for the same reason: with no snapshot, clearing all four
+    // variables is a repair only if they were ours. Somebody else's `HTTPS_PROXY=http://127.0.0.1:8888`
+    // is not ours, and vigil never wrote a snapshot over it precisely so that it would not be
+    // clobbered. Clearing it — including their `NO_PROXY`, which the old code did — destroys a
+    // configuration with nothing to put back.
+    let snapshot = env_snapshot_path().and_then(|p| std::fs::read_to_string(p).ok());
+    let target = match (snapshot, force) {
+        (Some(t), _) => {
             println!("environment: restoring the snapshot taken before vigil started");
             envproxy::snapshot_from_text(&t)
-        })
-        .unwrap_or_else(|| {
-            println!("environment: no usable snapshot; clearing the variables instead");
+        }
+        (None, true) => {
+            println!("environment: no snapshot, but --force was given; clearing the variables");
             envproxy::EnvProxy::default()
-        });
+        }
+        (None, false) => {
+            println!("environment: no usable snapshot, and these variables are not vigil's.");
+            println!("             Leaving them alone. (use --force to clear them anyway)");
+            return true;
+        }
+    };
     match envreg::apply(&target) {
         Ok(()) => {
             println!("environment: restored");
             if let Some(p) = env_snapshot_path() {
                 let _ = std::fs::remove_file(p);
             }
+            true
         }
         Err(e) => {
             eprintln!("environment: could not write the variables: {e}");
             eprintln!("undo it by hand: Windows > \"Edit environment variables for your account\"");
+            false
         }
     }
 }
@@ -154,20 +218,20 @@ fn repair_env(force: bool) {
 /// at a vigil that is not running has **no name resolution at all** — nothing resolves, and the
 /// error every program shows is about the site, never about a resolver. vigil always writes a
 /// public fallback after itself so this should not happen, but "should not" is not a plan.
-fn repair_dns(force: bool) {
+fn repair_dns(force: bool) -> bool {
     use vigil_platform::{dnsclient, sysdns};
 
     let ifaces = match dnsclient::read_interfaces() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("dns: cannot read the current servers: {e}");
-            return;
+            return false;
         }
     };
     let stranded = sysdns::stranded(&ifaces);
     if stranded.is_empty() && !force {
         println!("dns: nothing to repair");
-        return;
+        return true;
     }
     let snapshot: Vec<sysdns::Interface> = dns_snapshot_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -197,7 +261,7 @@ fn repair_dns(force: bool) {
     }
     if changes.is_empty() {
         println!("dns: nothing to repair");
-        return;
+        return true;
     }
     println!("dns: this needs administrator rights — Windows will ask");
     match dnsclient::apply(&changes) {
@@ -206,12 +270,14 @@ fn repair_dns(force: bool) {
             if let Some(p) = dns_snapshot_path() {
                 let _ = std::fs::remove_file(p);
             }
+            true
         }
         Err(e) => {
             eprintln!("dns: could not restore ({e})");
             eprintln!(
                 "undo it by hand: Ayarlar > Ağ ve İnternet > adaptör > DNS > Otomatik (DHCP)"
             );
+            false
         }
     }
 }
