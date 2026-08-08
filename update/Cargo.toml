@@ -1,0 +1,34 @@
+[package]
+name = "vigil-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The only crate that links rustls and a signature verifier, and the reason neither ever reaches
+# `vigil-app.exe` — which every user runs — or `vigil-repair.exe`, which is the safety net and must
+# keep working when everything else has gone wrong. See docs/18-auto-update.md §1.
+#
+# The direction is `update -> proxy -> platform`, never the reverse, and a test asserts it.
+[dependencies]
+vigil-core = { path = "../core" }
+# The resolver that asks an odd port before the operating system, and the same first-flight
+# transform every other vigil connection uses. Reused rather than reimplemented: an updater that
+# reached the network differently from the proxy would be the one code path nobody had measured.
+vigil-proxy = { path = "../proxy" }
+# Already in [workspace.dependencies] for probe/. New only in that they now reach a shipping
+# binary — and only this one.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true
+# One crate, measured zero transitive dependencies, carrying its own curve25519 and SHA-512. The
+# entire integrity story, because there is no code-signing certificate.
+minisign-verify = "0.2.5"
+
+[lib]
+name = "vigil_update"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vigil-update"
+path = "src/bin/update.rs"
