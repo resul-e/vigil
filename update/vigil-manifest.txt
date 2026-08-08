@@ -1,16 +1,16 @@
 # vigil update manifest — signed, do not edit
 schema=1
-serial=7
-version=0.7.0
+serial=9
+version=0.7.1
 expires=2027-02-08T00:00:00Z
 min_version=0.6.3
 critical=0
-base=https://github.com/resul-e/vigil/releases/download/v0.7.0/
+base=https://github.com/resul-e/vigil/releases/download/v0.7.1/
 notes_tr=Güncellemeler artık kendini kuruyor.
 notes_en=Updates now install themselves.
-file=0 vigil-repair.exe 402432 1 8fa58dee1cdfd708eae188cba6a7eb0c0fa1d2362a5cdebb51cd8b50ad71cde4
-file=1 vigil.exe 707072 1 cdba8c6f88f3ea21f3aedb792f0f8545f3bf356487286d375f115790deeed5e0
-file=2 wirelog.exe 391168 0 bd190392d2fb599147cef2789aad287501f3831ae8471f32f3ad1aad3925bcdd
-file=3 vigil-scan.exe 961536 0 58ce3402a30db879852fa8f39be5ba9cc5f7aae064c9e1dde729e667b614bef3
-file=4 vigil-update.exe 3164160 1 0cc6eaaf38515c55033e0cbca2d2a0616fad189ecf36424c044591dd54bc7b89
-file=5 vigil-app.exe 805888 1 f5c58ff710715a00e155bedcedaa0facd952ee4adf256eeffa05272914251510
+file=0 vigil-repair.exe 402432 1 08191582a1d3d3376b2f0bd78906c33422283fa010229784a9b7c92a1b38f91f
+file=1 vigil.exe 707072 1 f96c6ae88bdd18a75248584df8021521a6d48275029a41b34819592cb30112d7
+file=2 wirelog.exe 391168 0 30a739e51e64bed2ce4f7fce9853fdb138b300918ec994180572bd4a2d479b0e
+file=3 vigil-scan.exe 970752 0 52a04fc83cdb57205b5070d6c98a7754862d9b70d6328116532efcfc951503a0
+file=4 vigil-update.exe 3164160 1 fb18b8e7ebb2f6f12da333b0570e6ce5cf14935e24e20ce7c3b5f87d874bd3bd
+file=5 vigil-app.exe 805888 1 9368436165221f8bc1efd63becf919e4cabf9f849431b9f83247d20c14a4dc83

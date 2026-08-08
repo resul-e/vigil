@@ -557,8 +557,14 @@ fn unrecognised_opening_bytes_are_counted_and_dropped() {
 /// wire — and does not disturb the one already open.
 ///
 /// The interface exposes this, so the thing it promises has to be true of the datapath and not
-/// only of the label in the window. Asserted through the delay form, because a delayed second
-/// write is the one boundary loopback cannot coalesce away.
+/// only of the label in the window.
+///
+/// It used to say here that the delay form was chosen "because a delayed second write is the one
+/// boundary loopback cannot coalesce away". That was wrong, and a measurement said so on 2026-08-09:
+/// under `cargo test --workspace` the stub's reader thread can miss the whole 40 ms gap and read
+/// both writes as one, which failed a release. One failure in six workspace runs, zero in fifteen
+/// runs of this test alone. The delay still helps; it is just not a guarantee, and the assertion
+/// that decides this test is now the server's own record of the strategy it applied.
 #[test]
 fn a_mode_change_reaches_the_next_connection() {
     let (up, sizes) = stub_upstream();
@@ -571,6 +577,9 @@ fn a_mode_change_reaches_the_next_connection() {
         // and the next assertion reads the wrong connection's — which is how this test failed
         // once before it was pinned down. Retrying has its own tests.
         first_flight_attempts: 1,
+        // So the strategy the server actually applied is recorded and can be asserted on. The wire
+        // observation below is not reliable under load; this is.
+        record_hosts: true,
         ..Default::default()
     };
     let server = std::sync::Arc::new(Server::new(cfg));
@@ -608,10 +617,37 @@ fn a_mode_change_reaches_the_next_connection() {
     c.read_exact(&mut back).expect("echo");
     drop(c);
     let seen = sizes.recv_timeout(Duration::from_secs(5)).expect("sizes");
-    assert_eq!(
-        seen.first(),
-        Some(&1),
-        "after the switch the first write must be one byte: {seen:?}"
+
+    // **The server's own record first, because it is the only deterministic evidence here.**
+    //
+    // The read-boundary technique this file leans on is honest about its limits at the top: read
+    // boundaries "track write boundaries closely enough to tell one write from two" — over an idle
+    // loopback. Under `cargo test --workspace`, sixteen test binaries at once, the stub's reader
+    // thread can go unscheduled for longer than the split's own 40 ms gap, and both writes are then
+    // sitting in the socket buffer when it finally reads: one read of 300 where there were two
+    // writes of 1 and 299. Measured at one failure in six workspace runs and zero in fifteen runs of
+    // this test alone, which is the signature of load rather than logic.
+    //
+    // That collapse is indistinguishable from the bug this test exists to catch — a mode change that
+    // never reached the next connection also produces `[300]`. So the assertion that decides the
+    // test is the strategy the server *recorded applying*, which no scheduler can reorder.
+    let detail = server.seen_detail();
+    let (_, rec) = detail
+        .iter()
+        .find(|(h, _)| h == "127.0.0.1")
+        .expect("the host must be recorded");
+    assert!(
+        rec.applied.contains("split:1@40"),
+        "the mode change must reach the next connection; recorded: {:?}",
+        rec.applied
+    );
+
+    // And the wire, when the machine let us see it. A single read totalling 300 is the coalesced
+    // case and proves nothing either way; anything else must show the split.
+    let coalesced = seen.len() == 1 && seen[0] == 300;
+    assert!(
+        coalesced || seen.first() == Some(&1),
+        "the first write must be one byte unless the reads coalesced: {seen:?}"
     );
 
     // And back again, so the switch is not one-way.

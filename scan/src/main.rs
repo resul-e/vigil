@@ -45,9 +45,12 @@ struct Options {
     apps: bool,
     app_wait: u64,
     port: u16,
-    /// Seconds to watch the whole machine with the proxy engaged, 0 to skip. Off by default:
-    /// it is only worth anything while somebody is actually using the computer.
+    /// Seconds to watch the whole machine with the proxy engaged, 0 to skip.
     observe: u64,
+    /// Wait for Enter before exiting. On by default, because the person this tool is aimed at
+    /// **double-clicks it from Explorer** — and a console that closes on exit takes the report's
+    /// filename with it.
+    pause: bool,
 }
 
 impl Default for Options {
@@ -61,9 +64,68 @@ impl Default for Options {
             // Costs about three extra minutes and removes a confound.
             app_wait: 90,
             port: 1085,
-            observe: 0,
+            // On by default since 2026-08-09. It was off, on the reasoning that watching is only
+            // worth anything while somebody is using the computer — true, and it made the one
+            // measurement that decides whether v2 gets built reachable only by typing a flag. The
+            // volunteers who have the interesting networks do not use a terminal; they run the
+            // `.exe`. A default that needs an argument to be useful is a default that never runs.
+            observe: 180,
+            pause: true,
         }
     }
+}
+
+/// Where the report goes: **beside the executable**, not in the working directory.
+///
+/// A volunteer double-clicks this from Explorer, and Explorer's working directory is not reliably
+/// the folder the `.exe` sits in — running it straight out of a zip makes it a temporary folder,
+/// where the report is written and then lost with the temp directory. The person then has nothing to
+/// send and no way to know why.
+fn report_path(name: &str) -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .unwrap_or_else(|| std::path::PathBuf::from(name))
+}
+
+/// Open the folder with the report selected, so finding it needs no navigating.
+///
+/// Best effort and deliberately unchecked: `explorer.exe /select` exits non-zero even when it works,
+/// and a testbench that reported failure because a file manager was rude would be worse than one
+/// that stays quiet.
+#[cfg(windows)]
+fn reveal(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+}
+#[cfg(not(windows))]
+fn reveal(_path: &std::path::Path) {}
+
+/// Hold the console open until somebody presses Enter.
+///
+/// The whole reason this exists: everything this tool prints at the end — where the report is, what
+/// to do with it, whether the controls passed — is printed into a window that Windows closes the
+/// instant the process exits. For anyone who did not start it from a terminal, that is the same as
+/// printing nothing.
+fn wait_for_enter() {
+    use std::io::Write;
+    eprintln!();
+    eprint!("Kapatmak için Enter'a bas. / Press Enter to close. ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+}
+
+/// Keep the console open if this panics, so the message can be read and sent.
+fn hold_window_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        eprintln!();
+        eprintln!("Beklenmeyen bir hata oldu. Yukarıdaki satırları Resul'e gönder.");
+        wait_for_enter();
+    }));
 }
 
 fn main() -> std::process::ExitCode {
@@ -72,7 +134,13 @@ fn main() -> std::process::ExitCode {
         Some("cell") => cell(&args[1..]),
         Some("dns") => dns_report(),
         Some("teshis") | Some("diag") => diag_report(),
-        None => run(Options::default()),
+        None => {
+            // The double-click path. Anything that goes wrong from here is printed into a window
+            // Windows closes the moment this process exits, so a panic would reach the volunteer as
+            // "it flashed and nothing happened" — the least reportable bug there is.
+            hold_window_on_panic();
+            run(Options::default())
+        }
         Some(a) if a.starts_with("--") => {
             let mut o = Options::default();
             let mut i = 0usize;
@@ -94,6 +162,7 @@ fn main() -> std::process::ExitCode {
                         i += 1;
                         o.observe = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(120);
                     }
+                    "--no-pause" => o.pause = false,
                     other => {
                         eprintln!("bilinmeyen seçenek: {other}");
                         return std::process::ExitCode::from(2);
@@ -109,6 +178,8 @@ fn main() -> std::process::ExitCode {
                 "       vigil-scan --no-apps       # sadece ağ ölçümü, hiçbir ayara dokunmaz"
             );
             eprintln!("       vigil-scan --observe 300    # 5 dk boyunca hangi programlar vigil'i kullanıyor");
+            eprintln!("       vigil-scan --observe 0      # makineyi hiç izleme");
+            eprintln!("       vigil-scan --no-pause       # bitince Enter bekleme (betik için)");
             eprintln!("       vigil-scan --app-wait 60 --port 1090");
             eprintln!("       vigil-scan dns    # sadece DNS bütünlüğü / DNS integrity only");
             eprintln!(
@@ -591,8 +662,11 @@ fn run(opts: Options) -> std::process::ExitCode {
     } else {
         0
     };
-    let fast = ((total + app_probes) * 200) / 60_000 + 1 + app_minutes;
-    let slow = ((total + app_probes) * 6_200) / 60_000 + 1 + app_minutes;
+    // The watch window counts too. Left out, the estimate said four minutes for a run that takes
+    // seven, and a volunteer with no terminal reads that gap as "it has hung".
+    let observe_minutes = (opts.observe as usize).div_ceil(60);
+    let fast = ((total + app_probes) * 200) / 60_000 + 1 + app_minutes + observe_minutes;
+    let slow = ((total + app_probes) * 6_200) / 60_000 + 1 + app_minutes + observe_minutes;
     eprintln!("Yaklaşık {total} bağlantı denemesi yapılacak.");
     eprintln!(
         "Süre: engelleme hızlı cevap veriyorsa ~{fast} dakika; sessizce düşürüyorsa \
@@ -732,7 +806,8 @@ fn run(opts: Options) -> std::process::ExitCode {
         env!("CARGO_PKG_VERSION"),
         now_secs()
     );
-    let written = std::fs::write(&name, &text);
+    let path = report_path(&name);
+    let written = std::fs::write(&path, &text);
 
     eprintln!();
     eprintln!("{}", "=".repeat(72));
@@ -747,8 +822,12 @@ fn run(opts: Options) -> std::process::ExitCode {
     match written {
         Ok(()) => {
             eprintln!();
-            eprintln!("Rapor dosyası: {name}");
+            eprintln!("Rapor dosyası:");
+            eprintln!("  {}", path.display());
+            eprintln!();
             eprintln!("Bu dosyayı Resul'e gönder. İçini açıp okuyabilirsin, düz metindir.");
+            eprintln!("Dosyanın bulunduğu klasör şimdi açılıyor.");
+            reveal(&path);
         }
         Err(e) => {
             eprintln!("Rapor dosyası yazılamadı ({e}). Rapor aşağıda:");
@@ -756,5 +835,8 @@ fn run(opts: Options) -> std::process::ExitCode {
         }
     }
     eprintln!("{}", "=".repeat(72));
+    if opts.pause {
+        wait_for_enter();
+    }
     std::process::ExitCode::SUCCESS
 }
