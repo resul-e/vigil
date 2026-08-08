@@ -287,6 +287,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-update"
+version = "0.6.3"
+dependencies = [
+ "vigil-core",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

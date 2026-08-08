@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "platform", "probe", "proxy", "scan", "ui"]
+members = ["core", "platform", "probe", "proxy", "scan", "ui", "update"]
 
 [workspace.package]
 # One version for the whole workspace, so every binary and every report names the same build.

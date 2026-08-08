@@ -13,6 +13,7 @@
 
 pub mod calibrate;
 pub mod clienthello;
+pub mod clock;
 pub mod dnsmsg;
 pub mod hostlist;
 pub mod reader;

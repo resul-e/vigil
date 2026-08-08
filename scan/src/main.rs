@@ -7,7 +7,6 @@
 mod appphase;
 mod apps;
 mod attempt;
-mod clock;
 mod dns;
 mod hostdiag;
 mod net;
@@ -18,6 +17,7 @@ mod report;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use vigil_core::clock;
 use vigil_core::strategy::Strategy;
 use vigil_core::{Tally, MIN_TRIALS};
 
