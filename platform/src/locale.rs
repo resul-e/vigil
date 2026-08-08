@@ -39,8 +39,16 @@ pub fn lang_file() -> Option<std::path::PathBuf> {
 /// A language is not a diagnostic — it is the language the person reads, and asking them to
 /// choose it again on every launch would be the bug.
 pub fn saved_lang() -> Option<String> {
-    let p = lang_file()?;
-    let s = std::fs::read_to_string(p).ok()?;
+    saved_lang_in(&crate::paths::state_dir()?)
+}
+
+/// The same, from a directory the caller names.
+///
+/// Exists so the tests can use a temporary directory instead of moving `XDG_CONFIG_HOME` out from
+/// under the whole process. Two tests doing that at once raced and failed exactly once, which is the
+/// worst way for a test to be wrong.
+pub fn saved_lang_in(dir: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(dir.join("lang.txt")).ok()?;
     let s = s.trim().to_string();
     (!s.is_empty()).then_some(s)
 }
@@ -48,16 +56,18 @@ pub fn saved_lang() -> Option<String> {
 /// Remember the chosen language. Best effort: failing to write a preference must never take the
 /// interface down, and the worst case is that the next launch follows the system again.
 pub fn save_lang(tag: &str) -> std::io::Result<()> {
-    let Some(p) = lang_file() else {
+    let Some(dir) = crate::paths::state_dir() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no state directory",
         ));
     };
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(p, tag)
+    save_lang_in(&dir, tag)
+}
+
+pub fn save_lang_in(dir: &std::path::Path, tag: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("lang.txt"), tag)
 }
 
 /// The `VIGIL_LANG` value, if the user set one.

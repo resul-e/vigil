@@ -35,6 +35,16 @@ use crate::plan::Digests;
 pub const STAGING: &str = ".vigil-update";
 /// Written last. Its presence means every file staged and verified.
 pub const READY: &str = "ready.txt";
+/// The manifest and its signatures, kept beside the staged files.
+///
+/// So that phase B can **verify again, offline**, rather than trusting that the staging folder was
+/// not touched between the download and the swap. Phase A runs while the user is protected and phase
+/// B can be minutes or a reboot later; anything with write access to the folder in between could
+/// otherwise substitute a file, and the hash it would be checked against would be the one it
+/// brought with it.
+pub const MANIFEST: &str = "manifest.txt";
+pub const SIG_A: &str = "manifest.txt.minisig";
+pub const SIG_B: &str = "manifest.txt.minisig2";
 /// How many times one file is re-fetched before the run gives up on it.
 pub const ATTEMPTS: usize = 3;
 
@@ -281,6 +291,36 @@ pub fn ready_text(m: &Manifest) -> String {
          Delete this folder to cancel the update.\n",
         m.version, m.serial
     )
+}
+
+/// Keep the manifest and its signatures beside the staged files, so phase B can verify offline.
+pub fn save_inputs(
+    app_folder: &Path,
+    manifest_text: &str,
+    sigs: &[String],
+) -> Result<(), StageError> {
+    let dir = staging_dir(app_folder);
+    std::fs::create_dir_all(&dir).map_err(|e| StageError::Io(e.to_string()))?;
+    std::fs::write(dir.join(MANIFEST), manifest_text).map_err(|e| StageError::Io(e.to_string()))?;
+    for (name, sig) in [SIG_A, SIG_B].iter().zip(sigs.iter()) {
+        std::fs::write(dir.join(name), sig).map_err(|e| StageError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Read them back. `None` when the set is not there — which phase B treats as "nothing to apply"
+/// rather than as an error, because that is the ordinary state of a folder with no update pending.
+pub fn load_inputs(app_folder: &Path) -> Option<(String, Vec<String>)> {
+    let dir = staging_dir(app_folder);
+    let text = std::fs::read_to_string(dir.join(MANIFEST)).ok()?;
+    let sigs: Vec<String> = [SIG_A, SIG_B]
+        .iter()
+        .filter_map(|n| std::fs::read_to_string(dir.join(n)).ok())
+        .collect();
+    if sigs.is_empty() {
+        return None;
+    }
+    Some((text, sigs))
 }
 
 /// Delete the staging folder. Used to cancel, and after a successful apply.
@@ -622,5 +662,40 @@ mod tests {
             assert_eq!(hash_file(&p), Some(sha256::hash(&body)), "{n} bytes");
         }
         assert_eq!(hash_file(&sb.path().join("nope.bin")), None);
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    /// Phase B has to be able to verify again without the network. The manifest and both signatures
+    /// therefore live beside the staged files — otherwise the only hash a substituted file would be
+    /// checked against is the one it arrived with.
+    #[test]
+    fn the_manifest_and_signatures_survive_for_phase_b() {
+        let dir = std::env::temp_dir().join(format!("vigil-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+
+        assert_eq!(load_inputs(&dir), None, "nothing staged yet");
+
+        let sigs = vec!["sig one".to_string(), "sig two".to_string()];
+        save_inputs(&dir, "schema=1\n", &sigs).expect("saves");
+        let (text, back) = load_inputs(&dir).expect("loads");
+        assert_eq!(text, "schema=1\n");
+        assert_eq!(back, sigs);
+
+        // One signature missing is still loadable — the verifier is what decides that two are
+        // required, and it must be the thing that says so rather than the file reader.
+        std::fs::remove_file(staging_dir(&dir).join(SIG_B)).expect("remove");
+        let (_, one) = load_inputs(&dir).expect("still loads");
+        assert_eq!(one.len(), 1);
+
+        // No signatures at all is "nothing to apply", not an error.
+        std::fs::remove_file(staging_dir(&dir).join(SIG_A)).expect("remove");
+        assert_eq!(load_inputs(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

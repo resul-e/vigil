@@ -33,7 +33,183 @@ use vigil_core::calibrate::Cache;
 use vigil_proxy::{Config, Mode as ProxyMode, Server, Stats};
 
 use crate::lang::{t, tf, Lang};
+use crate::model::UpdateState;
 use crate::model::{self, Command, Snapshot};
+
+/// Where the update machinery has got to, shared with the background thread that checks.
+///
+/// A `Mutex` rather than the atomic the language uses, because this one carries a version string and
+/// a reason. Held only long enough to read or replace it — never across a syscall, and never while
+/// painting.
+static UPDATE: std::sync::Mutex<Option<UpdateState>> = std::sync::Mutex::new(None);
+
+fn update_state() -> UpdateState {
+    UPDATE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or(UpdateState::NeverChecked)
+}
+
+fn set_update_state(s: UpdateState) {
+    if let Ok(mut g) = UPDATE.lock() {
+        *g = Some(s);
+    }
+}
+
+/// `vigil-update.exe`, beside us.
+fn updater_path() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("vigil-update.exe")))
+        .unwrap_or_else(|| std::path::PathBuf::from("vigil-update.exe"))
+}
+
+/// Run `vigil-update.exe --check` and read the one line it prints.
+///
+/// Shelled out rather than linked, deliberately: linking the updater would put rustls inside this
+/// binary, and keeping it out is the whole reason the updater is a separate program. The contract is
+/// one line of text and the parser for it is in `model`, tested on Linux.
+///
+/// Runs on its own thread. A wedged updater on a silently-dropping line is then a separate process
+/// with its own deadlines, and closing the application does not wait for it.
+fn check_for_updates_in_background(owner: HWND) {
+    let exe = updater_path();
+    if !exe.exists() {
+        set_update_state(UpdateState::Unreachable {
+            why: "vigil-update.exe is missing".into(),
+        });
+        return;
+    }
+    set_update_state(UpdateState::Checking);
+    let hwnd = owner.0 as isize;
+    std::thread::spawn(move || {
+        let out = std::process::Command::new(&exe).arg("--check").output();
+        let state = match out {
+            Err(e) => UpdateState::Unreachable {
+                why: format!("could not run the updater: {e}"),
+            },
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let line = text
+                    .lines()
+                    .rev()
+                    .find(|l| l.contains("vigil-update-status"))
+                    .unwrap_or("");
+                UpdateState::from_status_line(line)
+            }
+        };
+        set_update_state(state);
+        // Remember that we looked, so the details window can tell "nothing to update" from
+        // "not looking" — on a line that may be blocking the download those are very different.
+        let mut prefs = vigil_platform::prefs::read();
+        prefs.last_check = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let _ = vigil_platform::prefs::write(&prefs);
+        // Repaint from the message thread rather than from here.
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                WM_APP_UPDATE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    });
+}
+
+/// Our own messages: "start a check" and "a check finished".
+///
+/// Two rather than one because both ends have to happen on the message thread — the thread that
+/// sleeps must not touch a window, and the thread that fetches must not paint.
+const WM_APP_START_CHECK: u32 = 0x0400 + 16;
+const WM_APP_UPDATE: u32 = 0x0400 + 17;
+
+/// Ask, then hand over to the updater and get out of the way.
+///
+/// The order is the whole safety argument: disengage, **read it back**, and only then spawn. A
+/// process that replaces these binaries while the system still points at this one is the 2026-08-06
+/// stranding failure with extra steps.
+fn install_update(lang: Lang) {
+    let state = update_state();
+    let version = match &state {
+        UpdateState::Available { version, .. } | UpdateState::Staged { version } => version.clone(),
+        UpdateState::Interrupted => String::new(),
+        _ => return,
+    };
+    if !confirm(
+        &tf(lang, "update.confirm_body", &[("version", &version)]),
+        t(lang, "update.confirm_title"),
+    ) {
+        return;
+    }
+
+    // 1. Give the settings back, and check that they went.
+    let listen = with_app(|a| a.listen.clone()).unwrap_or_default();
+    let _ = engage(false, &listen);
+    set_engaged(false);
+    let still_ours = vigil_platform::registry::read_current()
+        .map(|c| c.enabled && c.server.contains("127.0.0.1"))
+        .unwrap_or(false);
+    if still_ours {
+        message_box(&tf(
+            lang,
+            "update.failed",
+            &[("why", "the proxy setting would not come back")],
+        ));
+        return;
+    }
+
+    // 2. Copy the updater into the staging folder and run *that*, so the one beside us is idle and
+    //    can be replaced like any other file.
+    let folder = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default();
+    let me = updater_path();
+    let runner = match std::fs::create_dir_all(folder.join(".vigil-update")).and_then(|_| {
+        let dst = folder.join(".vigil-update").join("runner.exe");
+        std::fs::copy(&me, &dst).map(|_| dst)
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            message_box(&tf(lang, "update.failed", &[("why", &e.to_string())]));
+            return;
+        }
+    };
+
+    // 3. Hand over. It waits for this process to exit before it touches anything.
+    let pid = std::process::id().to_string();
+    match std::process::Command::new(&runner)
+        .args(["--apply", "--parent", &pid])
+        .spawn()
+    {
+        Ok(_) => {
+            // 4. Leave. Everything after this belongs to the runner, and the ordering means every
+            //    way it can fail leaves the machine disengaged — which means the internet works.
+            unsafe {
+                PostQuitMessage(0);
+            }
+        }
+        Err(e) => message_box(&tf(lang, "update.failed", &[("why", &e.to_string())])),
+    }
+}
+
+/// A yes/no question. Used once, for the one action that closes the application.
+fn confirm(text: &str, title: &str) -> bool {
+    let msg = model::wide(text);
+    let title = model::wide(title);
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(msg.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
 
 /// The language the interface speaks, decided once and then remembered.
 ///
@@ -150,8 +326,16 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
+        let prefs = vigil_platform::prefs::read();
         Snapshot {
             lang: lang(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            update: update_state(),
+            auto_update: prefs.enabled,
+            last_check: prefs
+                .last_check
+                .map(vigil_core::clock::iso8601)
+                .unwrap_or_default(),
             listen: self.listen.clone(),
             engaged: self.engaged,
             listening: self.serving.load(AtomicOrdering::Relaxed),
@@ -545,6 +729,29 @@ fn apply(cmd: Command) -> bool {
                 }
             }
         }
+        Command::CheckForUpdates => {
+            if let Some((owner, _, _)) = handles() {
+                check_for_updates_in_background(owner);
+                if let Some(snap) = snapshot_now() {
+                    unsafe { refresh_tray(owner, &snap) };
+                }
+            }
+        }
+        Command::InstallUpdate => install_update(lang()),
+        Command::ToggleAutoUpdate => {
+            let mut prefs = vigil_platform::prefs::read();
+            prefs.enabled = !prefs.enabled;
+            let _ = vigil_platform::prefs::write(&prefs);
+            // Switching it off says so on screen straight away rather than at the next check.
+            if !prefs.enabled {
+                set_update_state(UpdateState::Off);
+            } else if update_state() == UpdateState::Off {
+                set_update_state(UpdateState::NeverChecked);
+            }
+            if let (Some((owner, _, _)), Some(snap)) = (handles(), snapshot_now()) {
+                unsafe { refresh_tray(owner, &snap) };
+            }
+        }
         Command::ToggleAutostart => {
             let Some((owner, _, _)) = handles() else {
                 return true;
@@ -813,6 +1020,26 @@ fn repair() -> Result<(), String> {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     match msg {
+        // The background check finished. Repaint from here rather than from the thread that did the
+        // work: the interface is painted by one thread and only one.
+        WM_APP_START_CHECK => {
+            check_for_updates_in_background(hwnd);
+            if let Some(snap) = snapshot_now() {
+                unsafe { refresh_tray(hwnd, &snap) };
+            }
+            LRESULT(0)
+        }
+        WM_APP_UPDATE => {
+            if let Some(snap) = snapshot_now() {
+                unsafe { refresh_tray(hwnd, &snap) };
+            }
+            if let Some(full) = full_window() {
+                unsafe {
+                    let _ = InvalidateRect(Some(full), None, true);
+                }
+            }
+            LRESULT(0)
+        }
         WM_TRAY => {
             match (l.0 as u32) & 0xFFFF {
                 WM_LBUTTONUP => {
@@ -1140,6 +1367,30 @@ pub fn run() {
         let _ = SetTimer(Some(owner), TIMER_REFRESH, 1000, None);
 
         let mut msg = MSG::default();
+        // Look for an update a little after starting, not during. Startup is when a user is
+        // watching, the network is the slowest thing here, and nothing about an update is urgent
+        // enough to make the tray icon appear late.
+        //
+        // The delay is jittered by the process id so a room full of machines that all boot at nine
+        // o'clock does not arrive at GitHub in the same second.
+        if vigil_platform::prefs::read().enabled {
+            // The handle as a plain integer: `HWND` is not `Send`, and posting to a window from
+            // another thread is allowed even though holding the type across threads is not.
+            let owner_bits = owner.0 as isize;
+            let jitter = 60 + (std::process::id() % 60) as u64;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(jitter));
+                let _ = PostMessageW(
+                    Some(HWND(owner_bits as *mut _)),
+                    WM_APP_START_CHECK,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            });
+        } else {
+            set_update_state(UpdateState::Off);
+        }
+
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);

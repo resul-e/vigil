@@ -16,6 +16,10 @@ vigil-core = { path = "../core" }
 # transform every other vigil connection uses. Reused rather than reimplemented: an updater that
 # reached the network differently from the proxy would be the one code path nobody had measured.
 vigil-proxy = { path = "../proxy" }
+# Directly, for the guards: the registry and environment reads, the instance lock, and the same
+# restore `vigil-repair` runs. Still the allowed direction — `update -> platform`, never the
+# reverse — and platform gains nothing, which is what keeps `vigil-repair.exe` small.
+vigil-platform = { path = "../platform" }
 # Already in [workspace.dependencies] for probe/. New only in that they now reach a shipping
 # binary — and only this one.
 rustls.workspace = true

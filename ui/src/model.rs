@@ -44,6 +44,16 @@ pub struct Snapshot {
     /// `(host, strategy)` pairs the calibrator has settled on.
     pub learned: Vec<(String, String)>,
     pub exclude_patterns: Vec<String>,
+    /// The running version, as a string — `env!("CARGO_PKG_VERSION")` from whoever built the
+    /// snapshot. Held rather than read here so this module stays a pure function of its input.
+    pub version: String,
+    /// Where the update machinery has got to.
+    pub update: UpdateState,
+    /// Whether automatic checking is switched on. Separate from [`UpdateState::Off`] because the
+    /// menu tick has to reflect the preference even while a manual check is running.
+    pub auto_update: bool,
+    /// When a check last completed, already rendered — the model has no clock.
+    pub last_check: String,
     /// Which language to say all of it in. Decided once at startup from the operating system
     /// (`vigil_platform::locale`), carried in the snapshot so every rendering function below
     /// stays a pure function of its input — including the language.
@@ -111,6 +121,144 @@ impl Health {
     }
 }
 
+/// Where the update machinery has got to.
+///
+/// Ten states, and the reason there are ten rather than three is that the interesting ones are the
+/// failures. "No update" and "could not look" are the same to a naive design and completely
+/// different to a user on a line that may be blocking the download — one means nothing to do, the
+/// other means the tool has quietly stopped receiving fixes. Every one of these says something a
+/// person could act on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UpdateState {
+    /// The user switched checking off.
+    Off,
+    #[default]
+    NeverChecked,
+    Checking,
+    UpToDate,
+    /// Newer version offered, not yet downloaded.
+    Available {
+        version: String,
+        critical: bool,
+    },
+    /// Downloaded, signature verified, waiting for the user to say yes.
+    Staged {
+        version: String,
+    },
+    /// The check itself failed. On this line that is a finding, not a shrug.
+    Unreachable {
+        why: String,
+    },
+    /// The program folder cannot be written to — a zip opened in Explorer, a read-only directory.
+    /// The honest answer is "download it yourself", and it should be said early.
+    FolderNotWritable,
+    /// A build with no keys compiled in. Reported as its own thing: "cannot verify" is not the same
+    /// claim as "not genuine".
+    NoKeys,
+    /// An apply stopped part-way. The folder is safe — the ordering guarantees that — and the next
+    /// start offers to finish.
+    Interrupted,
+}
+
+impl UpdateState {
+    /// Is there something the user can click to move this forward?
+    pub fn actionable(&self) -> bool {
+        matches!(
+            self,
+            UpdateState::Available { .. } | UpdateState::Staged { .. } | UpdateState::Interrupted
+        )
+    }
+
+    /// Should the tray icon draw attention to itself? Only for the one case that is genuinely
+    /// urgent — a critical update — because an indicator that is always on is an indicator nobody
+    /// reads.
+    pub fn wants_attention(&self) -> bool {
+        matches!(self, UpdateState::Available { critical: true, .. })
+    }
+
+    /// The one line the details window shows.
+    pub fn line(&self, lang: Lang) -> String {
+        match self {
+            UpdateState::Off => t(lang, "update.off").into(),
+            UpdateState::NeverChecked => t(lang, "update.never_checked").into(),
+            UpdateState::Checking => t(lang, "update.checking").into(),
+            UpdateState::UpToDate => t(lang, "update.up_to_date").into(),
+            UpdateState::Available { version, critical } => tf(
+                lang,
+                if *critical {
+                    "update.critical"
+                } else {
+                    "update.available"
+                },
+                &[("version", version)],
+            ),
+            UpdateState::Staged { version } => tf(lang, "update.staged", &[("version", version)]),
+            UpdateState::Unreachable { why } => tf(lang, "update.unreachable", &[("why", why)]),
+            UpdateState::FolderNotWritable => t(lang, "update.folder_readonly").into(),
+            UpdateState::NoKeys => t(lang, "update.no_keys").into(),
+            UpdateState::Interrupted => t(lang, "update.interrupted").into(),
+        }
+    }
+
+    /// Read the one line `vigil-update.exe --check` prints.
+    ///
+    /// The two programs are deliberately separate — linking the updater into the tray application
+    /// would put rustls inside the binary every user runs — so this line of text is the whole
+    /// contract between them, and this is the parser for it.
+    ///
+    /// Anything it does not recognise becomes [`UpdateState::Unreachable`] carrying what was said.
+    /// Not `UpToDate`: a status this build cannot read is a reason to tell the user something is
+    /// wrong, and the one thing it must never do is quietly claim everything is fine.
+    pub fn from_status_line(line: &str) -> UpdateState {
+        let mut status = "";
+        let mut version = String::new();
+        let mut critical = false;
+        let mut why = String::new();
+        for field in line.split_whitespace() {
+            match field.split_once('=') {
+                Some(("status", v)) => status = v,
+                Some(("version", v)) => version = v.to_string(),
+                Some(("critical", v)) => critical = v == "1",
+                Some(("why", v)) => why = v.replace('_', " "),
+                _ => {}
+            }
+        }
+        match status {
+            "current" => UpdateState::UpToDate,
+            "available" if !version.is_empty() => UpdateState::Available { version, critical },
+            "staged" if !version.is_empty() => UpdateState::Staged { version },
+            "readonly" => UpdateState::FolderNotWritable,
+            "nokeys" => UpdateState::NoKeys,
+            "unreachable" | "badsig" | "badmanifest" | "untrusted" => UpdateState::Unreachable {
+                why: if why.is_empty() {
+                    status.to_string()
+                } else {
+                    why
+                },
+            },
+            // Including the empty string, which is what a crashed or missing updater leaves.
+            other => UpdateState::Unreachable {
+                why: if other.is_empty() {
+                    "no answer from the updater".into()
+                } else {
+                    other.to_string()
+                },
+            },
+        }
+    }
+
+    /// The label for the menu item that acts on this state, when there is one.
+    pub fn action_label(&self, lang: Lang) -> Option<String> {
+        match self {
+            UpdateState::Available { version, .. } | UpdateState::Staged { version } => {
+                Some(tf(lang, "update.install_now", &[("version", version)]))
+            }
+            UpdateState::Interrupted => Some(t(lang, "update.interrupted").into()),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------- commands
 
 /// Everything a click can mean. The Win32 layer turns a menu id or a button into one of
@@ -119,6 +267,12 @@ impl Health {
 pub enum Command {
     /// Read the interface in another language, and remember the choice.
     SetLang(Lang),
+    /// Look for an update now.
+    CheckForUpdates,
+    /// Install what is staged, or resume an interrupted apply.
+    InstallUpdate,
+    /// Switch automatic checking on or off, and remember it.
+    ToggleAutoUpdate,
     /// Engage or disengage the system proxy.
     Toggle,
     ShowMini,
@@ -186,6 +340,9 @@ pub mod id {
     pub const FORGET_ALL: u16 = 0x105;
     pub const AUTOSTART: u16 = 0x106;
     pub const SYSDNS: u16 = 0x107;
+    pub const CHECK_UPDATE: u16 = 0x108;
+    pub const INSTALL_UPDATE: u16 = 0x109;
+    pub const AUTO_UPDATE: u16 = 0x10A;
     /// The language entries, in [`super::LANGS`] order. Between the modes and the learned
     /// hosts, and like the modes it must stay below `FORGET_BASE`.
     pub const LANG_BASE: u16 = 0x120;
@@ -259,6 +416,35 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
         checked: mode_at(i).as_ref() == Some(&s.mode),
         ..MenuItem::item(id::MODE_BASE + i as u16, t(s.lang, label), true)
     }))
+    // The update block. The action item only exists when there is something to act on, so the menu
+    // never offers a button that does nothing — and it is placed above the language and startup
+    // entries because it is the only item here that can be time-sensitive.
+    .chain(
+        s.update
+            .action_label(s.lang)
+            .map(|label| MenuItem::item(id::INSTALL_UPDATE, label, true))
+            .into_iter()
+            .chain([
+                MenuItem {
+                    // Disabled while a check is in flight: pressing it again would start a second
+                    // one, and two checks racing is how a manifest gets applied twice.
+                    ..MenuItem::item(
+                        id::CHECK_UPDATE,
+                        if s.update == UpdateState::Checking {
+                            t(s.lang, "update.checking")
+                        } else {
+                            t(s.lang, "update.check_now")
+                        },
+                        s.update != UpdateState::Checking,
+                    )
+                },
+                MenuItem {
+                    checked: s.auto_update,
+                    ..MenuItem::item(id::AUTO_UPDATE, t(s.lang, "update.toggle_auto"), true)
+                },
+                MenuItem::sep(),
+            ]),
+    )
     .chain(LANGS.iter().enumerate().map(|(i, (key, l))| MenuItem {
         checked: *l == s.lang,
         ..MenuItem::item(id::LANG_BASE + i as u16, t(s.lang, key), true)
@@ -309,6 +495,9 @@ pub fn command_for(id: u16, learned: &[(String, String)]) -> Option<Command> {
         id::FORGET_ALL => Some(Command::ForgetAll),
         id::AUTOSTART => Some(Command::ToggleAutostart),
         id::SYSDNS => Some(Command::ToggleSystemDns),
+        id::CHECK_UPDATE => Some(Command::CheckForUpdates),
+        id::INSTALL_UPDATE => Some(Command::InstallUpdate),
+        id::AUTO_UPDATE => Some(Command::ToggleAutoUpdate),
         n if n >= id::MODE_BASE && (n as usize) < id::MODE_BASE as usize + MODES.len() => {
             mode_at((n - id::MODE_BASE) as usize).map(Command::SetMode)
         }
@@ -684,6 +873,36 @@ pub fn full_view(s: &Snapshot) -> Vec<Section> {
             vec![reading(t(s.lang, "placeholder.list_empty"))]
         } else {
             s.exclude_patterns.iter().map(reading).collect()
+        },
+    });
+
+    // What version this is, what the update machinery is doing, and when it last looked. The last
+    // of those is what lets a user tell "nothing to update" from "not looking", which on a line that
+    // may be blocking the download are very different situations.
+    out.push(Section {
+        title: t(s.lang, "update.section").into(),
+        rows: {
+            let mut rows = vec![
+                reading(tf(
+                    s.lang,
+                    "update.version_line",
+                    &[("version", &s.version)],
+                )),
+                Row {
+                    text: s.update.line(s.lang),
+                    // The state line is the button when there is something to do, so a user who
+                    // reads "ready — click to install" can click the thing they just read.
+                    action: s.update.actionable().then_some(Command::InstallUpdate),
+                },
+            ];
+            if !s.last_check.is_empty() {
+                rows.push(reading(tf(
+                    s.lang,
+                    "update.last_check",
+                    &[("when", &s.last_check)],
+                )));
+            }
+            rows
         },
     });
     out
@@ -1562,11 +1781,15 @@ mod tests {
         for lang in [Lang::Turkish, Lang::English] {
             let v = full_view(&snap_in(lang));
             let titles: Vec<&str> = v.iter().map(|s| s.title.as_str()).collect();
-            assert_eq!(titles.len(), 4, "{lang:?}");
+            assert_eq!(titles.len(), 5, "{lang:?}");
             assert_eq!(titles[0], t(lang, "section.status"));
             assert_eq!(titles[1], t(lang, "section.counters"));
             assert_eq!(titles[2], t(lang, "section.learned"));
             assert_eq!(titles[3], t(lang, "section.excluded"));
+            // Last, because it is about the program rather than about the traffic — and appended
+            // rather than inserted, so the sections above it keep the positions the rest of the
+            // interface and its tests already refer to.
+            assert_eq!(titles[4], t(lang, "update.section"));
         }
     }
 
@@ -1608,7 +1831,7 @@ mod tests {
                 lang,
                 ..Default::default()
             });
-            assert_eq!(v.len(), 4);
+            assert_eq!(v.len(), 5);
             assert!(!v[2].rows.is_empty());
             assert_eq!(v[2].rows[0].text, t(lang, "placeholder.nothing_learned"));
             assert_eq!(
@@ -1816,5 +2039,356 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    fn snap_with(u: UpdateState, lang: Lang) -> Snapshot {
+        Snapshot {
+            listen: "127.0.0.1:1080".into(),
+            engaged: true,
+            listening: true,
+            version: "0.6.3".into(),
+            update: u,
+            auto_update: true,
+            ..Default::default()
+        }
+        .tap_lang(lang)
+    }
+
+    trait TapLang {
+        fn tap_lang(self, lang: Lang) -> Snapshot;
+    }
+    impl TapLang for Snapshot {
+        fn tap_lang(mut self, lang: Lang) -> Snapshot {
+            self.lang = lang;
+            self
+        }
+    }
+
+    fn all_states() -> Vec<UpdateState> {
+        vec![
+            UpdateState::Off,
+            UpdateState::NeverChecked,
+            UpdateState::Checking,
+            UpdateState::UpToDate,
+            UpdateState::Available {
+                version: "0.7.0".into(),
+                critical: false,
+            },
+            UpdateState::Available {
+                version: "0.7.0".into(),
+                critical: true,
+            },
+            UpdateState::Staged {
+                version: "0.7.0".into(),
+            },
+            UpdateState::Unreachable {
+                why: "silently dropped".into(),
+            },
+            UpdateState::FolderNotWritable,
+            UpdateState::NoKeys,
+            UpdateState::Interrupted,
+        ]
+    }
+
+    /// Every state says something, in both languages, and no two of them say the same thing.
+    ///
+    /// The last part is the one that matters: "no update" and "could not look" are the same to a
+    /// naive design and completely different to a user whose line may be blocking the download.
+    #[test]
+    fn every_update_state_reads_distinctly_in_both_languages() {
+        for lang in [Lang::Turkish, Lang::English] {
+            let mut seen: Vec<String> = Vec::new();
+            for st in all_states() {
+                let line = st.line(lang);
+                assert!(!line.trim().is_empty(), "{st:?} in {lang:?} says nothing");
+                assert!(
+                    !line.contains("{{"),
+                    "{st:?} in {lang:?} left a placeholder showing: {line}"
+                );
+                assert!(
+                    !seen.contains(&line),
+                    "{st:?} in {lang:?} reads the same as an earlier state: {line}"
+                );
+                seen.push(line);
+            }
+        }
+    }
+
+    /// The menu never offers a button that does nothing, and offers one whenever there is something
+    /// to do.
+    #[test]
+    fn the_install_item_exists_exactly_when_there_is_something_to_install() {
+        for st in all_states() {
+            let s = snap_with(st.clone(), Lang::Turkish);
+            let menu = context_menu(&s);
+            let has = menu.iter().any(|m| m.id == id::INSTALL_UPDATE);
+            assert_eq!(
+                has,
+                st.actionable(),
+                "{st:?}: actionable={} but the item is {}",
+                st.actionable(),
+                if has { "present" } else { "absent" }
+            );
+            if has {
+                assert_eq!(
+                    command_for(id::INSTALL_UPDATE, &[]),
+                    Some(Command::InstallUpdate)
+                );
+            }
+        }
+    }
+
+    /// Pressing "check" while a check is running would start a second one, and two checks racing is
+    /// how a manifest gets applied twice.
+    #[test]
+    fn checking_is_unclickable_while_a_check_is_in_flight() {
+        let s = snap_with(UpdateState::Checking, Lang::English);
+        let item = context_menu(&s)
+            .into_iter()
+            .find(|m| m.id == id::CHECK_UPDATE)
+            .expect("the item must exist even while it is unusable");
+        assert!(!item.enabled);
+        assert_eq!(item.label, t(Lang::English, "update.checking"));
+
+        let s = snap_with(UpdateState::UpToDate, Lang::English);
+        let item = context_menu(&s)
+            .into_iter()
+            .find(|m| m.id == id::CHECK_UPDATE)
+            .expect("item");
+        assert!(item.enabled);
+        assert_eq!(item.label, t(Lang::English, "update.check_now"));
+    }
+
+    /// The tick reflects the preference, not the momentary state — a manual check running does not
+    /// mean automatic checking is on.
+    #[test]
+    fn the_automatic_tick_follows_the_preference_only() {
+        for (auto, state) in [
+            (true, UpdateState::Checking),
+            (false, UpdateState::Checking),
+            (true, UpdateState::Off),
+            (false, UpdateState::UpToDate),
+        ] {
+            let s = Snapshot {
+                auto_update: auto,
+                ..snap_with(state.clone(), Lang::Turkish)
+            };
+            let item = context_menu(&s)
+                .into_iter()
+                .find(|m| m.id == id::AUTO_UPDATE)
+                .expect("item");
+            assert_eq!(item.checked, auto, "auto={auto} state={state:?}");
+            assert!(item.enabled, "it must always be togglable");
+        }
+    }
+
+    /// Only a critical update may draw attention. An indicator that is always on is one nobody
+    /// reads, and this project has to spend that attention carefully.
+    #[test]
+    fn only_a_critical_update_asks_for_attention() {
+        for st in all_states() {
+            let want = matches!(st, UpdateState::Available { critical: true, .. });
+            assert_eq!(st.wants_attention(), want, "{st:?}");
+        }
+    }
+
+    /// The state line in the details window is itself the button when there is something to do, so
+    /// somebody who reads "ready — click to install" can click the thing they just read.
+    #[test]
+    fn the_details_line_is_clickable_exactly_when_the_state_is_actionable() {
+        for st in all_states() {
+            let s = snap_with(st.clone(), Lang::English);
+            let v = full_view(&s);
+            let section = v.last().expect("the update section is last");
+            assert_eq!(section.title, t(Lang::English, "update.section"));
+            // Row 0 is the version, row 1 is the state.
+            assert_eq!(section.rows[0].text, "Version: 0.6.3");
+            assert_eq!(section.rows[0].action, None, "the version is not a button");
+            assert_eq!(section.rows[1].action.is_some(), st.actionable(), "{st:?}");
+            if st.actionable() {
+                assert_eq!(section.rows[1].action, Some(Command::InstallUpdate));
+            }
+        }
+    }
+
+    /// "Last checked" appears only when there is something to say. Its absence is what tells a user
+    /// the tool has never looked, which on a line that may be blocking the download is the single
+    /// most useful thing on the screen.
+    #[test]
+    fn the_last_check_row_appears_only_when_a_check_has_happened() {
+        let never = snap_with(UpdateState::NeverChecked, Lang::Turkish);
+        let rows = full_view(&never).last().expect("section").rows.len();
+        assert_eq!(rows, 2, "version and state only");
+
+        let checked = Snapshot {
+            last_check: "2026-08-08 12:00:00 UTC".into(),
+            ..snap_with(UpdateState::UpToDate, Lang::Turkish)
+        };
+        let section = full_view(&checked).last().expect("section").clone();
+        assert_eq!(section.rows.len(), 3);
+        assert!(section.rows[2].text.contains("2026-08-08"));
+        assert_eq!(section.rows[2].action, None);
+    }
+
+    /// The three new ids must not collide with anything, and each must map to its own command.
+    #[test]
+    fn the_update_ids_are_their_own() {
+        let ids = [id::CHECK_UPDATE, id::INSTALL_UPDATE, id::AUTO_UPDATE];
+        for id in ids {
+            assert!(id < id::MODE_BASE, "{id:#x} must sit below the mode block");
+        }
+        assert_eq!(
+            command_for(id::CHECK_UPDATE, &[]),
+            Some(Command::CheckForUpdates)
+        );
+        assert_eq!(
+            command_for(id::INSTALL_UPDATE, &[]),
+            Some(Command::InstallUpdate)
+        );
+        assert_eq!(
+            command_for(id::AUTO_UPDATE, &[]),
+            Some(Command::ToggleAutoUpdate)
+        );
+        // And no two of them are the same number.
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            3
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::*;
+
+    /// The happy shapes, exactly as `vigil-update.exe --check` prints them.
+    #[test]
+    fn the_statuses_the_updater_prints_are_understood() {
+        assert_eq!(
+            UpdateState::from_status_line("vigil-update-status status=current"),
+            UpdateState::UpToDate
+        );
+        assert_eq!(
+            UpdateState::from_status_line(
+                "vigil-update-status status=available version=0.7.0 critical=0"
+            ),
+            UpdateState::Available {
+                version: "0.7.0".into(),
+                critical: false
+            }
+        );
+        assert_eq!(
+            UpdateState::from_status_line(
+                "vigil-update-status status=available version=0.7.1 critical=1"
+            ),
+            UpdateState::Available {
+                version: "0.7.1".into(),
+                critical: true
+            }
+        );
+        assert_eq!(
+            UpdateState::from_status_line(
+                "vigil-update-status status=staged version=0.7.0 critical=0"
+            ),
+            UpdateState::Staged {
+                version: "0.7.0".into()
+            }
+        );
+        assert_eq!(
+            UpdateState::from_status_line("vigil-update-status status=nokeys"),
+            UpdateState::NoKeys
+        );
+        assert_eq!(
+            UpdateState::from_status_line("vigil-update-status status=readonly why=access_denied"),
+            UpdateState::FolderNotWritable
+        );
+    }
+
+    /// Underscores come back as spaces, because the updater replaces spaces to keep one field one
+    /// token and the user should read a sentence.
+    #[test]
+    fn a_reason_survives_the_round_trip_through_underscores() {
+        let st = UpdateState::from_status_line(
+            "vigil-update-status status=unreachable why=no_endpoint_answered",
+        );
+        assert_eq!(
+            st,
+            UpdateState::Unreachable {
+                why: "no endpoint answered".into()
+            }
+        );
+    }
+
+    /// **The one that matters.** Anything unreadable must never become "up to date" — a build that
+    /// cannot understand the answer has to say so, not quietly claim everything is fine. That is the
+    /// difference between a user who knows they have stopped receiving fixes and one who does not.
+    #[test]
+    fn nothing_unreadable_is_ever_mistaken_for_up_to_date() {
+        for line in [
+            "",
+            "   ",
+            "garbage",
+            "status=",
+            "status=who_knows",
+            "vigil-update-status",
+            "vigil-update-status status=available", // no version
+            "vigil-update-status status=staged",    // no version
+            "thread 'main' panicked at src/main.rs",
+            "status=current extra", // right status, wrong shape overall
+        ] {
+            let st = UpdateState::from_status_line(line);
+            if line == "status=current extra" {
+                // A status field that *is* there is honoured; the stray token is ignored, which is
+                // the forgiving direction and cannot cause a false "fine".
+                assert_eq!(st, UpdateState::UpToDate, "{line:?}");
+                continue;
+            }
+            assert!(
+                matches!(st, UpdateState::Unreachable { .. }),
+                "{line:?} became {st:?}, which is not a complaint"
+            );
+            assert_ne!(st, UpdateState::UpToDate, "{line:?}");
+        }
+    }
+
+    /// The updater prints other lines before the status line; the app reads the last one it can
+    /// understand, so a parser that chokes on a log line would be useless.
+    #[test]
+    fn a_status_line_is_found_among_ordinary_output() {
+        let output = "folder: C:\\vigil\nsome progress\nvigil-update-status status=current\n";
+        let last = output
+            .lines()
+            .rev()
+            .find(|l| l.contains("vigil-update-status"))
+            .expect("found");
+        assert_eq!(UpdateState::from_status_line(last), UpdateState::UpToDate);
+    }
+
+    /// Every state the updater can print has a distinct sentence in both languages — the parser and
+    /// the wording are two halves of one promise.
+    #[test]
+    fn every_parsed_state_says_something_in_both_languages() {
+        let lines = [
+            "vigil-update-status status=current",
+            "vigil-update-status status=available version=0.7.0 critical=0",
+            "vigil-update-status status=available version=0.7.0 critical=1",
+            "vigil-update-status status=staged version=0.7.0",
+            "vigil-update-status status=nokeys",
+            "vigil-update-status status=readonly",
+            "vigil-update-status status=unreachable why=silently_dropped",
+        ];
+        for lang in [Lang::Turkish, Lang::English] {
+            for line in lines {
+                let st = UpdateState::from_status_line(line);
+                let text = st.line(lang);
+                assert!(!text.trim().is_empty(), "{line} in {lang:?}");
+                assert!(!text.contains("{{"), "{line} in {lang:?}: {text}");
+            }
+        }
     }
 }

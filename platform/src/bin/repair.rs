@@ -32,7 +32,15 @@ fn main() -> ExitCode {
             }
             "--force" => force = true,
             "-h" | "--help" => {
-                eprintln!("usage: vigil-repair [--snapshot PATH] [--force]");
+                eprintln!("usage: vigil-repair [--snapshot PATH] [--force] [--version]");
+                return ExitCode::SUCCESS;
+            }
+            // Exists so an update can *prove* the safety net still works before it replaces
+            // anything else. `vigil-update` runs this and refuses to continue if it does not exit
+            // zero — a broken repair tool is worse than an old one, and this is the one thing in
+            // the whole update that is checked by running it rather than by hashing it.
+            "-V" | "--version" => {
+                println!("vigil-repair {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
             other => {

@@ -13,6 +13,7 @@ pub mod instance;
 pub mod locale;
 pub mod owner;
 pub mod paths;
+pub mod prefs;
 pub mod process;
 pub mod proxydiag;
 pub mod registry;

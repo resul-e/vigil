@@ -11,7 +11,9 @@
 //! What is here so far is the half that decides **whether** an update may happen: the manifest,
 //! the version comparison, and the trust checks. All pure, all tested on Linux.
 
+pub mod apply;
 pub mod fetch;
+pub mod guard;
 pub mod http;
 pub mod manifest;
 pub mod plan;

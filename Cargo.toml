@@ -6,7 +6,7 @@ members = ["core", "platform", "probe", "proxy", "scan", "ui", "update"]
 # One version for the whole workspace, so every binary and every report names the same build.
 # It was not here until 2026-08-08, and the cost was measured: a volunteer re-sent a report
 # from a superseded build and neither the tool nor the report could tell the two apart.
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
