@@ -477,9 +477,16 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
             checked: s.autostart,
             ..MenuItem::item(id::AUTOSTART, t(s.lang, "menu.autostart"), true)
         },
-        // Offered only when we are actually answering DNS. Pointing the machine at a resolver
-        // that is not listening is the one change here that takes *all* name resolution down,
-        // and an item that can do that must not be clickable when it would.
+        // *Giving* DNS to vigil is offered only when we are actually answering it: pointing the
+        // machine at a resolver that is not listening is the one change here that takes all name
+        // resolution down, and an item that can do that must not be clickable when it would.
+        //
+        // **Taking it back is always offered.** The rule above, applied in both directions, greys
+        // out the only control that can undo the damage at exactly the moment the damage exists —
+        // the server dying while engaged is precisely when `dns_serving` goes false, and the user
+        // would be left looking at a ticked, disabled item on a machine whose resolver points at
+        // nothing. The 9.9.9.9 fallback keeps such a machine resolving, which is why this is a
+        // usability failure rather than a dead machine, but the fix is one condition.
         MenuItem {
             checked: s.dns_engaged,
             ..MenuItem::item(
@@ -489,7 +496,7 @@ pub fn context_menu(s: &Snapshot) -> Vec<MenuItem> {
                 } else {
                     t(s.lang, "menu.dns_give")
                 },
-                s.dns_serving,
+                s.dns_serving || s.dns_engaged,
             )
         },
         MenuItem::sep(),
@@ -846,7 +853,13 @@ fn reading(text: impl Into<String>) -> Row {
 /// way to understand why the menu item is available.
 pub fn dns_line(s: &Snapshot) -> &'static str {
     match (s.dns_serving, s.dns_engaged) {
-        (false, _) => t(s.lang, "dns.off"),
+        // **The dangerous one.** Windows is pointed at us and we are not answering, so every name
+        // on the machine resolves through the fallback or not at all. It used to read as plain
+        // "off", because `dns_serving` was computed once at bind time and never looked at again —
+        // a server that died reported itself healthy for the life of the process. Now it can be
+        // said, so it is said loudly.
+        (false, true) => t(s.lang, "dns.stopped_while_in_use"),
+        (false, false) => t(s.lang, "dns.off"),
         (true, false) => t(s.lang, "dns.ready_unused"),
         (true, true) => t(s.lang, "dns.in_use"),
     }
@@ -1507,6 +1520,27 @@ mod tests {
         assert_eq!(item.label, t(s.lang, "menu.dns_take_back"));
     }
 
+    /// **The rule must not apply in both directions.** "Unclickable when nothing answers" is right
+    /// for handing DNS over and catastrophic for taking it back: the server dying while engaged is
+    /// exactly when `dns_serving` goes false, and greying the item there leaves a ticked, disabled
+    /// control on a machine pointed at a resolver that is gone. The item is what undoes that.
+    #[test]
+    fn taking_dns_back_stays_clickable_when_the_server_has_died() {
+        let mut s = snap();
+        s.dns_engaged = true;
+        s.dns_serving = false;
+        let item = context_menu(&s)
+            .into_iter()
+            .find(|m| m.id == id::SYSDNS)
+            .expect("item");
+        assert!(
+            item.enabled,
+            "the only control that can take the resolver back was greyed out"
+        );
+        assert!(item.checked);
+        assert_eq!(item.label, t(s.lang, "menu.dns_take_back"));
+    }
+
     #[test]
     fn the_dns_id_means_what_it_says() {
         assert_eq!(command_for(id::SYSDNS, &[]), Some(Command::ToggleSystemDns));
@@ -1530,7 +1564,20 @@ mod tests {
         assert_eq!(dns_line(&s), t(Lang::Turkish, "dns.in_use"));
         // The three states must be three distinct phrases in English too, or the distinction
         // exists only for Turkish readers.
-        let en: Vec<&str> = [(false, false), (true, false), (true, true)]
+        // **The fourth state, and the one that matters.** Windows points at us and we are not
+        // answering: every name on the machine now resolves through the fallback or not at all.
+        // It used to be unreachable — `dns_serving` was computed once at bind time — so a server
+        // that died read as plain "off" for the life of the process.
+        s.dns_serving = false;
+        assert_eq!(dns_line(&s), t(Lang::Turkish, "dns.stopped_while_in_use"));
+        assert_ne!(
+            dns_line(&s),
+            t(Lang::Turkish, "dns.off"),
+            "a resolver that stopped while the machine points at it is not the same as one that \
+             was never started, and reading them the same is how the failure stayed invisible"
+        );
+
+        let en: Vec<&str> = [(false, false), (true, false), (true, true), (false, true)]
             .iter()
             .map(|(serving, engaged)| {
                 dns_line(&Snapshot {
@@ -1540,9 +1587,19 @@ mod tests {
                 })
             })
             .collect();
-        assert_eq!(en.len(), 3);
-        assert_ne!(en[0], en[1]);
-        assert_ne!(en[1], en[2]);
+        // Four states, four distinct phrases in English too — or the distinction exists only for
+        // Turkish readers. Compared pairwise rather than by counting a set, so a failure names the
+        // pair that collided.
+        assert_eq!(en.len(), 4);
+        for a in 0..en.len() {
+            for b in (a + 1)..en.len() {
+                assert_ne!(
+                    en[a], en[b],
+                    "states {a} and {b} read identically: {:?}",
+                    en[a]
+                );
+            }
+        }
 
         // and it reaches the window
         let text: String = full_view(&s)[0]

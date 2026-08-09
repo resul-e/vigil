@@ -13,8 +13,10 @@
 ## <a id="türkçe"></a>🇹🇷 Türkçe
 
 vigil, Türkiye'deki erişim engellerini (DPI) aşan, Rust ile yazılmış hafif bir masaüstü aracıdır.
-**Sürücü kurmaz, yönetici yetkisi istemez, kurulum yapmaz.** Tek klasör, birkaç dosya; silersen
-geriye hiçbir şey kalmaz.
+**Sürücü kurmaz, kurulum yapmaz.** Tek klasör, birkaç dosya; silersen geriye hiçbir şey kalmaz.
+Yönetici yetkisi de istemez — **tek bir istisna dışında:** menüdeki "DNS'i de vigil'e ver", makinenin
+ad çözümlemesini değiştirdiği için Windows'un izin penceresini açar. Onu açmazsanız program hiç
+sormaz.
 
 ### 🚀 Kurulum
 
@@ -25,6 +27,7 @@ geriye hiçbir şey kalmaz.
    * `vigil-app.exe` — ana program (masaüstü sürümü)
    * `vigil.exe` — aynı motor, komut satırında
    * `vigil-repair.exe` — **acil durum aracı**
+   * `vigil-update.exe` — güncellemeleri indirir; siz çalıştırmıyorsunuz, program kendi çağırıyor
 4. **Çalıştırın:** `vigil-app.exe`'ye çift tıklayın. Sağ altta, saatin yanında bir kalkan simgesi
    çıkar.
 5. **Açın:** Simgeye **sağ tıklayın → "Korumayı aç"**.
@@ -87,18 +90,30 @@ Hız, doğrudan bağlantıyla aynı seviyede: **80.8 MB/s** (vigil) — **78.2 M
 ### 🌍 Dil
 
 Arayüz **Windows'un dilini** takip eder: sistem Türkçeyse Türkçe, **başka herhangi bir dilse
-İngilizce.** Ayar ekranı yok, seçim yok. Zorlamak istersen `VIGIL_LANG=tr` veya `VIGIL_LANG=en`.
+İngilizce.** Menüden elle de seçebilirsiniz ve seçiminiz hatırlanır — bir sonraki açılışta o dille
+gelir. Komut satırından zorlamak isterseniz `VIGIL_LANG=tr` veya `VIGIL_LANG=en`.
 
 ### 🖱️ Menüde ne var?
 
+Menünün tamamı, yukarıdan aşağıya:
+
 | | |
 |---|---|
-| **Korumayı aç / kapat** | Sistem proxy'si + `HTTPS_PROXY` |
-| **Mod** | otomatik *(önerilen)* · `tlsrec:64+split:1` · `split:1` · `tlsrec:64` · dokunma |
-| **DNS'i de vigil'e ver** | Yönetici izni sorar. Proxy ayarını okumayan programlar için |
-| **Windows ile başlat** | İsteğe bağlı |
+| **Korumayı aç / kapat** | Sistem proxy'si + `HTTPS_PROXY`. Dinleyen bir şey yoksa tıklanamaz |
+| **Durum** | Küçük durum penceresi (simgeye sol tıklamakla aynı şey) |
 | **Ayrıntılar…** | Sayaçlar ve her site için öğrenilmiş yöntem |
+| **Mod** | otomatik *(önerilen)* · `tlsrec:64+split:1` · `split:1` · `tlsrec:64` · dokunma |
+| **Güncellemeyi kur** | Yalnızca gerçekten bir güncelleme varken görünür |
+| **Güncellemeleri denetle** | Elle denetleme; denetleme sürerken tıklanamaz |
+| **Otomatik güncelle** | Açık/kapalı. Kapalıyken vigil kendiliğinden bakmaz |
+| **Türkçe / English** | Arayüz dili; seçim hatırlanır |
+| **Windows ile başlat** | İsteğe bağlı |
+| **DNS'i de vigil'e ver** | Yönetici izni sorar. Proxy ayarını okumayan programlar için. vigil DNS'e cevap vermiyorsa tıklanamaz |
 | **Proxy ayarlarını onar** | Sadece onarılacak bir şey varken tıklanabilir |
+| **Çıkış** | Kapanırken bütün ayarları geri alır |
+
+"Ayrıntılar…" penceresinde ayrıca **"Hepsini unut"** var: her site için öğrenilmiş yöntemi siler,
+böylece kalibrasyon sıfırdan başlar.
 
 ### 🌐 DNS
 
@@ -137,8 +152,9 @@ dokunan her şey `platform/` içinde ve incedir.
 
 ### 🔮 Yol haritası
 
-* [ ] **Otomatik güncelleme** — bütün dosyaları, sansürlü hattın kendisi üzerinden
+* [x] **Otomatik güncelleme** — bütün dosyaları, sansürlü hattın kendisi üzerinden *(v0.7.0)*
 * [ ] **Açılışta devrede başlama** — şu an "Windows ile başlat" programı açıyor, korumayı değil
+* [ ] **DNS'i DoH'a taşımak** — bugünkü çözümleyici düz DNS konuşuyor, sadece alışılmadık bir portta
 * [ ] **macOS sürümü** — kodun ~%90'ı zaten taşınabilir
 * [ ] **CI ile şeffaf derleme** — GitHub Actions, imzalı sürümler
 
@@ -147,8 +163,10 @@ dokunan her şey `platform/` içinde ve incedir.
 ## <a id="english"></a>🇬🇧 English
 
 vigil is a lightweight Windows desktop tool, written in Rust, that gets past DPI-based internet
-blocking in Turkey. **No driver, no administrator rights, no installation.** One folder, a few
-files; delete it and nothing is left behind.
+blocking in Turkey. **No driver, no installation.** One folder, a few files; delete it and nothing
+is left behind. No administrator rights either — **with one exception:** the menu item "use vigil for
+DNS too" changes how the machine resolves names, so Windows raises its consent prompt. Leave it off
+and the program never asks.
 
 ### 🚀 Installation
 
@@ -159,6 +177,7 @@ files; delete it and nothing is left behind.
    * `vigil-app.exe` — the main program (desktop version)
    * `vigil.exe` — the same engine on the command line
    * `vigil-repair.exe` — **the emergency tool**
+   * `vigil-update.exe` — fetches updates; you never run it, the program calls it
 4. **Run** `vigil-app.exe`. A shield icon appears in the system tray.
 5. **Turn it on:** right-click the icon → **"Turn protection on"**.
 
@@ -221,19 +240,30 @@ direct.
 ### 🌍 Language
 
 The interface follows **Windows' own UI language**: Turkish if the system is Turkish, **English
-for anything else.** No settings screen, no picker. Force it with `VIGIL_LANG=tr` or
-`VIGIL_LANG=en` if you want the other one.
+for anything else.** You can also pick one from the menu, and the choice is remembered — the next
+launch opens in it. Force it from the command line with `VIGIL_LANG=tr` or `VIGIL_LANG=en`.
 
 ### 🖱️ The tray menu
 
+The whole menu, top to bottom:
+
 | | |
 |---|---|
-| **Turn protection on / off** | System proxy + `HTTPS_PROXY` |
-| **Mode** | automatic *(recommended)* · `tlsrec:64+split:1` · `split:1` · `tlsrec:64` · passthrough |
-| **Use vigil for DNS too** | Asks for administrator rights. For programs that ignore the proxy |
-| **Start with Windows** | Optional |
+| **Turn protection on / off** | System proxy + `HTTPS_PROXY`. Disabled when nothing is listening |
+| **Status** | The small status window (same as left-clicking the icon) |
 | **Details…** | Counters, and the strategy learned for each host |
+| **Mode** | automatic *(recommended)* · `tlsrec:64+split:1` · `split:1` · `tlsrec:64` · passthrough |
+| **Install update** | Shown only when there actually is one |
+| **Check for updates** | A manual check; disabled while one is in flight |
+| **Update automatically** | On/off. Off means vigil never looks by itself |
+| **Türkçe / English** | Interface language; the choice is remembered |
+| **Start with Windows** | Optional |
+| **Use vigil for DNS too** | Asks for administrator rights. For programs that ignore the proxy. Disabled unless vigil is answering DNS |
 | **Repair proxy settings** | Offered only when there is something to repair |
+| **Quit** | Restores every setting on the way out |
+
+The "Details…" window also has **"Forget everything"**: it clears the strategy learned for each
+host, so calibration starts over.
 
 ### 🌐 DNS
 
@@ -273,8 +303,9 @@ that touches the operating system lives in `platform/` and is deliberately thin.
 
 ### 🔮 Roadmap
 
-* [ ] **Auto-update** — all files, over the censored line itself
+* [x] **Auto-update** — all files, over the censored line itself *(v0.7.0)*
 * [ ] **Start engaged at logon** — today "start with Windows" starts the program, not the protection
+* [ ] **Move DNS to DoH** — today's resolver speaks plain DNS, just on an unusual port
 * [ ] **macOS build** — roughly 90 % of the code is already portable
 * [ ] **Transparent builds via CI** — GitHub Actions, signed releases
 

@@ -45,6 +45,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0usize;
 
+    // Kept so the periodic status line can show the DNS half too; `None` when --dns was
+    // never asked for, or the port was held.
+    let mut dns_stats: Option<std::sync::Arc<vigil_proxy::dnsserver::DnsStats>> = None;
     while i < args.len() {
         let arg = args[i].clone();
         i += 1;
@@ -188,8 +191,8 @@ fn main() -> ExitCode {
             Ok(addr) => match vigil_proxy::dnsserver::DnsServer::bind(addr) {
                 Ok(sock) => {
                     let actual = sock.local_addr().unwrap_or(addr);
-                    let dns = vigil_proxy::dnsserver::DnsServer::new(std::sync::Arc::clone(
-                        &server.resolver,
+                    let dns = std::sync::Arc::new(vigil_proxy::dnsserver::DnsServer::new(
+                        std::sync::Arc::clone(&server.resolver),
                     ));
                     eprintln!("  dns: {actual} (yalnız loopback)");
                     if actual.port() == 53 {
@@ -197,6 +200,7 @@ fn main() -> ExitCode {
                             "    sistemi buna yöneltmek için (yönetici):                              netsh interface ip set dns name=\"Wi-Fi\" static 127.0.0.1"
                         );
                     }
+                    dns_stats = Some(std::sync::Arc::clone(&dns.stats));
                     std::thread::spawn(move || dns.serve(sock));
                     if set_dns {
                         engage_system_dns(true);
@@ -298,6 +302,7 @@ fn main() -> ExitCode {
     }
 
     let stats = std::sync::Arc::clone(&server.stats);
+    let dns_line = dns_stats.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
         eprintln!(
@@ -315,6 +320,12 @@ fn main() -> ExitCode {
             stats.calibrated.load(Ordering::Relaxed),
             stats.first_flight_retries.load(Ordering::Relaxed),
         );
+        // The DNS half, when it is running. `recv_errors` climbing while `answered` stands still
+        // is the signature of the failure that used to kill this server silently — it is printed
+        // for that reason, not for completeness.
+        if let Some(d) = &dns_line {
+            eprintln!("{}", d.line());
+        }
         // Worth its own line: if every client is arriving on a dialect we did not expect,
         // that is the difference between "the tool is running" and "the tool is being used".
         eprintln!(
@@ -473,14 +484,37 @@ fn engage_system_dns(on: bool) {
             .map(|i| (i.index, Some(sysdns::ours())))
             .collect();
         eprintln!("system dns: asking for administrator rights (Windows will prompt)");
-        match dnsclient::apply(&changes) {
+        let outcome = dnsclient::apply(&changes);
+        // **Read it back rather than believing the return value.** A batch can now fail as a
+        // whole while some of its interfaces landed — one stale index is enough — and a machine
+        // that is half engaged must still be put back on the way out. `DNS_ENGAGED` is what the
+        // exit path consults, so it is set from what Windows says, not from what `apply` said.
+        let engaged = dnsclient::read_interfaces()
+            .map(|now| !sysdns::stranded(&now).is_empty())
+            .unwrap_or(outcome.is_ok());
+        if engaged {
+            DNS_ENGAGED.set(true).ok();
+        } else if outcome.is_err() {
+            // Nothing landed, so the record of what was there must not stay behind claiming
+            // otherwise. Only when nothing landed: a half-applied batch needs its snapshot.
+            if let Some(p) = &path {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        match outcome {
             Ok(()) => {
                 for i in &targets {
                     eprintln!("system dns: {} -> {}", i.alias, sysdns::ours().join(", "));
                 }
-                DNS_ENGAGED.set(true).ok();
             }
-            Err(e) => eprintln!("system dns: {e}"),
+            Err(e) => eprintln!(
+                "system dns: {e}{}",
+                if engaged {
+                    " — but some interfaces did change; they will be put back on exit"
+                } else {
+                    ""
+                }
+            ),
         }
     } else {
         let stranded = sysdns::stranded(&ifaces);
@@ -505,8 +539,19 @@ fn engage_system_dns(on: bool) {
         match dnsclient::apply(&changes) {
             Ok(()) => {
                 eprintln!("system dns: restored");
-                if let Some(p) = &path {
-                    let _ = std::fs::remove_file(p);
+                // The snapshot is the only record of what was there, so it goes only when
+                // nothing is left pointing at us — checked, not assumed.
+                let clean = dnsclient::read_interfaces()
+                    .map(|now| sysdns::stranded(&now).is_empty())
+                    .unwrap_or(true);
+                if clean {
+                    if let Some(p) = &path {
+                        let _ = std::fs::remove_file(p);
+                    }
+                } else {
+                    eprintln!(
+                        "system dns: something still points at us; keeping the snapshot, run vigil-repair"
+                    );
                 }
             }
             Err(e) => eprintln!("system dns: could not restore ({e}); run vigil-repair"),

@@ -126,6 +126,50 @@ fn check_for_updates_in_background(owner: HWND) {
 /// sleeps must not touch a window, and the thread that fetches must not paint.
 const WM_APP_START_CHECK: u32 = 0x0400 + 16;
 const WM_APP_UPDATE: u32 = 0x0400 + 17;
+/// A system-DNS change finished. See [`DNS_RESULT`].
+const WM_APP_DNS_DONE: u32 = 0x0400 + 18;
+
+/// The outcome of the system-DNS change now running on a worker thread, if one is.
+///
+/// The change asks for administrator rights, and the consent dialog blocks until the user answers
+/// it — which could be a minute, or never. Doing that inside the `WM_COMMAND` handler froze the
+/// tray for exactly that long and left Windows free to paint the app as "not responding". So the
+/// work runs on a thread and posts [`WM_APP_DNS_DONE`] back.
+static DNS_RESULT: Mutex<Option<Result<bool, DnsFailure>>> = Mutex::new(None);
+/// True while a change is in flight, so a second click cannot start a second consent dialog.
+///
+/// Also read by [`restore_host`]: while this is true the snapshot has been written and an elevated
+/// change may already have landed, so "we never engaged" is not something the exit path may assume.
+static DNS_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Why a DNS change did not happen.
+///
+/// `Refused` is the person answering **No** to the consent dialog. That is an answer, and the one
+/// place this product asks for administrator rights is the last place it should punish the careful
+/// answer with a box saying something went wrong. It was being flattened into a string one layer
+/// too early and shown as `DNS ayarlanamadı:`.
+enum DnsFailure {
+    Refused,
+    Failed(String),
+}
+
+impl core::fmt::Display for DnsFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DnsFailure::Refused => f.write_str("declined"),
+            DnsFailure::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<vigil_platform::dnsclient::Error> for DnsFailure {
+    fn from(e: vigil_platform::dnsclient::Error) -> Self {
+        match e {
+            vigil_platform::dnsclient::Error::Refused => DnsFailure::Refused,
+            other => DnsFailure::Failed(other.to_string()),
+        }
+    }
+}
 
 /// Ask, then hand over to the updater and get out of the way.
 ///
@@ -226,7 +270,7 @@ fn install_update(lang: Lang) {
     //     same prompt at a moment when nothing is waiting on it.
     if with_app(|a| a.dns_engaged).unwrap_or(false) {
         if let Err(e) = set_system_dns(false) {
-            message_box(&tf(lang, "update.failed", &[("why", &e)]));
+            message_box(&tf(lang, "update.failed", &[("why", &e.to_string())]));
             let _ = engage(true, &listen);
             set_engaged(true);
             return;
@@ -378,10 +422,15 @@ struct App {
     serving: Arc<AtomicBool>,
     /// Our own path, so the autostart entry can name it and be recognised again later.
     exe: std::path::PathBuf,
-    /// Whether we are answering DNS on loopback at all.
-    dns_serving: bool,
-    /// Whether Windows' own resolver is pointed at us. Cached rather than read per refresh:
-    /// finding out costs a PowerShell launch, and the tray refreshes once a second.
+    /// The DNS server's counters, or `None` if the port could not be bound at all.
+    ///
+    /// Held rather than a `bool`, because a `bool` computed at bind time is a claim about the past.
+    /// `serve` can return — a socket that really has died, 64 unrecognised errors in a row — and
+    /// the tray used to keep saying "DNS is served" for the life of the process. Every website
+    /// failing while the tool looks healthy is the worst shape a failure can take.
+    dns: Option<Arc<vigil_proxy::dnsserver::DnsStats>>,
+    /// Whether Windows' own resolver is pointed at us. Cached rather than read per refresh: the
+    /// tray refreshes once a second, and this only changes when the user asks it to.
     dns_engaged: bool,
 }
 
@@ -429,7 +478,7 @@ impl App {
             upstream_errors: self.stats.upstream_errors.load(Relaxed),
             dns_failures: self.stats.dns_failures.load(Relaxed),
             first_flight_retries: self.stats.first_flight_retries.load(Relaxed),
-            dns_serving: self.dns_serving,
+            dns_serving: self.dns.as_ref().is_some_and(|d| d.serving()),
             dns_engaged: self.dns_engaged,
             by_socks5: self.stats.by_socks5.load(Relaxed),
             by_socks4: self.stats.by_socks4.load(Relaxed),
@@ -859,20 +908,38 @@ fn apply(cmd: Command) -> bool {
             repaint_full();
         }
         Command::ToggleSystemDns => {
+            // **Off the message thread.** Reading the interfaces is fast now, but the write asks for
+            // administrator rights and the consent dialog blocks until the user answers — a minute,
+            // or never. Doing that here froze the tray for exactly that long, which is most of what
+            // the owner reported as "it takes ages to react".
+            if DNS_BUSY.swap(true, AtomicOrdering::SeqCst) {
+                return true; // Already asking; a second dialog would be worse than a slow first one.
+            }
             let want = !with_app(|a| a.dns_engaged).unwrap_or(false);
-            match set_system_dns(want) {
-                Ok(now) => {
-                    APP.with(|a| {
-                        if let Some(app) = a.borrow_mut().as_mut() {
-                            app.dns_engaged = now;
-                        }
-                    });
+            // No window means nothing can be told the answer: `PostMessageW` with a null `hWnd`
+            // posts to the *calling* thread, which here is a worker with no message loop, so the
+            // completion would be discarded and `DNS_BUSY` would stay true for the life of the
+            // process — a menu item that never works again, silently.
+            let Some((owner, _, _)) = handles() else {
+                DNS_BUSY.store(false, AtomicOrdering::SeqCst);
+                return true;
+            };
+            let owner_bits = owner.0 as isize;
+            std::thread::spawn(move || {
+                let outcome = set_system_dns(want);
+                if let Ok(mut g) = DNS_RESULT.lock() {
+                    *g = Some(outcome);
                 }
-                Err(e) => message_box(&tf(lang(), "err.dns", &[("error", &e.to_string())])),
-            }
-            if let (Some((owner, _, _)), Some(snap)) = (handles(), snapshot_now()) {
-                unsafe { refresh_tray(owner, &snap) };
-            }
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(owner_bits as *mut _)),
+                        WM_APP_DNS_DONE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            });
+            // Repaint now so the menu closes and the interface stays alive while the prompt is up.
             repaint_full();
         }
         Command::SetMode(m) => {
@@ -1034,10 +1101,24 @@ fn forget(host: Option<&str>) {
 /// take a machine's name resolution down, so it snapshots first and always writes a public
 /// fallback after itself. Everything about *what* to write is decided in
 /// `vigil_platform::sysdns`, which is pure and tested.
-fn set_system_dns(on: bool) -> Result<bool, String> {
+/// Is any interface pointed at us, right now, according to Windows?
+///
+/// `None` when the interfaces could not be read at all, which is the only case where there is
+/// nothing better to do than keep believing what was there before.
+fn read_back_dns_engaged() -> Option<bool> {
+    use vigil_platform::{dnsclient, sysdns};
+
+    dnsclient::read_interfaces()
+        .ok()
+        .map(|ifaces| !sysdns::stranded(&ifaces).is_empty())
+}
+
+fn set_system_dns(on: bool) -> Result<bool, DnsFailure> {
     use vigil_platform::{dnsclient, paths, sysdns};
 
-    let ifaces = dnsclient::read_interfaces().map_err(|e| e.to_string())?;
+    let apply = dnsclient::apply;
+
+    let ifaces = dnsclient::read_interfaces()?;
     let path = paths::dns_snapshot();
     if on {
         let targets: Vec<sysdns::Interface> =
@@ -1045,18 +1126,34 @@ fn set_system_dns(on: bool) -> Result<bool, String> {
         if targets.is_empty() {
             return Ok(!sysdns::stranded(&ifaces).is_empty());
         }
-        let p = path.ok_or_else(|| "nowhere to save a snapshot".to_string())?;
+        let p = path.ok_or_else(|| DnsFailure::Failed("nowhere to save a snapshot".into()))?;
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         // Before the change, always: a machine whose resolver we moved without a record of
         // where it was is one that even the repair tool can only guess about.
-        std::fs::write(&p, sysdns::snapshot_to_text(&targets)).map_err(|e| e.to_string())?;
+        std::fs::write(&p, sysdns::snapshot_to_text(&targets))
+            .map_err(|e| DnsFailure::Failed(e.to_string()))?;
         let changes: Vec<(u32, Option<Vec<String>>)> = targets
             .iter()
             .map(|i| (i.index, Some(sysdns::ours())))
             .collect();
-        dnsclient::apply(&changes).map_err(|e| e.to_string())?;
+        if let Err(e) = apply(&changes) {
+            // **A record that outlives the change it was taken for is a lie about the machine.**
+            // The snapshot is written before the prompt, deliberately; when the prompt is declined
+            // it used to stay on disk saying the resolver had been moved when it had not. Found by
+            // the live gate on 2026-08-09, not by a test.
+            //
+            // Checked rather than assumed, because a batch can now fail with some of its interfaces
+            // already done — and in *that* case the snapshot is the only way back and must survive.
+            let landed = dnsclient::read_interfaces()
+                .map(|now| !sysdns::stranded(&now).is_empty())
+                .unwrap_or(true);
+            if !landed {
+                let _ = std::fs::remove_file(&p);
+            }
+            return Err(e.into());
+        }
         Ok(true)
     } else {
         let stranded: Vec<sysdns::Interface> =
@@ -1081,7 +1178,7 @@ fn set_system_dns(on: bool) -> Result<bool, String> {
                 )
             })
             .collect();
-        dnsclient::apply(&changes).map_err(|e| e.to_string())?;
+        apply(&changes)?;
         if let Some(p) = &path {
             let _ = std::fs::remove_file(p);
         }
@@ -1105,6 +1202,55 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if let Some(snap) = snapshot_now() {
                 unsafe { refresh_tray(hwnd, &snap) };
             }
+            LRESULT(0)
+        }
+        WM_APP_DNS_DONE => {
+            DNS_BUSY.store(false, AtomicOrdering::SeqCst);
+            let outcome = DNS_RESULT.lock().ok().and_then(|mut g| g.take());
+            // **Read the machine, do not believe the return value.** Once a failing `netsh` inside
+            // the batch could fail the whole batch, "it returned an error" stopped meaning "nothing
+            // changed": a batch where one interface landed and another's index was stale reports
+            // failure with the first interface really pointed at us. Believing the return value
+            // there leaves `dns_engaged` false while the machine is engaged, so the exit path skips
+            // the restore and the machine boots pointed at a vigil that is not running — which is
+            // the one failure this whole file is organised around.
+            //
+            // The read costs 0.01 s now. That it is affordable is the entire point of the change
+            // this handler belongs to, so there is no excuse for guessing instead.
+            let live = read_back_dns_engaged();
+            match outcome {
+                Some(Ok(now)) => {
+                    APP.with(|a| {
+                        if let Some(app) = a.borrow_mut().as_mut() {
+                            app.dns_engaged = live.unwrap_or(now);
+                        }
+                    });
+                }
+                // Declining the prompt is an answer, not a fault: no box. The state still comes
+                // from the machine — a declined prompt changed nothing, and the read says so.
+                Some(Err(DnsFailure::Refused)) => {
+                    APP.with(|a| {
+                        if let (Some(app), Some(live)) = (a.borrow_mut().as_mut(), live) {
+                            app.dns_engaged = live;
+                        }
+                    });
+                }
+                // A failure is not "nothing happened" — see above. Say so, and then believe the
+                // machine about what the state now is.
+                Some(Err(DnsFailure::Failed(e))) => {
+                    APP.with(|a| {
+                        if let (Some(app), Some(live)) = (a.borrow_mut().as_mut(), live) {
+                            app.dns_engaged = live;
+                        }
+                    });
+                    message_box(&tf(lang(), "err.dns", &[("error", &e)]))
+                }
+                None => {}
+            }
+            if let Some(snap) = snapshot_now() {
+                unsafe { refresh_tray(hwnd, &snap) };
+            }
+            repaint_full();
             LRESULT(0)
         }
         WM_APP_UPDATE => {
@@ -1309,16 +1455,21 @@ pub fn run() {
     // The machine's resolver, offered but not imposed: it answers on loopback from the moment
     // the app starts, and nothing uses it until somebody ticks the menu item. Binding it here
     // rather than on the tick means the tick is instant and cannot half-succeed.
-    let dns_serving =
+    let dns_stats =
         match vigil_proxy::dnsserver::DnsServer::bind("127.0.0.1:53".parse().expect("literal")) {
             Ok(sock) => {
-                let dns = vigil_proxy::dnsserver::DnsServer::new(Arc::clone(&server.resolver));
+                let dns = Arc::new(vigil_proxy::dnsserver::DnsServer::new(Arc::clone(
+                    &server.resolver,
+                )));
+                // Keep the counters. They are the only way to find out afterwards that the server
+                // stopped, or that it is dropping queries because the in-flight cap is too low.
+                let stats = Arc::clone(&dns.stats);
                 std::thread::spawn(move || dns.serve(sock));
-                true
+                Some(stats)
             }
             // Port 53 held by something else — a local DNS tool, or another vigil. Not fatal: the
             // proxy half is the product, and the menu item stays greyed out rather than lying.
-            Err(_) => false,
+            Err(_) => None,
         };
 
     let serving = Arc::new(AtomicBool::new(true));
@@ -1423,7 +1574,7 @@ pub fn run() {
                 scroll: 0,
                 serving,
                 exe: std::env::current_exe().unwrap_or_default(),
-                dns_serving,
+                dns: dns_stats,
                 // Read once at startup: a machine already pointing at us — because a previous
                 // run left it that way — must show as engaged rather than as a fresh start.
                 dns_engaged: vigil_platform::dnsclient::read_interfaces()
@@ -1522,22 +1673,71 @@ fn restore_host() {
     // resolver "the loudest failure of the three" — and that reasoning does not survive contact with
     // what the two operations actually cost.
     //
-    // The proxy restore is what the comment below claims: a handful of registry writes, microseconds,
-    // no prompt. The DNS restore is not. `set_system_dns(false)` shells out to a cold `powershell.exe`
-    // to enumerate adapters, then to a **second** one running `Start-Process -Verb RunAs -Wait` — a
-    // UAC consent dialog on the secure desktop, waited on synchronously. Inside
-    // `WM_QUERYENDSESSION`, against Windows' 5-second `HungAppTimeout`, that is an invitation to be
-    // force-terminated; and a force-terminated process gets **no** `WM_ENDSESSION` and no
-    // `WM_DESTROY`, so the two second chances this function was given never run either. The machine
-    // then boots with `ProxyEnable=1`, `ProxyServer=https=127.0.0.1:1080` and no vigil: verbatim the
-    // 2026-08-06 failure that cost a reboot with no internet.
+    // The proxy restore is a handful of registry writes: microseconds, no prompt. The DNS restore is
+    // not, and it never will be — it raises a **UAC consent dialog** and waits for a human. The
+    // PowerShell that used to make it far worse is gone (two cold interpreters before the prompt even
+    // appeared), but the prompt is the point of the feature and cannot be removed. Inside
+    // `WM_QUERYENDSESSION`, against Windows' 5-second `HungAppTimeout`, waiting on a human is an
+    // invitation to be force-terminated; and a force-terminated process gets **no** `WM_ENDSESSION`
+    // and no `WM_DESTROY`, so the two second chances this function was given never run either. The
+    // machine then boots with `ProxyEnable=1`, `ProxyServer=https=127.0.0.1:1080` and no vigil:
+    // verbatim the 2026-08-06 failure that cost a reboot with no internet.
     //
-    // The priority is also backwards on its own terms. A stopped vigil leaves `9.9.9.9` written after
-    // it precisely so name resolution survives — the DNS half has a safety net, deliberately. The
-    // proxy half has none. So the operation without a fallback goes first, and the one with a
-    // fallback goes second, where being killed costs a working resolver rather than a working machine.
+    // So the proxy — the operation with **no** fallback — goes first and completes unconditionally,
+    // and the DNS restore gets a deadline. Giving up on the wait does not cancel the change: the
+    // elevated helper keeps running and usually finishes. What it buys is that this function always
+    // returns, which is what the session-end path is actually for.
+    //
+    // The priority is right on its own terms too. A stopped vigil leaves `9.9.9.9` written after it
+    // precisely so name resolution survives — the DNS half has a safety net, deliberately, and the
+    // proxy half has none.
     let _ = repair();
-    if with_app(|a| a.dns_engaged).unwrap_or(false) {
-        let _ = set_system_dns(false);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SHUTDOWN_DNS_MS);
+
+    // A change may be in flight right now: `ToggleSystemDns` runs on a worker, and it is very
+    // possibly sitting inside its own consent dialog. Give it a moment to settle rather than
+    // racing it, or the session-end path stacks a *second* prompt on top of the first.
+    while DNS_BUSY.load(AtomicOrdering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // `dns_engaged` alone is not the question. A change started from the menu sets it only when the
+    // worker's result comes back, so between the click and the answer the flag is false while the
+    // snapshot is already written and the elevated change may already have landed. Asking about the
+    // in-flight case too costs one registry read when nothing is engaged: `set_system_dns(false)`
+    // returns without prompting when no interface points at us.
+    if with_app(|a| a.dns_engaged).unwrap_or(false) || DNS_BUSY.load(AtomicOrdering::SeqCst) {
+        // **On a thread, with a deadline, and it is the whole call that is bounded.** The first
+        // attempt at this bounded `WaitForSingleObject` instead — which bounds nothing that matters,
+        // because `ShellExecuteExW` with `runas` does not return until the human answers the consent
+        // dialog, and the wait comes after it. A worker can simply be walked away from.
+        //
+        // Walking away does not cancel anything: the elevated helper, if it was reached, keeps
+        // running and usually finishes. What this buys is that the session-end message is always
+        // answered, so `WM_ENDSESSION` and `WM_DESTROY` still arrive and the proxy restore above is
+        // never skipped. A DNS setting left behind by the abandoned case is survivable by design —
+        // `9.9.9.9` is written after us — and `vigil-repair` fixes it. A stranded *proxy* is not.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(set_system_dns(false));
+        });
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let _ = rx.recv_timeout(left);
     }
 }
+
+/// The whole session-end DNS budget: waiting for an in-flight change plus the restore itself.
+///
+/// Under Windows' default 5-second `HungAppTimeout`, so the message is answered before Windows
+/// decides the application is hung and kills it — which would skip `WM_ENDSESSION` and `WM_DESTROY`
+/// as well, the exact shape of the 2026-08-06 failure.
+///
+/// **Measured on this machine, 2026-08-09**, by sending a real `WM_QUERYENDSESSION` at the tray
+/// window with DNS engaged and deliberately leaving the consent dialog unanswered: at a 4 s budget
+/// the message was answered in **4575 ms**. That passes, by 425 ms, on an idle machine — and the
+/// thing this budget exists to survive is a machine that is *not* idle, shutting down, with every
+/// other application being asked the same question at the same moment. 2.5 s measured out at ~3.1 s
+/// and buys back most of the margin. What the extra 1.5 s bought was a slightly better chance that
+/// a human answers a dialog in the meantime, which is not worth the failure it risks.
+const SHUTDOWN_DNS_MS: u64 = 2_500;

@@ -147,6 +147,8 @@ pub const STRINGS: &[Entry] = &[
     Entry { key: "dns.off",                   tr: "kapalı",                      en: "off" },
     Entry { key: "dns.ready_unused",          tr: "hazır — sistem henüz kullanmıyor",
                                               en: "ready — the system is not using it yet" },
+    Entry { key: "dns.stopped_while_in_use",  tr: "DNS DURDU — Windows hâlâ bizi gösteriyor",
+                                              en: "DNS HAS STOPPED — Windows still points at us" },
 
     Entry { key: "err.autostart",             tr: "Windows ile başlatma ayarlanamadı:\n{{error}}",
                                               en: "Could not set start-with-Windows:\n{{error}}" },
