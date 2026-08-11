@@ -42,8 +42,17 @@ impl fmt::Display for ProxySettings {
 ///
 /// `<local>` is Windows' token for "hosts without a dot". Nothing else belongs here — every
 /// entry is a host the tool will *not* help.
-pub const DEFAULT_BYPASS: &str = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;\
-                                  172.2*;172.30.*;172.31.*;192.168.*;<local>";
+///
+/// **RFC 1918's middle block is enumerated, not abbreviated.** It used to read `172.2*`, meaning
+/// 172.20–172.29 — but WinINET matches that as a prefix, so it also swallowed `172.2.x.x`, which is
+/// public address space. Anything a user reached there went direct, unhelped and unmeasured, and
+/// nothing said so. Twelve entries instead of one is a small price for a list whose entire job is
+/// to name what the tool refuses to protect.
+pub const DEFAULT_BYPASS: &str = "localhost;127.*;10.*;\
+                                  172.16.*;172.17.*;172.18.*;172.19.*;\
+                                  172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;\
+                                  172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;\
+                                  172.30.*;172.31.*;192.168.*;<local>";
 
 /// Build the settings that point Windows at our proxy.
 ///
@@ -74,19 +83,67 @@ pub fn rollback_to(previous: &ProxySettings) -> ProxySettings {
     previous.clone()
 }
 
+/// Every address in a `ProxyServer` value, whatever shape it is in: `host:port`,
+/// `scheme=host:port`, or several of the latter joined by `;`.
+pub(crate) fn addresses(server: &str) -> impl Iterator<Item = &str> {
+    server.split(';').filter_map(|part| {
+        let part = part.trim();
+        (!part.is_empty()).then(|| part.split_once('=').map_or(part, |(_, a)| a).trim())
+    })
+}
+
 /// Does the live setting route traffic at our listener?
 ///
 /// Disabled-but-populated is deliberately **false**: nothing is being routed, so the value is
 /// a leftover rather than an engagement.
+///
+/// **The address is compared exactly, and it used to be a substring test.** `contains("127.0.0.1:1080")`
+/// is true of `127.0.0.1:10809`, which is v2rayN's default HTTP inbound — so a user running one of
+/// those got "already engaged" (no snapshot written, nothing configured) while the tray read
+/// *Protecting*, and quitting vigil then blanked their `ProxyServer`. It destroyed a configuration
+/// vigil had never touched, with nothing to restore from.
 pub fn points_at_us(current: &ProxySettings, listen: &str) -> bool {
-    current.enabled && current.server.contains(listen)
+    current.enabled && addresses(&current.server).any(|a| a == listen)
+}
+
+/// Is this value, byte for byte, something **vigil itself** wrote — for any of its listeners?
+///
+/// Not "does it point at loopback" and not "does it point at *this* listener". A snapshot that names
+/// a loopback address may perfectly well be the user's own proxy (v2rayN on 10809, Clash on 7890,
+/// Fiddler on 8888), and treating those as ours blanks a configuration this tool never touched on
+/// every quit — the regression [`points_at_us`] records above. And an exact compare against the
+/// current listener misses the case that actually happens, which is **two vigils on two ports**: the
+/// scanner runs on 1085 and the tray on 1080, so the snapshot one of them takes of the other names
+/// neither's own address.
+///
+/// So the test is the whole triple. `settings_for` writes `enabled`, `https={addr}` and this project's
+/// own bypass list; nothing else on a machine writes all three together, and the address must be
+/// loopback as well. It is deliberately narrow: a value that is *nearly* ours is somebody else's.
+pub fn looks_like_our_own_writing(s: &ProxySettings) -> bool {
+    let mut found = addresses(&s.server);
+    let Some(addr) = found.next() else {
+        return false;
+    };
+    // More than one entry is not a shape we ever write.
+    if found.next().is_some() {
+        return false;
+    }
+    let loopback = addr
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.ip().is_loopback());
+    loopback && *s == settings_for(addr)
 }
 
 /// A machine is left broken when the proxy is enabled and points somewhere nothing listens.
-/// The repair tool looks for exactly this — the same predicate as [`points_at_us`], named for
-/// the perspective of the tool that has to clean up afterwards.
+///
+/// **Deliberately a prefix test, and no longer the same function as [`points_at_us`].** The repair
+/// tool passes `"127.0.0.1:"` on purpose: a vigil that was serving on another port still left the
+/// setting behind, and it is still ours to clean up. Sharing one predicate meant tightening
+/// ownership to an exact address would silently stop `vigil-repair` detecting a genuine strand —
+/// with the whole suite staying green, because the test for it used port 9999, which shares no
+/// prefix with 1080 and so passed for the wrong reason.
 pub fn is_stranded(current: &ProxySettings, our_prefix: &str) -> bool {
-    points_at_us(current, our_prefix)
+    current.enabled && addresses(&current.server).any(|a| a.starts_with(our_prefix))
 }
 
 /// Settings that disable the proxy entirely — what the repair tool writes when it cannot
@@ -164,13 +221,25 @@ mod tests {
     #[test]
     fn the_bypass_list_contains_only_local_destinations() {
         for entry in DEFAULT_BYPASS.split(';') {
+            // `starts_with("172.")` used to be enough, which is how `172.2*` — a prefix that
+            // also matches the public 172.2.0.0/16 — passed this test for months. RFC 1918's
+            // middle block is 172.16 through 172.31 and nothing else.
+            let private_172 = entry
+                .strip_prefix("172.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|octet| octet.parse::<u8>().ok())
+                .is_some_and(|n| (16..=31).contains(&n));
             let ok = entry == "<local>"
                 || entry == "localhost"
                 || entry.starts_with("127.")
                 || entry.starts_with("10.")
-                || entry.starts_with("172.")
+                || private_172
                 || entry.starts_with("192.168.");
-            assert!(ok, "{entry:?} is not a local destination");
+            assert!(
+                ok,
+                "{entry:?} is not a local destination — an entry here is a host vigil refuses to \
+                 help, so a wildcard that reaches public address space silently un-protects it"
+            );
         }
     }
 
@@ -226,6 +295,73 @@ mod tests {
                 "rollback must be exact, including a disabled-but-populated state"
             );
         }
+    }
+
+    /// **A port that merely starts with ours is not ours.** `127.0.0.1:10809` is v2rayN's default
+    /// HTTP inbound, and a substring test called it vigil's: `engage::start` then answered
+    /// "already engaged", so no snapshot was written and nothing was configured, while the tray
+    /// read *Protecting*. Quitting blanked their `ProxyServer` with nothing to restore from.
+    #[test]
+    fn a_longer_port_that_starts_with_ours_is_somebody_elses() {
+        let theirs = ProxySettings {
+            enabled: true,
+            server: "http=127.0.0.1:10809;https=127.0.0.1:10809".into(),
+            bypass: String::new(),
+        };
+        assert!(
+            !points_at_us(&theirs, "127.0.0.1:1080"),
+            "v2rayN's proxy was read as ours"
+        );
+        // And ours, in every shape Windows writes it, still is.
+        for server in [
+            "https=127.0.0.1:1080",
+            "127.0.0.1:1080",
+            "http=127.0.0.1:1080;https=127.0.0.1:1080",
+            " https=127.0.0.1:1080 ",
+        ] {
+            let ours = ProxySettings {
+                enabled: true,
+                server: server.into(),
+                bypass: String::new(),
+            };
+            assert!(points_at_us(&ours, "127.0.0.1:1080"), "{server}");
+        }
+    }
+
+    /// **And `is_stranded` must stay a prefix test**, because `vigil-repair` calls it with the
+    /// port deliberately left off: a vigil that served on 1085 and died still left the setting
+    /// behind and it is still ours to clean up. This is the test that would have gone red if the
+    /// ownership fix had been applied to one shared predicate.
+    #[test]
+    fn a_strand_is_recognised_whatever_port_it_was_serving_on() {
+        for server in [
+            "https=127.0.0.1:1080",
+            "https=127.0.0.1:1085",
+            "https=127.0.0.1:10809",
+        ] {
+            let stranded = ProxySettings {
+                enabled: true,
+                server: server.into(),
+                bypass: String::new(),
+            };
+            assert!(
+                is_stranded(&stranded, "127.0.0.1:"),
+                "{server} would have been left behind"
+            );
+        }
+        // Somebody else's real proxy is not a strand, and disabled is not a strand.
+        let corp = ProxySettings {
+            enabled: true,
+            server: "http=corp-proxy:8080".into(),
+            bypass: String::new(),
+        };
+        assert!(!is_stranded(&corp, "127.0.0.1:"));
+        let off = ProxySettings {
+            enabled: false,
+            server: "https=127.0.0.1:1080".into(),
+            bypass: String::new(),
+        };
+        assert!(!is_stranded(&off, "127.0.0.1:"));
     }
 
     /// The failure mode the repair tool exists for: enabled, pointing at us, nothing running.

@@ -75,11 +75,6 @@ impl<'a> Reader<'a> {
             pos: 0,
         })
     }
-
-    /// Absolute offset of this reader's cursor, given the reader's own base offset.
-    pub fn abs(&self, base: usize) -> usize {
-        base + self.pos
-    }
 }
 
 #[cfg(test)]

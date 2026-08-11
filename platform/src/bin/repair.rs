@@ -83,12 +83,18 @@ fn main() -> ExitCode {
     // already consumed: disabling the proxy is right, and it is what saves a stranded machine.
     //
     // If it names some other local proxy — Clash, v2rayN, Fiddler, ByeDPI on another port — then
-    // vigil deliberately never wrote a snapshot, because `envproxy::start`/`sysproxy` refuse to take
+    // vigil deliberately never wrote a snapshot, because `sysproxy`/`envproxy::start` refuse to take
     // over a setting somebody else owns. Writing `disabled()` there does not repair anything: it
-    // silently destroys a configuration this tool never touched, with nothing to restore it from.
-    // An adversarial review reached that state through the updater's guard, which is the same
-    // "loopback" / "us" confusion in a third place. Refusing is the only safe answer, and `--force`
-    // remains for the user who really does want the proxy off.
+    // destroys a configuration this tool never touched, with nothing to restore it from.
+    //
+    // **And this comment used to end by saying "refusing is the only safe answer", which the code
+    // below does not do and never did.** The arm that refused was removed on 2026-08-11 as provably
+    // unreachable: getting this far requires `force || is_stranded`, and `is_stranded` matches any
+    // enabled loopback address — including somebody else's. So the third-party case *does* reach the
+    // clearing arm, and the honest description of today's behaviour is that this tool cannot yet tell
+    // "a vigil that died" from "another local proxy on a port we do not use". The distinction it
+    // needs is a third question neither half asks — **is anything listening there** — and until that
+    // exists the comment must not claim a safety the code does not provide.
     let target = match (previous, sysproxy::is_stranded(&current, "127.0.0.1:")) {
         (Some(prev), _) => {
             println!("restoring the snapshot taken before vigil started");
@@ -98,18 +104,15 @@ fn main() -> ExitCode {
             println!("no snapshot, but --force was given; disabling the proxy");
             sysproxy::disabled()
         }
-        (None, true) => {
+        // Both remaining cases, because the second cannot happen: reaching this match at all
+        // requires `force || is_stranded`, and `force` is consumed by the arm above — so `(None,
+        // false)` is `!force && !is_stranded`, which returned early. There used to be a fourth arm
+        // here printing "this is not vigil, leaving it alone", and it described a behaviour this tool
+        // does not have from a state it cannot be in. A message that cannot be true is worse than no
+        // message: somebody reasons from it.
+        (None, _) => {
             println!("no usable snapshot; disabling the proxy instead");
             sysproxy::disabled()
-        }
-        (None, false) => {
-            println!(
-                "proxy: {} is not vigil and there is no snapshot",
-                current.server
-            );
-            println!("       leaving it alone — vigil never wrote this and cannot restore it.");
-            println!("       (use --force to disable the proxy anyway)");
-            return exit_for(both(repair_env(force), repair_dns(force)));
         }
     };
 
@@ -162,6 +165,7 @@ fn exit_for(ok: bool) -> ExitCode {
 /// nothing on screen mentions a proxy, so this is arguably the harder half to diagnose by
 /// hand. Repaired on the same rules: restore the snapshot if there is one, otherwise clear.
 fn repair_env(force: bool) -> bool {
+    use vigil_platform::envproxy::repair_target;
     use vigil_platform::{envproxy, envreg};
 
     let current = match envreg::read_current() {
@@ -175,27 +179,25 @@ fn repair_env(force: bool) -> bool {
         println!("environment: nothing to repair");
         return true;
     }
-    // Same rule as the registry half, and for the same reason: with no snapshot, clearing all four
-    // variables is a repair only if they were ours. Somebody else's `HTTPS_PROXY=http://127.0.0.1:8888`
-    // is not ours, and vigil never wrote a snapshot over it precisely so that it would not be
-    // clobbered. Clearing it — including their `NO_PROXY`, which the old code did — destroys a
-    // configuration with nothing to put back.
+    // Same rule as the registry half, and the reasoning that used to be here was the wrong way
+    // round. It argued that clearing without a snapshot could destroy somebody else's
+    // configuration — true in general, and not reachable from here: without `--force` this line is
+    // only reached because `is_stranded` matched, and that means a variable names a **loopback**
+    // listener. Somebody else's corporate proxy does not match it. What the old caution actually
+    // protected was a dead port.
     let snapshot = env_snapshot_path().and_then(|p| std::fs::read_to_string(p).ok());
-    let target = match (snapshot, force) {
-        (Some(t), _) => {
-            println!("environment: restoring the snapshot taken before vigil started");
-            envproxy::snapshot_from_text(&t)
-        }
-        (None, true) => {
-            println!("environment: no snapshot, but --force was given; clearing the variables");
-            envproxy::EnvProxy::default()
-        }
-        (None, false) => {
-            println!("environment: no usable snapshot, and these variables are not vigil's.");
-            println!("             Leaving them alone. (use --force to clear them anyway)");
-            return true;
-        }
-    };
+    // The decision is `envproxy::repair_target`, which is pure and tested — this binary has no tests
+    // of its own, and the arm that used to live here printed "these variables are not vigil's,
+    // leaving them alone" and returned success on a machine that was demonstrably stranded.
+    if snapshot.is_some() {
+        println!("environment: restoring the snapshot taken before vigil started");
+    } else if force {
+        println!("environment: no snapshot, but --force was given; clearing the variables");
+    } else {
+        println!("environment: stranded on a loopback proxy and no snapshot to restore —");
+        println!("             clearing the variables, which is what the registry half does.");
+    }
+    let target = repair_target(snapshot.as_deref());
     match envreg::apply(&target) {
         Ok(()) => {
             println!("environment: restored");

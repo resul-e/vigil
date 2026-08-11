@@ -58,7 +58,7 @@ hız kaybı yok.
 
 **Hangi yöntemin işe yaradığı hatta göre değişiyor**, ve vigil bunu site site kendisi öğreniyor:
 
-| | Türk Telekom (AS9121) | Turkcell Superonline (AS34984) |
+| | the home line | SansürOn |
 |---|---|---|
 | Engelleme şekli | RST enjeksiyonu, ~2 ms | Sessiz düşürme, 6 sn |
 | İlk baytı ayırmak (`split:1`) | **20/20** | **0/10** — hatta RST'ye çeviriyor |
@@ -73,7 +73,7 @@ hatırlıyor.
 Ölçülen sonuçlar, aynı anda aynı hatta, doğrudan bağlantı ile vigil üzerinden karşılaştırmalı:
 
 ```
-Türk Telekom (AS9121)              doğrudan     vigil'den
+the home line              doğrudan     vigil'den
   discord.com                        0/6          6/6
   updates.discord.com                0/6          6/6
   gateway.discord.gg                 0/6          6/6
@@ -81,7 +81,7 @@ Türk Telekom (AS9121)              doğrudan     vigil'den
   4chan.org                          0/5          5/5
   example.com          (kontrol)     6/6          6/6
 
-Turkcell Superonline (AS34984)     doğrudan     vigil'den
+SansürOn     doğrudan     vigil'den
   engellenen 10 alan adı             0/6          6/6      (60/60)
 ```
 
@@ -207,7 +207,7 @@ No throughput cost.
 
 **Which technique works depends on the ISP**, and vigil learns it per hostname:
 
-| | Türk Telekom (AS9121) | Turkcell Superonline (AS34984) |
+| | the home line | SansürOn |
 |---|---|---|
 | Blocking method | RST injection, ~2 ms | Silent drop, 6 s |
 | Splitting the first byte (`split:1`) | **20/20** | **0/10** — it even provokes an RST |
@@ -222,7 +222,7 @@ one works, and remembers it.
 Measured on the same line at the same moment, direct versus through vigil:
 
 ```
-Türk Telekom (AS9121)                direct      via vigil
+the home line                direct      via vigil
   discord.com                          0/6          6/6
   updates.discord.com                  0/6          6/6
   gateway.discord.gg                   0/6          6/6
@@ -230,7 +230,7 @@ Türk Telekom (AS9121)                direct      via vigil
   4chan.org                            0/5          5/5
   example.com            (control)     6/6          6/6
 
-Turkcell Superonline (AS34984)       direct      via vigil
+SansürOn       direct      via vigil
   10 blocked hostnames                 0/6          6/6      (60/60)
 ```
 

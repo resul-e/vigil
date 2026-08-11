@@ -31,6 +31,13 @@ use vigil_update::plan;
 use vigil_update::stage;
 
 /// Where the real binaries are. Two profiles, because the operator may have built either.
+///
+/// **These are pre-built binaries, and `cargo test` does not rebuild them.** That is deliberate —
+/// this gate exists to walk the *shipped* executables — but it means a run can silently validate a
+/// binary from days ago, so the guard below refuses one older than the sources it is supposed to
+/// be. Found on 2026-08-11 while mutation-checking the signature test: the check was deleted from
+/// `update.rs`, `cargo test` was green, and the reason was that the test never ran the mutated
+/// code at all. A gate that can pass against code that is not under test is not a gate.
 fn release_dir() -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -40,6 +47,7 @@ fn release_dir() -> PathBuf {
     for profile in ["release", "debug"] {
         let d = root.join(profile);
         if d.join("vigil-repair.exe").exists() {
+            refuse_if_stale(&d);
             return d;
         }
     }
@@ -47,6 +55,68 @@ fn release_dir() -> PathBuf {
         "no vigil-repair.exe under {}. Build it first:\n  \
          cargo build --release --target x86_64-pc-windows-msvc",
         root.display()
+    );
+}
+
+/// Refuse to run the walk against binaries older than the code they were built from.
+fn refuse_if_stale(dir: &Path) {
+    // Every crate's `src/`, and only `src/`: those are the files the executables are built from.
+    // Including `tests/` would make editing this very file look like a stale binary.
+    let newest_source = {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root");
+        let mut newest = std::time::SystemTime::UNIX_EPOCH;
+        let mut stack: Vec<PathBuf> = ["core", "platform", "proxy", "ui", "update"]
+            .iter()
+            .map(|c| root.join(c).join("src"))
+            .collect();
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+                    if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                        newest = newest.max(t);
+                    }
+                }
+            }
+        }
+        newest
+    };
+    // The *newest* binary, not each one: cargo only relinks what actually changed, so an
+    // untouched `vigil-repair.exe` keeps its old timestamp through a perfectly current build.
+    // What this asks is the question that matters — "did a build run after the last edit" — and
+    // the newest output in the folder is when that build was. Its blind spot is a `-p`-scoped
+    // build, which can refresh one binary and leave a sibling genuinely stale; the workflow and
+    // `scripts/release.sh` both build the whole workspace, so that is a corner rather than a hole.
+    let newest_binary = NAMES
+        .iter()
+        .map(|(name, _)| *name)
+        // `vigil-update.exe` is not in `NAMES` — it is the runner rather than one of the files an
+        // update replaces — but it is the binary these tests actually *execute*, so leaving it out
+        // is how this check first reported a fresh tree as stale.
+        .chain(std::iter::once("vigil-update.exe"))
+        .filter_map(|name| {
+            std::fs::metadata(dir.join(name))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .max()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+    assert!(
+        newest_binary >= newest_source,
+        "the executables in {} are older than the sources they should have been built from.\n\
+         This walk runs the pre-built executables rather than anything cargo just compiled, so it \
+         would be testing code that is not the code under test — which is exactly how a deleted \
+         signature check once left the whole suite green. Rebuild first:\n  \
+         cargo build --release --target x86_64-pc-windows-msvc",
+        dir.display()
     );
 }
 
@@ -99,6 +169,13 @@ impl Sandbox {
     /// A manifest describing the staged files, signed by nobody — the signature path is covered by
     /// `verify`'s own tests with real keys; this walk is about the filesystem.
     fn manifest(&self) -> Manifest {
+        manifest::parse(&self.manifest_text()).expect("manifest")
+    }
+
+    /// The manifest as text. Kept rather than thrown away, because a test that wants to *stage* a
+    /// real manifest had to invent a fake one otherwise — and a fake one is refused by the parser,
+    /// one gate earlier than the gate the test was written for.
+    fn manifest_text(&self) -> String {
         let mut s = String::from(
             "schema=1\nserial=7\nversion=0.7.0\nexpires=2036-11-12T00:00:00Z\n\
              min_version=0.6.3\ncritical=0\n\
@@ -115,7 +192,7 @@ impl Sandbox {
                 sha256::hex(&digest)
             ));
         }
-        manifest::parse(&s).expect("manifest")
+        s
     }
 
     fn mark_ready(&self, m: &Manifest) {
@@ -267,9 +344,14 @@ fn the_binary_refuses_to_apply_a_staged_set_whose_signatures_do_not_verify() {
     // the shape an attacker with write access to the folder produces: right bytes, right hashes,
     // no signature. The per-file hashes all match, so **only** the signature check stands between
     // this and a swap.
+    //
+    // **The manifest has to be the real one.** It used to be `"schema=1\nnot a real manifest\n"`,
+    // which the *parser* rejects — one gate earlier than the gate this test exists for. So the
+    // refusal it observed was a parse failure, the assertion accepted either word, and deleting the
+    // signature check outright left the whole suite and all 40 boundary runs green.
     stage::save_inputs(
         sb.path(),
-        "schema=1\nnot a real manifest\n",
+        &sb.manifest_text(),
         &["not a signature".to_string(), "nor this".to_string()],
     )
     .expect("saves inputs");
@@ -296,8 +378,17 @@ fn the_binary_refuses_to_apply_a_staged_set_whose_signatures_do_not_verify() {
     // told "nothing staged".
     let runner = apply::place_runner(sb.path(), &release_dir().join("vigil-update.exe"))
         .expect("places the runner");
+    // `--die-after nothing` is a safety net for the *mutation*, not for the passing run. With the
+    // signature check present the run bails at `signature:` long before any boundary, so this
+    // argument changes nothing. With the check deleted it would otherwise build a valid plan,
+    // perform the swaps and relaunch `vigil-app.exe` — starting a tray application on the machine
+    // running the test, which the comment above forbids, and only *then* failing the "nothing
+    // moved" assertion. Stopping at `BeforeAnything` makes the mutation fail on the refusal
+    // assertions with nothing touched.
     let out = std::process::Command::new(&runner)
         .arg("--apply")
+        .arg("--die-after")
+        .arg("nothing")
         .output()
         .expect("runs");
     let said = String::from_utf8_lossy(&out.stdout);
@@ -312,9 +403,12 @@ fn the_binary_refuses_to_apply_a_staged_set_whose_signatures_do_not_verify() {
         "it must refuse. It said:\n{said}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // `signature` alone, not `signature || manifest`: the manifest staged above is a valid one, so
+    // the only thing left that can refuse it is the signature check. Accepting "manifest" is what
+    // let a parse failure stand in for the check this test is named after.
     assert!(
-        said.contains("signature") || said.contains("manifest"),
-        "the refusal must name its reason: {said}"
+        said.contains("signature"),
+        "the refusal must be the signature check, not something earlier: {said}"
     );
     // And it says what it did about restarting, rather than being silent about it. Every failure path
     // used to be silent; that is the finding this test also covers.
@@ -326,10 +420,7 @@ fn the_binary_refuses_to_apply_a_staged_set_whose_signatures_do_not_verify() {
     // up and sends it has brought the explanation with them.
     let recorded = std::fs::read_to_string(sb.path().join(stage::LAST_ERROR))
         .expect("the reason must be written next to the binaries");
-    assert!(
-        recorded.contains("signature") || recorded.contains("manifest"),
-        "{recorded}"
-    );
+    assert!(recorded.contains("signature"), "{recorded}");
 
     // And nothing moved. This is the assertion the whole ordering exists to protect.
     let after: Vec<Option<_>> = NAMES

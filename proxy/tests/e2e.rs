@@ -156,40 +156,88 @@ fn split_transforms_the_first_flight_and_preserves_it() {
     );
 }
 
-/// With a delay between writes the split becomes observable on the wire, which is the
-/// property the technique actually depends on: two segments, not one.
+// `a_delayed_split_is_visibly_two_writes_upstream` was deleted here on 2026-08-11. Every
+// assertion it made is made again, at the safe 200 ms interval and with `transformed == 1` on
+// top, by the `"socks5"` arm of `every_dialect_gets_the_first_flight_split` below — so it was a
+// strictly weaker duplicate standing at the one interval this file has twice measured as
+// unreliable. It failed under load, and its message ("first write was not one byte: [300]") is
+// indistinguishable from a real regression in the split transform, which is what made it
+// expensive rather than merely annoying.
+
+/// **The step-8 gate, driven through the whole datapath for the first time.**
+///
+/// `*.gov.tr`, `*.com.tr`, `*.edu.tr` and `*.org.tr` are excluded because Turkish banking and
+/// government sites break under desync — the number one "your tool broke my internet" report for
+/// tools in this space. `HostRules::applies_to` is well tested as a pure function, and until now
+/// **nothing drove a connection through the server to an excluded host**: the wiring from that
+/// function to "relay this flight untouched" could be deleted with the whole suite green.
+///
+/// It is driven over **SOCKS4** deliberately, because that is where the rail is thinnest. A SOCKS4
+/// client sends an *address*, never a name — Chromium never uses 4a — so the hostname has to be
+/// recovered from the ClientHello's SNI. If that recovery ever stops working the exclude list
+/// silently stops applying and nothing fails: the connection still works, it is merely being
+/// desynced against a bank. That is CLAUDE.md's "the step-8 gate coming undone without anything
+/// failing", and it is now a test.
 #[test]
-fn a_delayed_split_is_visibly_two_writes_upstream() {
-    let (up, sizes) = stub_upstream();
-    let (proxy, _stats) = start_proxy("split:1@20");
-    let mut s = socks_connect(proxy, "127.0.0.1", up.port()).expect("connect");
+fn an_excluded_host_is_relayed_untouched_even_when_only_the_sni_names_it() {
+    // A strategy that is unmistakable on the wire if it runs at all.
+    for (host, should_transform) in [("giris.turkiye.gov.tr", false), ("discord.com", true)] {
+        let (up, sizes) = stub_upstream();
+        let (proxy, stats) = start_proxy("split:1@200");
 
-    let flight = vec![0x16u8; 300];
-    s.write_all(&flight).expect("write");
-    let mut back = vec![0u8; flight.len()];
-    s.read_exact(&mut back).expect("echo");
-    assert_eq!(back, flight);
-    drop(s);
+        // SOCKS4 by address: the proxy is told 127.0.0.1, and the only place `host` appears is
+        // inside the TLS record it is about to inspect.
+        let mut s = socks4_connect(proxy, [127, 0, 0, 1], up.port()).expect("connect");
+        let flight = vigil_core::synth::client_hello(host, 512, [0x5Au8; 32]).expect("hello");
+        s.write_all(&flight).expect("write");
+        let mut back = vec![0u8; flight.len()];
+        s.read_exact(&mut back).expect("echo");
+        assert_eq!(back, flight, "{host}: the flight did not survive");
+        drop(s);
 
-    let seen = sizes.recv_timeout(Duration::from_secs(5)).expect("sizes");
-    assert_eq!(
-        seen.first(),
-        Some(&1),
-        "first write was not one byte: {seen:?}"
-    );
-    assert_eq!(
-        seen.iter().sum::<usize>(),
-        300,
-        "byte count changed: {seen:?}"
-    );
+        let seen = sizes.recv_timeout(Duration::from_secs(5)).expect("sizes");
+        let transformed = stats.transformed.load(std::sync::atomic::Ordering::Relaxed);
+        let excluded = stats.excluded.load(std::sync::atomic::Ordering::Relaxed);
+
+        if should_transform {
+            assert_eq!(excluded, 0, "{host} is not on the exclude list");
+            assert_eq!(transformed, 1, "{host} should have been split");
+            assert_eq!(
+                seen.first().copied(),
+                Some(1),
+                "{host}: expected the 1-byte split, got {seen:?}"
+            );
+        } else {
+            assert_eq!(
+                excluded, 1,
+                "{host} was not recognised as excluded — the SNI recovery that the exclude list \
+                 depends on for every SOCKS4 client is not working"
+            );
+            assert_eq!(
+                transformed, 0,
+                "{host} is on the exclude list and was desynced anyway"
+            );
+            // And it went out in one piece: a bank sees exactly what the client wrote.
+            assert_eq!(
+                seen,
+                vec![flight.len()],
+                "{host}: an excluded flight must reach the server as one write, got {seen:?}"
+            );
+        }
+    }
 }
 
-/// Exact write boundaries, made observable with a delay for the same reason as above: without
-/// one the kernel is free to coalesce, and then the test measures the kernel rather than us.
+/// A multi-cut spec must survive a real connection intact. **The boundaries themselves are
+/// asserted in `server.rs`**, by `a_multi_cut_spec_produces_exactly_those_boundaries`, where they
+/// are arithmetic rather than a race against the scheduler — this test used to assert the whole
+/// vector behind three 20 ms gaps and went red in 4 runs of 8 under load.
+///
+/// What is left here is the part only a socket can answer: that a four-write flight arrives whole
+/// and in order at the far end.
 #[test]
-fn a_multi_split_produces_the_expected_write_boundaries() {
+fn a_multi_split_delivers_the_flight_intact() {
     let (up, sizes) = stub_upstream();
-    let (proxy, _stats) = start_proxy("split:1,3,7@20");
+    let (proxy, stats) = start_proxy("split:1,3,7@20");
     let mut s = socks_connect(proxy, "127.0.0.1", up.port()).expect("connect");
 
     let flight = vec![0xABu8; 100];
@@ -201,9 +249,16 @@ fn a_multi_split_produces_the_expected_write_boundaries() {
 
     let seen = sizes.recv_timeout(Duration::from_secs(5)).expect("sizes");
     assert_eq!(
-        seen,
-        vec![1, 2, 4, 93],
-        "cuts at 1,3,7 of a 100-byte flight should land exactly here"
+        seen.iter().sum::<usize>(),
+        100,
+        "byte count changed on the wire: {seen:?}"
+    );
+    // The deciding assertion is off the wire: the proxy reports whether it applied the transform,
+    // and that cannot be coalesced away by a busy scheduler.
+    assert_eq!(
+        stats.transformed.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the multi-cut transform was not applied at all"
     );
 }
 
@@ -695,7 +750,7 @@ fn tls_record(len: usize) -> Vec<u8> {
 
 /// What arrived has to be recorded with more than its name.
 ///
-/// The Superonline report of 2026-08-07 said "updates.discord.com arrived" and could not say
+/// The SansürOn report of 2026-08-07 said "updates.discord.com arrived" and could not say
 /// whether that was one lookup or a client looping on retries, which strategy was actually
 /// applied to it, or which program asked — and each of those was the question that mattered.
 #[test]
@@ -770,4 +825,67 @@ fn clearing_forgets_the_detail_as_well_as_the_names() {
     server.clear_seen();
     assert!(server.seen_detail().is_empty());
     assert!(server.seen_hosts().is_empty());
+}
+
+/// **A `tlsrec` that did not run has to be visible.** The record transform refuses a partial record
+/// and the composition swallows the error, so `tlsrec:64+split:1` can silently become a bare
+/// `split:1` — which on the second network is the difference between the only transform measured to
+/// work there and the one strategy that is 0/300 *and* converts a silent drop into an active reset.
+/// It was indistinguishable in every report ever taken.
+#[test]
+fn a_record_split_that_did_not_apply_is_marked_in_the_record() {
+    let (up, _sizes) = stub_upstream();
+    let cfg = Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        strategy: Strategy::parse("tlsrec:64+split:1").expect("spec"),
+        record_hosts: true,
+        ..Default::default()
+    };
+    let server = std::sync::Arc::new(Server::new(cfg));
+    let l = server.bind().expect("bind");
+    let proxy = l.local_addr().expect("addr");
+    let s2 = std::sync::Arc::clone(&server);
+    std::thread::spawn(move || s2.serve(l));
+
+    // A first flight that is *not* a whole TLS record: five bytes of header claiming far more than
+    // follows. `tlsrec` cannot reframe it, `split` still applies, and the spec asked for both.
+    let mut partial = vec![0x16u8, 0x03, 0x01, 0x04, 0x00];
+    partial.extend(std::iter::repeat_n(0xAAu8, 40));
+    let mut c = socks_connect(proxy, "127.0.0.1", up.port()).expect("connect");
+    c.write_all(&partial).expect("write");
+    let mut back = [0u8; 64];
+    let _ = c.set_read_timeout(Some(std::time::Duration::from_millis(600)));
+    let _ = c.read(&mut back);
+    drop(c);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let detail = server.seen_detail();
+    let (_, rec) = detail
+        .iter()
+        .find(|(h, _)| h == "127.0.0.1")
+        .expect("recorded");
+    assert!(
+        rec.applied.iter().any(|a| a.contains("UYGULANMADI")),
+        "a tlsrec that could not run must say so; recorded: {:?}",
+        rec.applied
+    );
+
+    // And a whole record is recorded plainly, with its parameters intact.
+    let whole = vigil_core::synth::client_hello("example.com", 300, [3u8; 32]).expect("hello");
+    let mut c = socks_connect(proxy, "127.0.0.1", up.port()).expect("connect");
+    c.write_all(&whole).expect("write");
+    let _ = c.set_read_timeout(Some(std::time::Duration::from_millis(600)));
+    let _ = c.read(&mut back);
+    drop(c);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let detail = server.seen_detail();
+    let (_, rec) = detail
+        .iter()
+        .find(|(h, _)| h == "127.0.0.1")
+        .expect("recorded");
+    assert!(
+        rec.applied.contains("tlsrec:64+split:1"),
+        "the working case keeps its parameters; recorded: {:?}",
+        rec.applied
+    );
 }

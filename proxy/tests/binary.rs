@@ -63,6 +63,87 @@ fn start(proxy_port: u16, panel_port: u16) -> (Vigil, SocketAddr) {
     panic!("vigil's panel never answered on {panel}");
 }
 
+/// **`--split` must mean the strategy that is 10/10 on both measured networks.**
+///
+/// It is the shipped shortcut and what the desktop shortcut passes. Nothing tested what it maps
+/// to, so pointing it at `Strategy::split_only()` left the whole workspace green — and `split:1` is
+/// **0/10 on SansürOn**, where it also converts that censor's silent drop into an active reset.
+/// Pointing it at `passthrough()` was green too, and produces the "proxy that works perfectly and
+/// helps with nothing" that this binary's own comments say the code exists to prevent.
+///
+/// Read off `mode`, because `cfg.mode` is what the engine acts on, and asserted as a literal so a
+/// change to `measured_default()` itself is caught here too.
+#[test]
+fn split_means_the_measured_default() {
+    let (proxy_port, panel_port) = (free_port(), free_port());
+    let (_v, panel) = start(proxy_port, panel_port);
+
+    let body = http_get(panel, "/api/status").expect("status");
+    assert!(
+        body.contains(r#""mode":"fixed:tlsrec:64+split:1""#),
+        "--split must be the measured default; `split:1` alone is 0/10 on the second network: \
+         {body}"
+    );
+}
+
+/// `--set-dns` without `--dns` refuses, out loud.
+///
+/// It used to be accepted, parsed, and then do nothing at all — no engagement, no message, no
+/// non-zero exit. The behaviour was right; the silence was the defect, on the one flag that asks
+/// for administrator rights. Whoever typed it walked away believing their DNS was protected.
+#[test]
+fn set_dns_without_dns_is_refused_rather_than_ignored() {
+    let out = Command::new(env!("CARGO_BIN_EXE_vigil"))
+        .arg("127.0.0.1:0")
+        .arg("--set-dns")
+        .arg("--no-panel")
+        .output()
+        .expect("run vigil");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "should refuse: {err}");
+    assert!(err.contains("--set-dns needs --dns"), "{err}");
+}
+
+/// **A startup that fails must not have already rewired the machine's DNS.**
+///
+/// `--set-dns` used to engage inside the `--dns` bind arm, which sits *above* three paths that
+/// `return` out of `main` — the proxy `bind()` failing, a non-loopback `--panel`, and the
+/// instance-lock refusal — and above the shutdown handler that would have undone it. So
+/// `vigil --dns --set-dns` on a machine whose proxy port was already taken raised the consent
+/// prompt, rewrote every interface to a static `127.0.0.1, 9.9.9.9`, and then exited with
+/// `bind: address in use`, leaving the machine pointed at a resolver that was not running.
+///
+/// This drives the shipped binary down the exact path, and asserts on `engage_system_dns`'s own
+/// output: it prints something on *every* route through it — success, "already pointing at us",
+/// or "cannot read the current servers" — so silence is proof it was never called. That is what
+/// makes the test work on Linux, where there is no Windows resolver to rewire.
+#[test]
+fn a_failed_startup_never_engaged_the_system_resolver() {
+    // Hold the proxy port so `server.bind()` is guaranteed to fail.
+    let held = TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let taken = held.local_addr().expect("addr").port();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_vigil"))
+        .arg(format!("127.0.0.1:{taken}"))
+        .arg("--dns")
+        .arg("127.0.0.1:0")
+        .arg("--set-dns")
+        .arg("--no-panel")
+        .output()
+        .expect("run vigil");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("bind"),
+        "the test needs the proxy bind to be the thing that failed: {err}"
+    );
+    assert!(
+        !err.contains("system dns:"),
+        "the machine's resolver was engaged before a startup that then failed: {err}"
+    );
+    assert_ne!(out.status.code(), Some(0), "startup should have failed");
+}
+
 /// The regression: `listen` must name the proxy, which is the address a client connects to.
 #[test]
 fn the_panel_reports_the_proxy_address_not_its_own() {

@@ -71,7 +71,7 @@ pub fn apply(s: &ProxySettings) -> Result<(), Error> {
 /// single string — `dwOption` receives wininet's own module handle and `lpBuffer` receives a
 /// pointer to the text `"0 39 0 0"`. WinINET was never notified, in any build, on any machine,
 /// while the comment above claimed it was. Found while looking for why a volunteer's Chromium
-/// ignored a proxy this function had just written; see `docs/14-superonline.md` §7.
+/// ignored a proxy this function had just written; see `docs/14-second-network.md` §7.
 ///
 /// Declared by hand rather than through a bindings crate, the same call the rest of this crate
 /// makes: two declarations are easier to audit than a dependency.

@@ -9,13 +9,6 @@
 //! it. The serial is the exception — it is bookkeeping, and it lives here because it is the only
 //! per-machine thing an update needs to remember, and one file is better than two.
 
-use std::path::PathBuf;
-
-/// `updates.txt` beside the strategy cache.
-pub fn path() -> Option<PathBuf> {
-    crate::paths::state_dir().map(|d| d.join("updates.txt"))
-}
-
 /// What the file says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Prefs {

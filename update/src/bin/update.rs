@@ -235,15 +235,23 @@ fn check_cmd(args: &[String]) -> std::process::ExitCode {
     // bug — this binary is manifest order 4 and `vigil-app.exe` is order 5, so after a crash between
     // them the updater is already the new version and would answer "current" forever, with the
     // finishing bytes sitting untouched one directory down.
+    // A complete staging set that has not been started yet. Remembered rather than printed: while
+    // the endpoints answer, what they say is more current than what is on disk, so this is only
+    // used if the fetch below fails. **Phase B needs no network at all**, so answering
+    // `unreachable` over the top of a ready folder made a fully downloaded, doubly-signed,
+    // hash-checked update uninstallable — `UpdateState::Unreachable` offers no action, and the tray
+    // rechecks by itself every six hours, so it needed nobody to click anything. The condition that
+    // triggers it is the ordinary one: the line starts blocking `github.com` between staging and
+    // installing, which is the situation this whole product exists for.
+    let mut staged_offline: Option<(String, bool)> = None;
     if let Some((text, sigs)) = stage::load_inputs(&folder) {
         let refs: Vec<&str> = sigs.iter().map(String::as_str).collect();
         let verified = vigil_update::verify::verify(text.as_bytes(), &refs).is_ok();
         if let Ok(m) = vigil_update::manifest::parse(&text) {
             let required = m.files.iter().filter(|f| f.required).count();
             let left = apply::outstanding(&folder, &m).len();
-            if let apply::Resume::Finishable { outstanding } =
-                apply::resume_state(verified, required, left)
-            {
+            let resume = apply::resume_state(verified, required, left);
+            if let apply::Resume::Finishable { outstanding } = resume {
                 println!(
                     "{}",
                     status_line(
@@ -256,6 +264,14 @@ fn check_cmd(args: &[String]) -> std::process::ExitCode {
                 );
                 return std::process::ExitCode::SUCCESS;
             }
+            if apply::offer_staged_offline(
+                verified,
+                stage::ready_marker(&folder).exists(),
+                vigil_update::manifest::is_newer_than(&m, vigil_update::Version::running()),
+                resume,
+            ) {
+                staged_offline = Some((m.version.to_string(), m.critical));
+            }
         }
     }
 
@@ -267,7 +283,21 @@ fn check_cmd(args: &[String]) -> std::process::ExitCode {
     let (text, sigs) = match fetch_manifest(&resolver, dl) {
         Ok(v) => v,
         Err(why) => {
-            println!("{}", status_line("unreachable", &[("why", why)]));
+            // A ready folder outranks a dead endpoint: the bytes are here and installing them
+            // needs nothing from the network.
+            match &staged_offline {
+                Some((version, critical)) => println!(
+                    "{}",
+                    status_line(
+                        "staged",
+                        &[
+                            ("version", version),
+                            ("critical", if *critical { "1" } else { "0" }),
+                        ]
+                    )
+                ),
+                None => println!("{}", status_line("unreachable", &[("why", why)])),
+            }
             return std::process::ExitCode::SUCCESS;
         }
     };
@@ -307,6 +337,22 @@ fn check_cmd(args: &[String]) -> std::process::ExitCode {
         });
     }
     if !vigil_update::manifest::is_newer_than(&m, vigil_update::Version::running()) {
+        // Unless something newer is already staged and ready. An endpoint serving a superseded
+        // manifest would otherwise answer `current` over the top of a finished download and hide
+        // it just as completely as an unreachable one did.
+        if let Some((version, critical)) = &staged_offline {
+            println!(
+                "{}",
+                status_line(
+                    "staged",
+                    &[
+                        ("version", version),
+                        ("critical", if *critical { "1" } else { "0" }),
+                    ]
+                )
+            );
+            return std::process::ExitCode::SUCCESS;
+        }
         println!("{}", status_line("current", &[]));
         return std::process::ExitCode::SUCCESS;
     }
@@ -626,6 +672,18 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
             if let Some(b) = out.stopped_at {
                 println!("stopped deliberately at {b:?}");
                 return std::process::ExitCode::from(9);
+            }
+            // Optional files that were never staged, named. `plan()` reports them in its return
+            // value exactly as its doc says, and this — the binary — dropped them on the floor, so
+            // `folder matches the manifest: false` was printed with nothing to explain it. That
+            // line is the one this accounts for, which is why it sits beside it.
+            //
+            // `AlreadyCurrent` is deliberately not printed: on a resumed apply that is every
+            // finished file, and it would bury the line that matters.
+            for skipped in &p.skipped {
+                if let plan::Skipped::OptionalAndMissing(name) = skipped {
+                    println!("  not staged, optional: {name}");
+                }
             }
             println!(
                 "done. folder matches the manifest: {}",

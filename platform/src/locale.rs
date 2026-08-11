@@ -26,12 +26,6 @@ pub fn ui_langid() -> Option<u16> {
     imp::ui_langid()
 }
 
-/// Where the chosen language is remembered, beside the strategy cache and the settings
-/// snapshots. One file, one line, `tr` or `en`.
-pub fn lang_file() -> Option<std::path::PathBuf> {
-    crate::paths::state_dir().map(|d| d.join("lang.txt"))
-}
-
 /// The language the user picked from the menu, if they ever picked one.
 ///
 /// Persisted on purpose, and worth saying why given that the *mode* deliberately is not: a mode

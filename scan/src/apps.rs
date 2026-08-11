@@ -6,12 +6,12 @@
 //! - **Discord** is two network stacks in one application. Its Electron half honours the
 //!   registry proxy and emits ~1800 B ClientHellos that partly evade this DPI by accident; its
 //!   native updater emits 175 B, is blocked outright, and gates startup. That "partly evades"
-//!   is a Türk Telekom property and does not travel: on Superonline, measured 2026-08-07,
+//!   is a the home line property and does not travel: on SansürOn, measured 2026-08-07,
 //!   every ClientHello length from 250 B to 2200 B is 0/8, so there the Electron half has no
 //!   accident to be saved by and must come through the proxy or not run at all.
 //! - **Roblox** ignores the registry setting completely — measured 2026-08-05: five direct
 //!   sockets to port 443 and none to the proxy — and honours the curl environment variables
-//!   instead. Every hostname it needs is blocked on Türk Telekom and reachable through vigil.
+//!   instead. Every hostname it needs is blocked on the home line and reachable through vigil.
 //!
 //! A machine where those two behave differently from here is a machine worth hearing about,
 //! which is the whole point of handing this to somebody on another ISP.
@@ -68,10 +68,10 @@ pub const APPS: &[App] = &[
             "discordapp.net",
             "discord.gg",
         ],
-        // The last two are the package downloads, added 2026-08-08. The Superonline run showed
+        // The last two are the package downloads, added 2026-08-08. The SansürOn run showed
         // the *manifest* host reaching the proxy and the client still not opening, and the
         // obvious next question — is the thing it then tries to download blocked? — could not
-        // be answered because neither host had ever been measured on that line. On Türk Telekom
+        // be answered because neither host had ever been measured on that line. On the home line
         // `stable.dl2.discordapp.net` is 8/8, which is why it is a probe and not an assumption.
         probes: &[
             "discord.com",
@@ -85,7 +85,7 @@ pub const APPS: &[App] = &[
         protocol_key: None,
         // Two names, two different failures. `updates.discord.com` gates startup: blocked, the
         // application stalls at five processes. `discord.com` is what the Electron half must
-        // fetch before it can draw anything, and it was added after a Superonline run where it
+        // fetch before it can draw anything, and it was added after a SansürOn run where it
         // never arrived — only the updater did — and the report still said "opened, uses the
         // proxy" while Discord sat at the same five processes it reached with vigil switched
         // off. If Chromium is using the proxy this name always arrives; if it never does,
@@ -235,7 +235,7 @@ mod tests {
         }
     }
 
-    /// Added after the Superonline report of 2026-08-07 read as a success. Only the updater
+    /// Added after the SansürOn report of 2026-08-07 read as a success. Only the updater
     /// reached the proxy; the name the Electron half cannot draw a window without never did,
     /// and nothing in the report objected. The gateway stays out on purpose — it is reached
     /// only by a signed-in client, so requiring it would fail every logged-out machine.

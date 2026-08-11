@@ -47,6 +47,15 @@ struct Options {
     port: u16,
     /// Seconds to watch the whole machine with the proxy engaged, 0 to skip.
     observe: u64,
+    /// Whether `--observe` was given explicitly, which is what makes `--no-apps` inert again.
+    ///
+    /// The watch window's default went from 0 to 180 so that the measurement that decides whether
+    /// this project writes a driver would actually run — a default that needs an argument is a
+    /// default that never runs. But `--no-apps` is documented in four places as the half that
+    /// changes nothing, and observing engages the system proxy, so from that day `--no-apps` quietly
+    /// engaged for three minutes while the banner promised it did not. Both promises are kept by
+    /// distinguishing "the default happened to be 180" from "the operator asked for a window".
+    observe_was_asked_for: bool,
     /// Wait for Enter before exiting. On by default, because the person this tool is aimed at
     /// **double-clicks it from Explorer** — and a console that closes on exit takes the report's
     /// filename with it.
@@ -70,6 +79,7 @@ impl Default for Options {
             // volunteers who have the interesting networks do not use a terminal; they run the
             // `.exe`. A default that needs an argument to be useful is a default that never runs.
             observe: 180,
+            observe_was_asked_for: false,
             pause: true,
         }
     }
@@ -128,6 +138,92 @@ fn hold_window_on_panic() {
     }));
 }
 
+/// The value after a flag, or `None` without consuming anything.
+///
+/// `None` when the token is missing **or looks like another flag**. Without the second half,
+/// `vigil-scan --app-wait --no-apps` swallowed `--no-apps` as the value of `--app-wait`: the parse
+/// failed, the fallback kept the old value, and the run engaged the machine's proxy settings for a
+/// command whose whole promise is that it changes nothing. `--observe` is worse still, because its
+/// failed parse also sets `observe_was_asked_for`, which is exactly what disarms the guard below.
+fn value<'a>(args: &'a [String], i: &mut usize) -> Option<&'a str> {
+    match args.get(*i + 1) {
+        Some(v) if !v.starts_with("--") => {
+            *i += 1;
+            Some(v.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// A numeric flag value.
+///
+/// `Ok(None)` when the flag was given no value at all — the flag keeps its default and the next
+/// token stays available to be matched as the flag it is. `Err` when a value *was* given and is not
+/// a number: on a measurement tool a mistyped value must be refused, never quietly replaced by a
+/// fallback that then gets reported as though it had been asked for.
+fn num<T: std::str::FromStr>(args: &[String], i: &mut usize, flag: &str) -> Result<Option<T>, u8> {
+    match value(args, i) {
+        None => {
+            eprintln!("{flag} bir değer istiyor; yok sayıldı");
+            Ok(None)
+        }
+        Some(v) => v.parse().map(Some).map_err(|_| {
+            eprintln!("{flag}: '{v}' bir sayı değil");
+            2
+        }),
+    }
+}
+
+/// Turn a command line into [`Options`].
+///
+/// Split out of `main` so the one rule this binary promises in four places — that `--no-apps`
+/// changes nothing — is a testable function rather than three lines inside a match arm. Deleting
+/// those three lines left all 836 tests green while `--no-apps` went back to engaging Windows'
+/// system proxy and `HTTPS_PROXY`/`ALL_PROXY` for 180 seconds under a banner reading
+/// "(uygulama testi kapalı)".
+fn options_from(args: &[String]) -> Result<Options, u8> {
+    let mut o = Options::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-apps" => o.apps = false,
+            "--app-wait" => {
+                if let Some(n) = num(args, &mut i, "--app-wait")? {
+                    o.app_wait = n;
+                }
+            }
+            "--port" => {
+                if let Some(n) = num(args, &mut i, "--port")? {
+                    o.port = n;
+                }
+            }
+            "--observe" => {
+                // **Both fields together, or neither.** `observe_was_asked_for` used to be set
+                // unconditionally, so `--observe` with no value — or followed by another flag —
+                // disarmed the `--no-apps` guard below while the value fell back to 120. The flag
+                // that means "change nothing" then engaged the system proxy for two minutes.
+                if let Some(n) = num(args, &mut i, "--observe")? {
+                    o.observe = n;
+                    o.observe_was_asked_for = true;
+                }
+            }
+            "--no-pause" => o.pause = false,
+            other => {
+                eprintln!("bilinmeyen seçenek: {other}");
+                return Err(2);
+            }
+        }
+        i += 1;
+    }
+    // `--no-apps` means "change nothing", in the banner, the usage line, `Cargo.toml` and
+    // `CLAUDE.md`. The watch window engages the system proxy, so it cannot be left on by
+    // default here — but an operator who asks for one by name still gets it.
+    if !o.apps && !o.observe_was_asked_for {
+        o.observe = 0;
+    }
+    Ok(o)
+}
+
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -141,37 +237,10 @@ fn main() -> std::process::ExitCode {
             hold_window_on_panic();
             run(Options::default())
         }
-        Some(a) if a.starts_with("--") => {
-            let mut o = Options::default();
-            let mut i = 0usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--no-apps" => o.apps = false,
-                    "--app-wait" => {
-                        i += 1;
-                        o.app_wait = args
-                            .get(i)
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(o.app_wait);
-                    }
-                    "--port" => {
-                        i += 1;
-                        o.port = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(o.port);
-                    }
-                    "--observe" => {
-                        i += 1;
-                        o.observe = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(120);
-                    }
-                    "--no-pause" => o.pause = false,
-                    other => {
-                        eprintln!("bilinmeyen seçenek: {other}");
-                        return std::process::ExitCode::from(2);
-                    }
-                }
-                i += 1;
-            }
-            run(o)
-        }
+        Some(a) if a.starts_with("--") => match options_from(&args) {
+            Ok(o) => run(o),
+            Err(code) => std::process::ExitCode::from(code),
+        },
         _ => {
             eprintln!("usage: vigil-scan                 # tam tarama / full scan");
             eprintln!(
@@ -375,16 +444,27 @@ fn now_secs() -> u64 {
 
 /// Which ISP this is, and nothing else.
 ///
-/// Deliberately over plain HTTP and deliberately without the `query` field, so the answer we
-/// record is the network's identity and never the address it was learned from. Failure is not
-/// an error: the scan is still worth running, the report just says "unknown".
-/// Which ISP this is, and nothing more.
+/// A **label** for the line this ran on, carrying no name and no number.
 ///
-/// **Not the city, and not the district.** It asked for `city` until 2026-08-08 and put the
-/// answer in the report header, so a volunteer's report read `Kadıköy / SUPERONLINE / AS34984`
-/// — a district, an ISP and a timestamp, in a file whose own header promises "no personal
-/// data", written to be forwarded to somebody else. The ASN and the ISP name are what every
-/// measurement in this project actually uses; the city was never read by anything.
+/// Over plain HTTP and deliberately without the `query` field, so nothing here can record the
+/// address it was learned from. Failure is not an error: the scan is still worth running and the
+/// report just says "unknown".
+///
+/// Two things it used to do and no longer does:
+///
+/// - **The city.** It asked for `city` until 2026-08-08 and put the answer in the header, so a
+///   volunteer's report read `Kadıköy / <provider> / AS…` — a district, a company and a
+///   timestamp, in a file whose own header promises "no personal data" and which was written to be
+///   forwarded to somebody else.
+/// - **The company's name, and its AS number.** Removed 2026-08-10, by decision: no report and no
+///   document in this project names an internet provider. What every measurement here actually needs
+///   is only the ability to tell one line from another and to line up two runs on the same one, and
+///   a stable label does that.
+///
+/// The label is derived from the AS field, so the same line always produces the same one. **It is a
+/// pseudonym and not secrecy** — anyone determined can enumerate the few thousand plausible inputs.
+/// It exists so that a name is never written down, not so that a line cannot be identified by
+/// somebody who sets out to.
 fn network_identity() -> String {
     let Ok(addrs) = resolve("ip-api.com", 80) else {
         return "unknown".into();
@@ -398,7 +478,7 @@ fn network_identity() -> String {
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     use std::io::{Read, Write};
     if s.write_all(
-        b"GET /line/?fields=as,isp HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n",
+        b"GET /line/?fields=as HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n",
     )
     .is_err()
     {
@@ -415,14 +495,34 @@ fn network_identity() -> String {
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .collect();
-            if parts.is_empty() {
-                "unknown".into()
-            } else {
-                parts.join(" / ")
-            }
+            label_for(&parts.join(" "))
         }
         None => "unknown".into(),
     }
+}
+
+/// Turn whatever the lookup said into a stable label that names nobody. Pure.
+///
+/// FNV-1a folded to sixteen bits: short enough to read out over a message, stable across runs, and
+/// carrying nothing but "this is the same line as last time" or "this is a different one".
+fn label_for(raw: &str) -> String {
+    let raw = raw.trim();
+    // **Only hash something that looks like an answer.** Anything at all on port 80 was laundered
+    // into a confident `hat 3f21` — a captive portal, an error page, a proxy's own banner. The worse
+    // case is not a wrong label but a *false equality*: the same portal page on two different lines
+    // hashes the same, so two volunteers' reports would positively assert "same line".
+    let looks_like_an_answer = raw
+        .strip_prefix("AS")
+        .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_digit()));
+    if !looks_like_an_answer {
+        return "unknown".into();
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in raw.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("hat {:04x}", (h ^ (h >> 32)) as u16)
 }
 
 /// The address to measure against, preferring one a resolver other than the ISP's gave us.
@@ -526,12 +626,14 @@ fn execute(
             "  [{pct:>3}%] {:<14} {:<28} {:<18} {}/{}  {}",
             c.phase.label(),
             c.host,
-            if c.ttl.is_some() {
-                format!("ttl:{}", c.ttl.unwrap_or(0))
-            } else if c.client_hello_len.is_some() {
-                format!("{} B", c.client_hello_len.unwrap_or(0))
-            } else {
-                c.strategy.clone()
+            // The strategy *and* the length, not one or the other: a transform cell that fixes a
+            // browser-sized hello printed only "1800 B" and looked like a size cell, so two
+            // different measurements scrolled past under the same label.
+            match (c.ttl, c.client_hello_len) {
+                (Some(t), _) => format!("ttl:{t}"),
+                (None, Some(n)) if c.strategy == "none" => format!("{n} B"),
+                (None, Some(n)) => format!("{} @{n}B", c.strategy),
+                (None, None) => c.strategy.clone(),
             },
             r.tally.successes(),
             r.tally.trials(),
@@ -633,7 +735,10 @@ fn run(opts: Options) -> std::process::ExitCode {
     }
     eprintln!();
     eprintln!("  * Yönetici yetkisi istemez, hiçbir şey kurmaz.");
-    if opts.apps {
+    // On `opts.apps || opts.observe > 0`, not on `opts.apps` — because that is the condition the
+    // *engaging* is on, and a banner that promises less than the program does is the only kind of
+    // banner that matters.
+    if opts.apps || opts.observe > 0 {
         eprintln!("  * BİRİNCİ bölüm hiçbir ayara dokunmaz.");
         eprintln!("  * İKİNCİ bölüm, sadece kendi süresince, Windows'un proxy ayarını ve");
         eprintln!("    HTTP_PROXY değişkenlerini kendine yönlendirir ve Discord/Roblox'u");
@@ -648,7 +753,7 @@ fn run(opts: Options) -> std::process::ExitCode {
     eprintln!();
     // An honest range, not an average. A trial that gets an answer or a reset costs about a
     // fifth of a second; a trial that gets nothing costs the full read timeout, and on a
-    // network that drops silently — Superonline does — that is most of them. The old estimate
+    // network that drops silently — SansürOn does — that is most of them. The old estimate
     // assumed the fast case and told people "3-4 dakika" for a run that took half an hour.
     let app_probes = if opts.apps {
         (apps::APPS.iter().map(|a| a.probes.len()).sum::<usize>() + apps::CONTROLS.len()) * 2 * 6
@@ -748,7 +853,7 @@ fn run(opts: Options) -> std::process::ExitCode {
         eprintln!("Hiçbir aday site engelli çıkmadı. Bu hatta filtre yok gibi görünüyor.");
     } else {
         eprintln!("2/2  Engelli çıkanlar inceleniyor: {}", blocked.join(", "));
-        // A TTL sweep only means something against an injector. Superonline drops silently,
+        // A TTL sweep only means something against an injector. SansürOn drops silently,
         // and asking it twelve times would return "inconclusive" after two minutes.
         let resets = results.iter().any(|r| {
             r.cell.phase == plan::Phase::Baseline
@@ -839,4 +944,146 @@ fn run(opts: Options) -> std::process::ExitCode {
         wait_for_enter();
     }
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **No report names an internet provider.** The label has to be stable — two runs on the same
+    /// line must line up column by column, which is the whole reason the header carries anything at
+    /// all — and it must not be the name.
+    #[test]
+    fn the_line_label_is_stable_and_names_nobody() {
+        let a = label_for("AS1111 One Provider Inc.");
+        let b = label_for("AS2222 Another Provider");
+        assert_eq!(a, label_for("AS1111 One Provider Inc."), "must be stable");
+        assert_ne!(a, b, "two lines must be distinguishable");
+        for l in [&a, &b] {
+            assert!(l.starts_with("hat "), "{l}");
+            assert_eq!(l.len(), 8, "{l}");
+            let lower = l.to_ascii_lowercase();
+            for name in ["provider", "inc", "as1111", "as2222", "1111", "2222"] {
+                assert!(!lower.contains(name), "{name} survived into {l}");
+            }
+        }
+        assert_eq!(label_for("   "), "unknown");
+        assert_eq!(label_for(""), "unknown");
+        // And anything that is not an AS answer — a captive portal, an error page — is `unknown`
+        // rather than a confident label. Two lines behind the same portal must not read as one.
+        for junk in [
+            "<html><title>Hotspot</title>",
+            "error",
+            "ASsomething",
+            "{\"status\":\"fail\"}",
+        ] {
+            assert_eq!(label_for(junk), "unknown", "{junk}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    fn parse(a: &[&str]) -> Options {
+        options_from(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()).expect("parses")
+    }
+
+    /// **`--no-apps` must change nothing on the machine.**
+    ///
+    /// It is promised in the banner, the usage line, `Cargo.toml` and `CLAUDE.md`, and the whole
+    /// rule was three untested lines inside a `match` arm: deleting them left all 836 tests green
+    /// while the run engaged Windows' system proxy and `HTTPS_PROXY`/`ALL_PROXY` for 180 seconds.
+    /// It is a regression that has already happened once, from the commit that changed `observe`'s
+    /// default from 0 to 180.
+    #[test]
+    fn no_apps_touches_nothing() {
+        let o = parse(&["--no-apps"]);
+        assert!(!o.apps, "the application phase must be off");
+        assert_eq!(
+            o.observe, 0,
+            "the watch window engages the system proxy, so it must be off too"
+        );
+    }
+
+    /// But an operator who asks for a window by name still gets one.
+    #[test]
+    fn an_explicit_observe_survives_no_apps() {
+        let o = parse(&["--no-apps", "--observe", "300"]);
+        assert!(!o.apps);
+        assert_eq!(o.observe, 300);
+        assert!(o.observe_was_asked_for);
+    }
+
+    /// The defaults, pinned with literals rather than computed from the constants they are — the
+    /// documented failure mode of this repository is a test that asserts the code's current text.
+    #[test]
+    fn the_double_click_defaults_are_the_documented_ones() {
+        let d = Options::default();
+        assert!(d.apps, "a plain double-click runs the application phase");
+        assert_eq!(d.observe, 180, "and the 180-second watch window");
+        assert!(!d.observe_was_asked_for);
+    }
+
+    /// `--observe 0` asks for no window and is not `--no-apps`.
+    #[test]
+    fn observe_zero_is_asked_for_and_leaves_the_app_phase_alone() {
+        let o = parse(&["--observe", "0"]);
+        assert_eq!(o.observe, 0);
+        assert!(o.observe_was_asked_for);
+        assert!(o.apps);
+    }
+
+    /// **A flag must not be eaten as another flag's value.**
+    ///
+    /// `--app-wait --no-apps` used to consume `--no-apps` as the value, so the parse failed, the
+    /// fallback kept the default, and `--no-apps` never happened at all — on the one command whose
+    /// entire promise is that it changes nothing. `--observe` is the worse of the two: its failed
+    /// parse also set `observe_was_asked_for`, which is precisely what disarms the guard.
+    #[test]
+    fn a_missing_value_does_not_swallow_the_next_flag() {
+        let o = parse(&["--app-wait", "--no-apps"]);
+        assert!(!o.apps, "--no-apps was eaten as the value of --app-wait");
+        assert_eq!(o.observe, 0);
+        assert_eq!(o.app_wait, Options::default().app_wait);
+
+        let o = parse(&["--observe", "--no-apps"]);
+        assert!(!o.apps, "--no-apps was eaten as the value of --observe");
+        assert!(
+            !o.observe_was_asked_for,
+            "a flag that ate the next flag must not count as having been given a value"
+        );
+        assert_eq!(o.observe, 0, "and the --no-apps guard must still fire");
+
+        // A trailing flag with no value at all is the same case.
+        let o = parse(&["--no-apps", "--observe"]);
+        assert!(!o.apps);
+        assert!(!o.observe_was_asked_for);
+        assert_eq!(o.observe, 0);
+    }
+
+    #[test]
+    fn an_unknown_option_is_refused_rather_than_ignored() {
+        let args = ["--nope".to_string()];
+        assert!(matches!(options_from(&args), Err(2)));
+    }
+
+    /// A mistyped value is refused, not replaced by a fallback. This used to make `--observe abc`
+    /// silently run a 120-second window — a number nobody asked for, in the section the driver
+    /// question is read from.
+    #[test]
+    fn a_value_that_is_not_a_number_is_refused() {
+        for a in [
+            vec!["--observe", "abc"],
+            vec!["--app-wait", "9x"],
+            vec!["--port", "108o"],
+        ] {
+            let args: Vec<String> = a.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                matches!(options_from(&args), Err(2)),
+                "{a:?} should have been refused"
+            );
+        }
+    }
 }

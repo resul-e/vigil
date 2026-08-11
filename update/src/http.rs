@@ -15,7 +15,7 @@
 //!
 //! ## Why the transform
 //!
-//! GitHub is not blocked on Türk Telekom — measured 2026-08-08, five hostnames, 6/6 with no
+//! GitHub is not blocked on the home line — measured 2026-08-08, five hostnames, 6/6 with no
 //! strategy at all. That is today, on one ISP. The whole premise of this project is that the line
 //! decides, and the line changes: the same development line began poisoning DNS for five hostnames
 //! overnight with no warning. So the download goes through the same resolver and the same transform
@@ -309,7 +309,7 @@ pub fn request_for(url: &Url) -> String {
 
 /// The strategies a fetch tries, in order: the measured default first, then no transform at all.
 ///
-/// Both, and in this order, because either can be the one that works. On Superonline every
+/// Both, and in this order, because either can be the one that works. On SansürOn every
 /// `split:*` is 0/10 and `tlsrec` is what gets through; on a line where nothing is blocked the
 /// transform is harmless but pointless, and if a future middlebox objects to *being* transformed
 /// the plain attempt is the one that succeeds.

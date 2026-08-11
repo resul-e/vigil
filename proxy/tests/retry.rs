@@ -1,6 +1,6 @@
 //! Re-sending a first flight that was reset.
 //!
-//! Measured on Türk Telekom 2026-08-05: the Discord updater's real 175 B ClientHello, split at
+//! Measured on the home line 2026-08-05: the Discord updater's real 175 B ClientHello, split at
 //! byte 1, is answered 9/20 and reset 11/20 — from the far side, three hops past the local
 //! injector, which a TTL sweep showed never fires on a split flight. The application's own
 //! answer is to reconnect 2.3 seconds later; the proxy's is to reconnect immediately.
@@ -162,20 +162,81 @@ fn one_attempt_disables_retrying() {
     assert_eq!(seen.load(Ordering::Relaxed), 1);
 }
 
+/// Upstream that resets **every other** connection, starting with the first.
+///
+/// This is the shape the laundering test needs and `resetting_upstream(1)` cannot give it: there,
+/// connections 2..n are served on their *first* attempt, so the calibrator settles legitimately
+/// and the test would fail against correct code. Here every client attempt succeeds and every one
+/// of them costs a retry, so nothing may ever settle.
+fn alternating_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut s) = c else { continue };
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(800)));
+                if seen.fetch_add(1, Ordering::Relaxed).is_multiple_of(2) {
+                    std::thread::sleep(Duration::from_millis(30));
+                    return; // reset, unread — see `resetting_upstream`
+                }
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"\x16\x03\x03\x00\x02\x02\x00");
+                let mut sink = [0u8; 4096];
+                while let Ok(k) = s.read(&mut sink) {
+                    if k == 0 || s.write_all(&sink[..k]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (addr, counter)
+}
+
 /// The retry must not launder a strategy into the cache. A candidate that only worked on the
 /// second go is a candidate that failed, and the calibrator has to be told the failure — or
 /// it settles on something that needs a retry every single time.
+///
+/// **This test could not fail until 2026-08-11.** It drove one client connection, and one trial
+/// can never settle a calibrator that wants `CONFIRM` consecutive successes, so the assertion held
+/// whichever attempt the calibrator was told about. Moving `record_outcome` out of the attempt loop
+/// — the exact production mutation it exists to catch — left the whole workspace green.
+///
+/// So: `CONFIRM + 1` connections against an upstream that resets every other one. Every client
+/// attempt succeeds, every one of them needs a retry, and the retry count proves it — without that
+/// assertion the test would also pass if the flights had simply got through.
 #[test]
 fn the_calibrator_is_told_about_the_first_attempt_only() {
-    // Every odd connection is served, so each client attempt succeeds — but only ever on a
-    // retry. Nothing may settle.
-    let (up, _) = resetting_upstream(1);
+    use vigil_core::calibrate::CONFIRM;
+
+    let (up, _) = alternating_upstream();
     let (proxy, server) = start(Mode::Auto, 3);
 
-    assert!(attempt(proxy, up.port()));
+    let rounds = CONFIRM + 1;
+    for i in 0..rounds {
+        assert!(
+            attempt(proxy, up.port()),
+            "connection {i} should have been answered on its retry"
+        );
+    }
+
+    assert_eq!(
+        server.stats.first_flight_retries.load(Ordering::Relaxed),
+        rounds,
+        "every connection was supposed to need exactly one retry; without that this test would \
+         pass on flights that simply got through"
+    );
     let cache = server.cache.lock().expect("cache");
     assert!(
         cache.get("127.0.0.1").is_none(),
-        "a strategy that only worked on the second attempt was recorded as working"
+        "{rounds} connections that each needed a retry settled a strategy anyway — the calibrator \
+         was told about the successful attempt instead of the first one, and the cache now holds a \
+         strategy that pays a reset and a reconnect on every future connection"
     );
 }

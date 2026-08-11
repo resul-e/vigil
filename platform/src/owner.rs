@@ -1,7 +1,7 @@
 //! Which program opened this connection?
 //!
 //! The proxy has always been able to say *what* was asked for and never *who* asked. On
-//! 2026-08-07 that was the difference between two explanations of the same Superonline report:
+//! 2026-08-07 that was the difference between two explanations of the same SansürOn report:
 //! forty-seven connections arrived from "other programs" while Discord's Chromium half sent us
 //! nothing, and whether any of those forty-seven came from a browser decides whether the
 //! Windows proxy setting was in force at all. The report could not say, so the run could not

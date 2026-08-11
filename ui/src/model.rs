@@ -217,6 +217,27 @@ impl UpdateState {
         }
     }
 
+    /// The answer to a check the **user asked for**, or `None` if there is nothing to answer yet.
+    ///
+    /// A check that happens by itself is deliberately silent — a program that interrupts you to say
+    /// nothing has changed is a program people switch off. A check the user *clicked* is the
+    /// opposite: they asked a question and are standing there waiting for it.
+    ///
+    /// It was silent in both cases. The menu closed on the click, the state moved somewhere only the
+    /// details window shows, and from the user's seat nothing happened at all — reported on
+    /// 2026-08-09 by a volunteer on v0.7.1 who pressed it and could not tell whether it had worked.
+    /// The worst reading is the plausible one: he would have concluded the same thing on the release
+    /// that *did* have an update waiting for him.
+    ///
+    /// `Checking` is not a result, so it gets no box; every other state already has a sentence
+    /// written for it in [`UpdateState::line`], and that sentence is the answer.
+    pub fn answer_for_a_check_the_user_asked_for(&self, lang: Lang) -> Option<String> {
+        match self {
+            UpdateState::Checking => None,
+            other => Some(other.line(lang)),
+        }
+    }
+
     /// Read the one line `vigil-update.exe --check` prints.
     ///
     /// The two programs are deliberately separate — linking the updater into the tray application
@@ -319,7 +340,7 @@ pub enum Command {
 ///
 /// Every entry is a measured position rather than a knob for its own sake. `tlsrec:64+split:1`
 /// is 10/10 on both networks measured so far and is the shipped default; `split:1` is 20/20 on
-/// Türk Telekom and **0/10** on Superonline; `tlsrec:64` is the one Superonline yields to. The
+/// the home line and **0/10** on SansürOn; `tlsrec:64` is the one SansürOn yields to. The
 /// last entry turns the transform off without stopping the proxy, which is what tells a user
 /// whether vigil is the thing breaking a site.
 pub const MODES: &[(&str, Option<&str>)] = &[
@@ -365,14 +386,21 @@ pub mod id {
     pub const CHECK_UPDATE: u16 = 0x108;
     pub const INSTALL_UPDATE: u16 = 0x109;
     pub const AUTO_UPDATE: u16 = 0x10A;
-    /// The language entries, in [`super::LANGS`] order. Between the modes and the learned
-    /// hosts, and like the modes it must stay below `FORGET_BASE`.
+    /// The language entries, in [`super::LANGS`] order. Kept below `FORGET_BASE` so the block
+    /// above stays free for the whole open-ended range.
     pub const LANG_BASE: u16 = 0x120;
-    /// The mode entries take ids from here upward, in `MODES` order. Deliberately **below**
-    /// `FORGET_BASE`: the forget ids are unbounded (one per learned host), so anything placed
-    /// above them could collide once enough hosts are learned.
+    /// The mode entries take ids from here upward, in `MODES` order. Kept **below**
+    /// `FORGET_BASE` for the same reason: that range is unbounded by design, so anything placed
+    /// above it could collide once enough hosts are learned.
     pub const MODE_BASE: u16 = 0x110;
-    /// Learned hosts get ids from here upward, in the order they appear.
+    /// One id per learned host, from here upward — **reserved, and currently unallocated.**
+    ///
+    /// `command_for` decodes this range and `Command::Forget` is live, but no menu has ever
+    /// *emitted* an id from it, in any commit: forgetting is reached from the details window,
+    /// whose rows carry a `Command` directly (`full_view` row action → `hit_test` → `apply`) and
+    /// never a menu id. The same is true of `FORGET_ALL`. The range stays reserved because the
+    /// decode path and its tests are real and the layout constraints above depend on it; the
+    /// comments used to imply a menu that does not exist.
     pub const FORGET_BASE: u16 = 0x200;
 }
 
@@ -1930,6 +1958,43 @@ mod tests {
         }
     }
 
+    /// **The exclude list is the one thing on this screen a user has to be able to trust.**
+    ///
+    /// `*.gov.tr`, `*.com.tr` and the rest are what keep banking and e-Devlet away from a desync,
+    /// and this section is where somebody checks that. The non-empty arm was never rendered by any
+    /// test — every snapshot in the suite left the list empty — and the Win32 shell was
+    /// hard-coding `exclude_patterns: Vec::new()`, so the section read "(liste boş)" on a running
+    /// vigil with six patterns in force. Replacing the arm with `Vec::new()` left the whole
+    /// workspace green, which is why the shell's stub survived.
+    #[test]
+    fn the_exclude_section_lists_the_patterns_it_is_given() {
+        for lang in [Lang::Turkish, Lang::English] {
+            let v = full_view(&Snapshot {
+                lang,
+                exclude_patterns: vec![
+                    "*.gov.tr".to_string(),
+                    "*.com.tr".to_string(),
+                    "localhost".to_string(),
+                ],
+                ..Default::default()
+            });
+            let rows = &v[3].rows;
+            assert_eq!(
+                rows.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                vec!["*.gov.tr", "*.com.tr", "localhost"],
+                "{lang:?}: the patterns actually in force must be the ones shown"
+            );
+            assert_ne!(
+                rows[0].text,
+                t(lang, "placeholder.list_empty"),
+                "{lang:?}: a non-empty list must not render as empty"
+            );
+            for r in rows {
+                assert_eq!(r.action, None, "{lang:?}: an exclusion is not clickable");
+            }
+        }
+    }
+
     /// With nothing learned there is nothing to forget, so the button must not be offered.
     #[test]
     fn forget_all_is_absent_when_nothing_is_learned() {
@@ -2186,6 +2251,41 @@ mod update_tests {
             UpdateState::NoKeys,
             UpdateState::Interrupted,
         ]
+    }
+
+    /// **A check the user pressed must answer.** Reported live on 2026-08-09: a volunteer on v0.7.1
+    /// pressed "Güncellemeleri denetle" and nothing at all happened, because the result only ever
+    /// reached the details window and the menu had already closed. Silence is right for the check
+    /// that runs by itself and wrong for the one somebody asked for — and on the next release, the
+    /// same silence would have hidden an update that *was* waiting for him.
+    #[test]
+    fn a_check_the_user_pressed_answers_in_every_state_but_one() {
+        for lang in [Lang::Turkish, Lang::English] {
+            for st in all_states() {
+                match st {
+                    // Not a result. The click has been taken, the work is running, and a box
+                    // saying "checking…" is a box in the way.
+                    UpdateState::Checking => assert_eq!(
+                        st.answer_for_a_check_the_user_asked_for(lang),
+                        None,
+                        "an in-flight check is not an answer"
+                    ),
+                    ref other => {
+                        let answer = other
+                            .answer_for_a_check_the_user_asked_for(lang)
+                            .unwrap_or_else(|| panic!("{other:?} in {lang:?} answered nothing"));
+                        assert!(!answer.trim().is_empty(), "{other:?} said nothing");
+                        assert!(
+                            !answer.contains("{{"),
+                            "{other:?} left a placeholder showing: {answer}"
+                        );
+                        // The answer is the sentence the details window already shows, so the two
+                        // can never drift into telling the user different things.
+                        assert_eq!(answer, other.line(lang));
+                    }
+                }
+            }
+        }
     }
 
     /// Every state says something, in both languages, and no two of them say the same thing.

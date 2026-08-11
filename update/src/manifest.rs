@@ -208,10 +208,18 @@ impl core::fmt::Display for Reject {
 pub struct Trust {
     /// Seconds since the Unix epoch. A parameter, never read from the clock in here.
     pub now: u64,
-    /// `max(compiled-in serial, last serial we accepted)`. The compiled-in half is load-bearing:
-    /// vigil is portable and "delete the folder and it is gone", so the remembered half may be
-    /// missing on any run, and the constant is the one thing an attacker cannot reset without
-    /// replacing the binary he is trying to replace.
+    /// One below the highest manifest serial this machine has ever accepted — that is,
+    /// `platform::prefs::serial_floor` from `prefs.last_serial`, and zero when it has accepted
+    /// none.
+    ///
+    /// **Per machine, not compiled in.** The comment here used to describe a
+    /// `max(compiled-in serial, last accepted)` floor and call the compiled-in half load-bearing;
+    /// there is no compiled-in serial, the only production caller passes the remembered value
+    /// alone, and every test passes a literal. The consequence is worth stating plainly rather
+    /// than leaving to a reader of the old comment: a fresh install, or one whose state folder was
+    /// deleted, has a floor of zero and will accept any genuinely signed manifest, including a
+    /// superseded one. Replay protection here is a ratchet a machine builds for itself, not a
+    /// property of the binary.
     pub serial_floor: u64,
     pub running: Version,
 }
@@ -773,6 +781,11 @@ file=4 vigil-app.exe 730112 1 00e1f530d8e678d3625d7c4e954363ceae857951be9e92be32
             "https://github.com/x/#f",
             "https://user@github.com/x/",
             "https://github.com/../x/",
+            // The empty path segment. `https://host//a/` and `https://host/a/` are different URLs
+            // to a server and the same one to a careless reader — and this was the one clause of
+            // `check_base` with no test, so it could be deleted with the suite green.
+            "https://github.com//x/",
+            "https://github.com/x//",
         ] {
             assert!(
                 matches!(

@@ -5,6 +5,14 @@
 //! without a control in the same run.** A table where everything failed is indistinguishable
 //! from a broken rig unless something that must succeed did.
 
+/// A browser-sized ClientHello, for the size × strategy cross.
+///
+/// 1800 B because that is what this project has measured real Chromium sending (1721–2081 B), and
+/// because it is the length at which the home line's block becomes *unreliable* rather than absolute
+/// — so the same two cells read differently on the two networks, which is the point of measuring
+/// them on both.
+const LARGE_HELLO: usize = 1800;
+
 /// Hosts believed blocked on Turkish consumer lines. On an unknown ISP these are candidates,
 /// not assumptions — the report says what the data said, and a candidate that turns out to be
 /// reachable is a finding rather than an error.
@@ -24,7 +32,7 @@ pub const CONTROLS: &[&str] = &["example.com", "media.discordapp.net", "wikipedi
 /// Strategies to try against whatever turns out to be blocked. `none` is first so the table
 /// always carries its own baseline.
 /// `none` is first so the table always carries its own baseline. The `tlsrec` sizes are
-/// there because Superonline yielded to record fragmentation and to nothing else, so where
+/// there because SansürOn yielded to record fragmentation and to nothing else, so where
 /// its boundary lies is now a question worth an answer rather than a curiosity.
 pub const STRATEGIES: &[&str] = &[
     "none",
@@ -178,7 +186,7 @@ pub fn discovery(d: Depth) -> Vec<Cell> {
 /// Whether a TTL sweep can learn anything here.
 ///
 /// The sweep finds the smallest TTL at which an injected reset appears. A censor that
-/// silently drops — which is what Superonline does — produces a timeout at every TTL,
+/// silently drops — which is what SansürOn does — produces a timeout at every TTL,
 /// indistinguishable from the packet expiring on the way. Running it anyway costs the
 /// volunteer two minutes and returns "inconclusive", which is worse than not asking.
 pub fn ttl_sweep_can_work(baseline_resets: bool) -> bool {
@@ -249,6 +257,30 @@ pub fn investigation(blocked: &[String], ttl_useful: bool, d: Depth) -> Vec<Cell
         });
     }
 
+    // **The size × strategy cross, which was empty.** Every strategy cell above fixes the
+    // ClientHello at the synthetic minimum (~213 B) and every size cell above fixes the strategy at
+    // `none`, so nothing anywhere measured a *transform* against a *browser-sized* hello. On a line
+    // where no length evades the censor — 0/8 at every length from 250 B to 2200 B, twice — that is
+    // the case every browser and every Electron application actually presents, and the one the
+    // report was silent about.
+    //
+    // Two cells, not a sweep: `tlsrec:64` alone and the shipped default, at a Chrome-sized 1800 B.
+    // The control is already in the same run, because the `none @1800 B` size cell above is the same
+    // length with no transform. Cells rather than a flag, deliberately — the person who has to run
+    // this cannot type one.
+    for spec in ["tlsrec:64", "tlsrec:64+split:1"] {
+        cells.push(Cell {
+            phase: Phase::Strategy,
+            host: first.clone(),
+            via_host_addr: None,
+            strategy: spec.to_string(),
+            client_hello_len: Some(LARGE_HELLO),
+            ttl: None,
+            trials: d.strategy_trials,
+            round: 0,
+        });
+    }
+
     // How far away the injector is — but only where there is something to find.
     for t in (1..=MAX_TTL).filter(|_| ttl_useful) {
         cells.push(Cell {
@@ -286,6 +318,44 @@ pub fn connections(cells: &[Cell]) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The size × strategy cross must not be empty.** Every strategy cell fixes the hello at the
+    /// synthetic minimum and every size cell fixes the strategy at `none`, so for two networks and
+    /// three archived reports nothing ever measured a *transform* against a *browser-sized* hello —
+    /// which is the only case a browser or an Electron application ever presents. It matters most on
+    /// a line where no length evades the censor, because there the transform is the only thing
+    /// standing between the user and a dead connection.
+    #[test]
+    fn a_transform_is_measured_against_a_browser_sized_hello() {
+        let blocked = vec!["discord.com".to_string(), "roblox.com".to_string()];
+        let cells = investigation(&blocked, false, Depth::default());
+
+        let cross: Vec<&Cell> = cells
+            .iter()
+            .filter(|c| {
+                c.phase == Phase::Strategy
+                    && c.strategy.contains("tlsrec")
+                    && c.client_hello_len.is_some_and(|n| n >= 1400)
+            })
+            .collect();
+        assert!(
+            cross.len() >= 2,
+            "the size x strategy cross is empty again: {:?}",
+            cells
+                .iter()
+                .filter(|c| c.phase == Phase::Strategy)
+                .map(|c| (&c.strategy, c.client_hello_len))
+                .collect::<Vec<_>>()
+        );
+
+        // And its control is in the same run: the same length with no transform at all.
+        assert!(
+            cells.iter().any(|c| c.phase == Phase::Size
+                && c.strategy == "none"
+                && c.client_hello_len.is_some_and(|n| n >= 1400)),
+            "a large-hello transform cell without a large-hello control proves nothing"
+        );
+    }
     use super::*;
     use vigil_core::strategy::Strategy;
     use vigil_core::MIN_TRIALS;

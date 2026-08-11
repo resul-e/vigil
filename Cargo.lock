@@ -134,7 +134,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "probe"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "rustls",
  "rustls-pki-types",
@@ -254,11 +254,11 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "vigil-core"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "vigil-platform"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "windows",
  "winreg",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-proxy"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "vigil-core",
  "vigil-platform",
@@ -274,17 +274,18 @@ dependencies = [
 
 [[package]]
 name = "vigil-scan"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "vigil-core",
  "vigil-platform",
  "vigil-proxy",
+ "windows",
  "winreg",
 ]
 
 [[package]]
 name = "vigil-ui"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "vigil-core",
  "vigil-platform",
@@ -294,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-update"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "minisign-verify",
  "rustls",

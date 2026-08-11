@@ -359,15 +359,65 @@ mod tests {
         assert!(d.body >= Duration::from_secs(120), "a slow line needs room");
     }
 
-    /// A TLS config that resumes sessions would make the second fetch of a run a different
-    /// experiment from the first — a resumed handshake sends a different ClientHello.
+    /// Build the first flight offline — no network — and measure it. Same shape as
+    /// `probe/src/profile.rs`, deliberately: this is the same measurement, on the config the
+    /// updater actually uses.
+    fn flight_len(host: &str) -> usize {
+        let name =
+            ServerName::try_from(host.to_string()).expect("allowlisted host is a valid name");
+        let mut conn = ClientConnection::new(tls_config(), name).expect("client connection");
+        let mut buf = Vec::new();
+        while conn.wants_write() {
+            conn.write_tls(&mut buf)
+                .expect("write_tls into a Vec cannot fail");
+        }
+        buf.len()
+    }
+
+    /// Margin below the MSS the flight must clear. A ClientHello that merely *happens* to fit
+    /// today is not a guarantee — hostname length and extension changes move it by tens of bytes.
+    const SAFE_MARGIN: usize = 200;
+
+    /// **The single key-exchange group is the whole reason the updater's transform means
+    /// anything**, and nothing pinned it.
+    ///
+    /// With rustls' default provider the X25519MLKEM768 hybrid share pushes the ClientHello to
+    /// ~1730 B, past the MSS, and the kernel segments it before it reaches the wire — at which
+    /// point vigil is no longer the thing deciding where the flight is cut, and the updater is not
+    /// running the experiment that was measured. Deleting that one line left the whole suite green.
+    ///
+    /// Every allowlisted host, not just `github.com`: the binding case is the longest name,
+    /// `release-assets.githubusercontent.com`, and iterating means a host added to the allowlist
+    /// later is length-checked for free.
     #[test]
-    fn the_tls_config_builds_and_does_not_resume() {
-        let cfg = tls_config();
-        // Two configs must be independent; the assertion that matters is that this does not panic
-        // and that the roots are actually loaded.
-        assert!(!webpki_roots::TLS_SERVER_ROOTS.is_empty());
-        assert!(Arc::strong_count(&cfg) >= 1);
+    fn the_first_flight_fits_one_segment_for_every_allowed_host() {
+        for host in crate::manifest::ALLOWED_HOSTS {
+            let n = flight_len(host);
+            assert!(
+                n + SAFE_MARGIN <= vigil_core::TYPICAL_MSS,
+                "{host}: ClientHello is {n} B; needs <= {} B or the kernel splits it before we do",
+                vigil_core::TYPICAL_MSS - SAFE_MARGIN
+            );
+        }
+        assert!(
+            !webpki_roots::TLS_SERVER_ROOTS.is_empty(),
+            "no roots loaded"
+        );
+    }
+
+    /// A TLS config that resumes sessions would make the second fetch of a run a different
+    /// experiment from the first — a resumed handshake sends a different, shorter ClientHello.
+    ///
+    /// The test that used to carry this name asserted `Arc::strong_count(&cfg) >= 1`, which is
+    /// true of every `Arc` ever created, so the line it claimed to guard could be deleted freely.
+    #[test]
+    fn the_tls_config_does_not_resume() {
+        assert_eq!(
+            format!("{:?}", tls_config().resumption),
+            format!("{:?}", rustls::client::Resumption::disabled()),
+            "session resumption was re-enabled: the second fetch of a run would send a different \
+             ClientHello from the first"
+        );
     }
 
     #[test]

@@ -48,6 +48,10 @@ fn main() -> ExitCode {
     // Kept so the periodic status line can show the DNS half too; `None` when --dns was
     // never asked for, or the port was held.
     let mut dns_stats: Option<std::sync::Arc<vigil_proxy::dnsserver::DnsStats>> = None;
+    // Did the DNS server actually get its socket? Recorded rather than acted on, because pointing
+    // the machine at a resolver is the last thing this function does — see the engage far below,
+    // and the paragraph above it saying why it is not done where it is decided.
+    let mut dns_bound = false;
     while i < args.len() {
         let arg = args[i].clone();
         i += 1;
@@ -156,6 +160,16 @@ fn main() -> ExitCode {
             },
         }
     }
+    // `--set-dns` without `--dns` used to be accepted, parsed, and then do nothing at all — no
+    // engagement, no message, no non-zero exit. The *behaviour* was right (there is no resolver to
+    // point the machine at), but silence on the one flag that asks for administrator rights reads
+    // as "done" to whoever typed it, and they go away believing their DNS is protected.
+    if set_dns && dns_listen.is_none() {
+        eprintln!(
+            "--set-dns needs --dns: refusing to point the system at a resolver nobody serves"
+        );
+        return ExitCode::from(2);
+    }
     cfg.strategy = strategy.clone();
     cfg.mode = decide_mode(auto, chose_mode, &strategy);
     // The binary people reach for when they mean the tray application — measured by somebody
@@ -202,9 +216,8 @@ fn main() -> ExitCode {
                     }
                     dns_stats = Some(std::sync::Arc::clone(&dns.stats));
                     std::thread::spawn(move || dns.serve(sock));
-                    if set_dns {
-                        engage_system_dns(true);
-                    }
+                    // **Note that it bound; do not engage yet.** See the engage below.
+                    dns_bound = true;
                 }
                 Err(e) => eprintln!("  dns unavailable on {addr}: {e}"),
             },
@@ -295,10 +308,34 @@ fn main() -> ExitCode {
         let addr = actual.to_string();
         if engage_system_proxy(&addr) {
             let _ = ENGAGED_ON.set(addr);
-            if !shutdown::on_stop(disengage) {
-                eprintln!("  note: no console handler here — use vigil-repair if this is killed");
-            }
         }
+    }
+
+    // **Nothing above this line may `return`.** The system resolver is engaged here, and not up in
+    // the `--dns` bind arm where it used to be, because three fallible startup steps sat between
+    // the two — `server.bind()`, the non-loopback `--panel` check, and the instance-lock refusal —
+    // and every one of them `return`s out of `main` without disengaging anything. The shutdown
+    // handler that would have caught it is installed below, later still.
+    //
+    // So `vigil --dns --set-dns` on a machine where the proxy port was already taken raised the
+    // consent prompt, rewrote every interface to a static `127.0.0.1, 9.9.9.9`, and then exited
+    // with `bind: address in use` — leaving the machine pointed at a resolver that was no longer
+    // running. The fallback written after us means it still resolves, which is exactly why this was
+    // survivable rather than fatal, but the interface is off DHCP and internal names stay broken
+    // until `vigil-repair` runs. `engage_system_proxy` above was already ordered correctly; only
+    // the DNS half was not, and it is the half that CLAUDE.md calls the one action that can take
+    // all name resolution down.
+    if set_dns && dns_bound {
+        engage_system_dns(true);
+    }
+
+    // **The exit hook goes outside `if set_proxy`.** It was nested inside it, so `vigil --set-dns`
+    // on its own installed no handler at all — and `--set-dns` is the one change here that can take
+    // a machine's name resolution down. `disengage` reads what was actually engaged from
+    // `ENGAGED_ON` and `DNS_ENGAGED`, so it is correct to install it whenever either of them might
+    // be set, and harmless when neither is.
+    if (set_proxy || set_dns) && !shutdown::on_stop(disengage) {
+        eprintln!("  note: no console handler here — use vigil-repair if this is killed");
     }
 
     let stats = std::sync::Arc::clone(&server.stats);
@@ -365,22 +402,36 @@ fn read_snapshot() -> Option<sysproxy::ProxySettings> {
 }
 
 /// Put the system proxy back. Safe to call more than once.
+///
+/// **Order matters and this had it backwards**, the same way the tray application did until
+/// 2026-08-10. Two of the three operations here can take an unbounded amount of time — the DNS
+/// restore raises a consent dialog and waits for a human, and the environment restore ends in a
+/// `HWND_BROADCAST` whose timeout Windows applies *per window* — and this runs from a console handler
+/// that Windows gives a few seconds before killing the process. Killed part-way through, whatever had
+/// not run yet never runs, so the slow operations must not be in front of the one whose failure
+/// leaves the machine with no internet.
+///
+/// So: the registry first, unconditionally. The DNS half has `9.9.9.9` written after it precisely so
+/// that being interrupted costs a working resolver rather than a working machine, and the environment
+/// half has no fallback but also no way to make a machine unreachable — a stale `HTTPS_PROXY` breaks
+/// the curl family, and the registry value breaks everything.
 fn disengage() {
-    // The machine's resolver first: a machine that keeps asking a vigil which has already put
-    // the proxy back is one that cannot resolve anything at all.
+    if let Some(listen) = ENGAGED_ON.get() {
+        if let Ok(current) = registry::read_current() {
+            restore_registry_proxy(&current, listen);
+        }
+        // Second, because of the broadcast.
+        engage_env_proxy(false, listen);
+    }
+    // Last: it asks a human, and it is the one with a fallback already written after it.
     if DNS_ENGAGED.get().copied().unwrap_or(false) {
         engage_system_dns(false);
     }
-    let Some(listen) = ENGAGED_ON.get() else {
-        return;
-    };
-    // The environment variables come off first: a client that reads them must never be sent to
-    // a proxy after the registry has already stopped naming one.
-    engage_env_proxy(false, listen);
-    let Ok(current) = registry::read_current() else {
-        return;
-    };
-    match engage::stop(&current, read_snapshot().as_ref(), listen) {
+}
+
+/// The registry half of [`disengage`], split out so the ordering above is readable.
+fn restore_registry_proxy(current: &sysproxy::ProxySettings, listen: &str) {
+    match engage::stop(current, read_snapshot().as_ref(), listen) {
         engage::Stop::Restore(s) => {
             // The snapshot is deleted only after the restore actually succeeded. Deleting it
             // regardless would turn a half-finished shutdown — which is the likely kind, since
@@ -517,16 +568,19 @@ fn engage_system_dns(on: bool) {
             ),
         }
     } else {
-        let stranded = sysdns::stranded(&ifaces);
-        if stranded.is_empty() {
-            return;
-        }
         let snapshot: Vec<sysdns::Interface> = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|t| sysdns::parse(&t))
             .unwrap_or_default();
-        let changes: Vec<(u32, Option<Vec<String>>)> = stranded
+        // Only what we hold a snapshot for — see `sysdns::ours_to_restore`. `stranded` also matches
+        // a loopback resolver another program configured, and restoring one of those means handing
+        // an interface vigil never touched back to DHCP.
+        let mine = sysdns::ours_to_restore(&ifaces, &snapshot);
+        if mine.is_empty() {
+            return;
+        }
+        let changes: Vec<(u32, Option<Vec<String>>)> = mine
             .iter()
             .map(|i| {
                 let back = snapshot
@@ -539,10 +593,13 @@ fn engage_system_dns(on: bool) {
         match dnsclient::apply(&changes) {
             Ok(()) => {
                 eprintln!("system dns: restored");
-                // The snapshot is the only record of what was there, so it goes only when
-                // nothing is left pointing at us — checked, not assumed.
+                // The snapshot is the only record of what was there, so it goes only when nothing
+                // *of ours* is left pointing at us — checked, not assumed. Asked through
+                // `ours_to_restore` rather than `stranded` for the same reason as the change
+                // above: another program's loopback resolver would otherwise keep this at
+                // "not clean" forever and print a repair notice about an interface we never wrote.
                 let clean = dnsclient::read_interfaces()
-                    .map(|now| sysdns::stranded(&now).is_empty())
+                    .map(|now| sysdns::ours_to_restore(&now, &snapshot).is_empty())
                     .unwrap_or(true);
                 if clean {
                     if let Some(p) = &path {

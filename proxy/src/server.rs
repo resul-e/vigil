@@ -112,13 +112,38 @@ pub struct Stats {
     /// Worth its own number: it is the difference between "the strategy works" and "the
     /// strategy works often enough that retrying hides the rest".
     pub first_flight_retries: AtomicUsize,
+    /// Bytes relayed each way, and connections that got **nothing back**.
+    ///
+    /// Added 2026-08-10 because the counters could not tell a healthy run from a censored one.
+    /// `copy()` turns every error into `Ok(total)` — deliberately, since the read timeouts this
+    /// proxy sets would otherwise read as failures — and both call sites discarded even that. So a
+    /// censor that accepted every flight and then reset every connection mid-stream produced
+    /// `handshake errors 0`, `upstream errors 0`, and a report that looked perfect.
+    ///
+    /// `closed_empty` is the one that matters: a relayed connection over which the upstream never
+    /// sent a single byte. On a line whose mechanism is a silent drop that is what censorship looks
+    /// like from in here, and it was invisible.
+    pub bytes_to_upstream: AtomicUsize,
+    pub bytes_from_upstream: AtomicUsize,
+    pub closed_empty: AtomicUsize,
+    /// Hosts whose learned strategy was **thrown away** after `ABANDON` consecutive failures.
+    ///
+    /// The counter for the thing that already happened and no report could say. On the second
+    /// network, one run's counters read `calibrated 15` above a learned table with fourteen rows,
+    /// and working out which host was missing took a set difference and an argument.
+    ///
+    /// It is the project's only answer to "the censor changed" — and it is **blind to the shape of
+    /// censorship the second network actually uses.** `record_failure` is only reached when a trial
+    /// was scored as failed, and a read timeout is currently scored as *reached*, so on a line whose
+    /// mechanism is silence this counter stays at zero however completely the strategy has stopped
+    /// working. `cevapsiz kapanan` is the number to read there until the third trial state exists.
+    pub abandoned: AtomicUsize,
 }
 
 /// What the client asked for, however it asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// What to hand the connector, e.g. `discord.com:443` or `162.159.138.232:443`.
-    pub connect_to: String,
     /// The hostname the client named — `None` when it resolved DNS itself, which SOCKS4
     /// clients always do.
     pub domain: Option<String>,
@@ -161,7 +186,7 @@ pub fn plan_first_write(flight: &[u8], strategy: &Strategy) -> Plan {
 /// What was observed about one hostname during a measurement run.
 ///
 /// A set of names was all this recorded until 2026-08-08, and a set could not answer the
-/// question a Superonline report actually raised: forty-seven connections arrived from
+/// question a SansürOn report actually raised: forty-seven connections arrived from
 /// "other programs" while Discord's Chromium half sent nothing, and whether any of those came
 /// from a browser is what decides whether Windows' proxy setting was in force at all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -235,8 +260,6 @@ impl Server {
         self
     }
 
-    /// Persist the learned strategies. Best effort: a cache is a hint, and failing to write
-    /// it must never take the proxy down.
     /// Every hostname that arrived, sorted. Empty unless `Config::record_hosts` is on.
     pub fn seen_hosts(&self) -> Vec<String> {
         self.seen
@@ -274,6 +297,17 @@ impl Server {
             .unwrap_or_else(|_| self.cfg.mode.clone())
     }
 
+    /// The hosts this proxy leaves completely alone — the same `cfg.rules` the datapath enforces.
+    ///
+    /// An accessor rather than a constant, because the interface must report what this server was
+    /// actually configured with. Reading `DEFAULT_EXCLUDES` instead would agree today only by
+    /// coincidence and would lie in the dangerous direction — listing `*.com.tr` as excluded when a
+    /// custom rule set had replaced it — and it would lie invisibly, which is how the tray came to
+    /// show this list as empty in the first place.
+    pub fn excludes(&self) -> &[vigil_core::hostlist::Pattern] {
+        self.cfg.rules.excludes()
+    }
+
     /// Change it, for connections that start from here on.
     ///
     /// Connections already in flight keep the mode they started with — see `handle`. Leaving
@@ -283,20 +317,6 @@ impl Server {
         if let Ok(mut m) = self.mode.lock() {
             *m = mode;
         }
-    }
-
-    pub fn save_cache(&self) {
-        let Some(p) = &self.cfg.cache_path else {
-            return;
-        };
-        let text = match self.cache.lock() {
-            Ok(c) => c.to_text(),
-            Err(_) => return,
-        };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(p, text);
     }
 
     /// Bind and return the listener, so tests can ask for port 0 and learn the port.
@@ -453,7 +473,6 @@ fn negotiate(
                         _ => None,
                     };
                     Some(Target {
-                        connect_to: r.target(),
                         domain,
                         fallback_host: r.addr.to_string(),
                         port: r.port,
@@ -485,7 +504,6 @@ fn negotiate(
                         socks4::Addr::V4(_) => None,
                     };
                     Some(Target {
-                        connect_to: r.target(),
                         domain,
                         fallback_host: r.addr.to_string(),
                         port: r.port,
@@ -508,7 +526,6 @@ fn negotiate(
                 Ok((r, used)) => {
                     buf.drain(..used);
                     Some(Target {
-                        connect_to: r.target(),
                         domain: Some(r.host.clone()),
                         fallback_host: r.host,
                         port: r.port,
@@ -597,6 +614,7 @@ impl Shared {
                 if reached {
                     c.record_success(&key);
                 } else if c.record_failure(&key) {
+                    self.stats.abandoned.fetch_add(1, Ordering::Relaxed);
                     if let Ok(mut cals) = self.calibrators.lock() {
                         cals.remove(&key);
                     }
@@ -735,7 +753,25 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
             if s.len() < 4096 {
                 let e = s.entry(host_name.to_ascii_lowercase()).or_default();
                 e.connections += 1;
-                e.applied.insert(strategy.to_string());
+                // **The spec, plus a mark when it did not all run.** `applied` is documented as
+                // "the strategy specs actually applied" and recorded the requested spec, so a
+                // `tlsrec:64+split:1` that silently degraded into a bare `split:1` — because the
+                // record transform refuses a partial record and the composition swallows the error
+                // — was indistinguishable in every report from one that worked. On the second
+                // network that degradation is the difference between the only transform that works
+                // there and the one strategy that is 0/300 *and* converts a silent drop into an
+                // active reset.
+                //
+                // The spec string stays, because it is what carries the parameters a reader needs
+                // (`:64`, `@40`) and what every report is read with. What is added is the mark: the
+                // strategy asked for a record split and no record split ran.
+                let asked_tlsrec = strategy.tls_record.is_some();
+                let ran_tlsrec = plan.applied.contains(&"tlsrec");
+                if asked_tlsrec && !ran_tlsrec {
+                    e.applied.insert(format!("{strategy} (tlsrec UYGULANMADI)"));
+                } else {
+                    e.applied.insert(strategy.to_string());
+                }
                 if plan.did_nothing() {
                     e.untouched += 1;
                 }
@@ -753,7 +789,7 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
     // nothing is lost by looking.
     //
     // Looking also buys a second attempt, which is worth more than it sounds. Measured on
-    // Türk Telekom 2026-08-05: the Discord updater's real 175 B ClientHello, split at byte 1,
+    // the home line 2026-08-05: the Discord updater's real 175 B ClientHello, split at byte 1,
     // is answered about half the time and reset the rest — and the reset is **not** the local
     // injector. That one sits three hops away and never fires on a split flight; a TTL sweep
     // of the same flight produced no reset at all up to TTL 8 and only found one once the
@@ -791,6 +827,13 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
                 wrote = false;
                 break;
             }
+            // Counted here as well as in the relay, because the first flight is the *only* thing
+            // some connections ever send — a client that writes a ClientHello and waits produces
+            // zero relay bytes in that direction, and "bytes to upstream: 0" would then be a lie
+            // about a flight that went out.
+            stats
+                .bytes_to_upstream
+                .fetch_add(chunk.bytes.len(), Ordering::Relaxed);
         }
         if !watch {
             if !wrote {
@@ -837,11 +880,30 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
         (Ok(c), Ok(u)) => (c, u),
         _ => return,
     };
+    let to_up = Arc::clone(&shared.stats);
     let up = std::thread::spawn(move || {
-        let _ = copy(&mut c2, &mut u2);
+        let n = copy(&mut c2, &mut u2).unwrap_or(0);
+        to_up
+            .bytes_to_upstream
+            .fetch_add(n as usize, Ordering::Relaxed);
         let _ = u2.shutdown(Shutdown::Write);
     });
-    let _ = copy(&mut upstream, &mut client);
+    // `early` is the first thing the upstream said — read during the watch above, before the relay
+    // existed — so it belongs in this direction's total and in the decision below. Leaving it out
+    // made **every** probe-shaped connection look silent: the answer arrives in `early`, the client
+    // reads it and hangs up, the relay copies nothing, and the counter that exists to say "the
+    // upstream never answered" fired on a connection that was answered.
+    let back = early.len() as u64 + copy(&mut upstream, &mut client).unwrap_or(0);
+    shared
+        .stats
+        .bytes_from_upstream
+        .fetch_add(back as usize, Ordering::Relaxed);
+    // Nothing at all came back, in the relay *or* in the watch above. The flight was written, the
+    // upstream accepted the connection, and then it said nothing — which is exactly what a
+    // silent-drop censor looks like from in here.
+    if back == 0 {
+        shared.stats.closed_empty.fetch_add(1, Ordering::Relaxed);
+    }
     let _ = client.shutdown(Shutdown::Write);
     let _ = up.join();
 }
@@ -855,8 +917,21 @@ fn copy(from: &mut TcpStream, to: &mut TcpStream) -> std::io::Result<u64> {
         match from.read(&mut buf) {
             Ok(0) => return Ok(total),
             Ok(n) => {
-                to.write_all(&buf[..n])?;
+                // **Counted before the write, and a failed write ends the direction rather than
+                // erasing it.** `write_all` fails whenever the other side has already hung up —
+                // which is the ordinary shape of a probe: send a ClientHello, read the answer, drop
+                // the socket. It used to be `total += n` *after* a `?`, so the failing case
+                // propagated an `Err` and every caller's `.unwrap_or(0)` threw the whole
+                // direction's total away. A served connection then read as "nothing came back", on
+                // the one counter whose purpose is to tell a censored line from a healthy one.
+                //
+                // Read errors were already treated as end-of-direction two arms down, for the same
+                // reason: this proxy sets read timeouts on purpose, so an error here is ordinary
+                // rather than exceptional. The write side now agrees with the read side.
                 total += n as u64;
+                if to.write_all(&buf[..n]).is_err() {
+                    return Ok(total);
+                }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(_) => return Ok(total),
@@ -917,7 +992,7 @@ mod tests {
     }
 
     /// The shipped default has to do both things, because the two measured networks need
-    /// different ones: Türk Telekom yields to a byte-1 split, Superonline only to TLS record
+    /// different ones: the home line yields to a byte-1 split, SansürOn only to TLS record
     /// fragmentation. A default that did one of them would fail half the connections.
     #[test]
     fn the_default_both_fragments_records_and_splits() {
@@ -963,6 +1038,33 @@ mod tests {
         let plan = plan_first_write(not_tls, &s);
         assert_eq!(plan.flatten(), not_tls, "connection must not be dropped");
         assert!(plan.did_nothing());
+    }
+
+    /// **Exact write boundaries, asserted where they are a fact rather than a race.**
+    ///
+    /// This claim used to live in `e2e.rs`, against a real socket with a 20 ms delay between
+    /// writes, and it measured the scheduler: under a loaded workspace run the stub's reader was
+    /// descheduled past all three gaps, read `[100]` where the proxy had performed four writes, and
+    /// failed with a message that reads exactly like a split-transform regression. Reproduced at
+    /// 4 runs in 8 under load. The same collapse had already been diagnosed twice in that file — at
+    /// 20 ms and again at 40 ms — and both times the fix was applied to one test and not to this
+    /// one.
+    ///
+    /// A delay is a probability. The boundaries are arithmetic. This is where the arithmetic goes,
+    /// and it covers the part the pure `core` tests do not: that the *spec string* reaches them.
+    #[test]
+    fn a_multi_cut_spec_produces_exactly_those_boundaries() {
+        let s = Strategy::parse("split:1,3,7").expect("parses");
+        let plan = plan_first_write(&[0xABu8; 100], &s);
+        assert_eq!(
+            plan.writes
+                .iter()
+                .map(|w| w.bytes.len())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 93],
+            "cuts at 1,3,7 of a 100-byte flight land exactly here"
+        );
+        assert_eq!(plan.flatten(), [0xABu8; 100], "the bytes are unchanged");
     }
 
     #[test]
@@ -1026,5 +1128,49 @@ mod tests {
         );
         assert_eq!(c.listen.port(), 1080);
         assert_eq!(c.strategy, Strategy::passthrough());
+    }
+
+    /// **What was read is counted even when it cannot be forwarded.**
+    ///
+    /// `copy` had `total += n` *after* `to.write_all(..)?`, so a write that failed threw away the
+    /// whole direction's byte count. That is not an exotic case: a client that sends a request, reads
+    /// the answer and hangs up leaves the relay holding bytes it can no longer deliver, and the
+    /// caller's `.unwrap_or(0)` then read a served connection as "nothing came back" — on the one
+    /// counter whose purpose is to tell a censored line from a healthy one.
+    #[test]
+    fn bytes_read_are_counted_even_when_the_far_side_has_gone() {
+        use std::net::TcpListener;
+
+        // A pair to read from, with data waiting in it.
+        let src = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let src_addr = src.local_addr().expect("addr");
+        let feeder = std::thread::spawn(move || {
+            let mut w = TcpStream::connect(src_addr).expect("connect");
+            let _ = w.write_all(&[0x5Au8; 4096]);
+            let _ = w.shutdown(Shutdown::Write);
+            // Held until the test is done reading, so the stream is not torn down early.
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        let (mut from, _) = src.accept().expect("accept");
+
+        // A destination that cannot be written to, deterministically: our own write half is shut
+        // down, so `write_all` fails on its first attempt with a broken pipe. Closing the *peer*
+        // does not do it — a peer's FIN is a half-close and writing after one is legal, so the
+        // bytes go into the socket buffer and the write succeeds, which is why the first version of
+        // this test could not tell the two orderings apart.
+        let dst = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dst_addr = dst.local_addr().expect("addr");
+        let mut to = TcpStream::connect(dst_addr).expect("connect");
+        let (_peer, _) = dst.accept().expect("accept");
+        to.shutdown(Shutdown::Write).expect("shutdown write");
+
+        // `copy` returns `Err` here, and every caller does `.unwrap_or(0)` — so the count has to be
+        // right *in the error*, which is only true if the read is counted before the write.
+        let total = copy(&mut from, &mut to).unwrap_or(0);
+        let _ = feeder.join();
+        assert!(
+            total >= 4096,
+            "4096 bytes were read and could not be forwarded; the count says {total}"
+        );
     }
 }

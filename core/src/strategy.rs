@@ -85,7 +85,7 @@ impl Strategy {
     /// The default that holds on **both** measured networks.
     ///
     /// It was `split:1` alone until 2026-08-04, on the strength of 20/20 against Türk
-    /// Telekom. Then Superonline was measured for the first time, and every TCP-splitting
+    /// Telekom. Then SansürOn was measured for the first time, and every TCP-splitting
     /// strategy scored **0/10** there — that censor reassembles the stream, and splitting it
     /// merely converts a silent drop into an active reset. `tlsrec:64` and
     /// `tlsrec:64+split:1` were 10/10 on both lines.
@@ -101,7 +101,7 @@ impl Strategy {
     }
 
     /// Split at byte 1 and nothing else — the old default, kept because it is what 20/20 on
-    /// Türk Telekom was measured with and the golden tests are written against it.
+    /// the home line was measured with and the golden tests are written against it.
     pub fn split_only() -> Self {
         Strategy {
             tls_record: None,
@@ -274,7 +274,7 @@ impl fmt::Display for Strategy {
 /// that costs latency must never sit ahead of one that does not, and one measured unreliable
 /// must not sit ahead of one measured reliable.
 ///
-/// Measured on Türk Telekom AS9121 against `discord.com`, 5 trials each, 2026-08-03:
+/// Measured on the home line against `discord.com`, 5 trials each, 2026-08-03:
 ///
 /// | strategy | result |
 /// |----------|--------|
@@ -293,10 +293,10 @@ pub fn candidates() -> Vec<Strategy> {
     // calibrator tries them in turn, so a candidate that fails on half the country's
     // connections costs every user on that half a burnt connection before it moves on.
     //
-    //   tlsrec:64+split:1  10/10 Türk Telekom, 10/10 Superonline
-    //   tlsrec:64          10/10 Türk Telekom, 10/10 Superonline
-    //   split:1            20/20 Türk Telekom,  0/10 Superonline
-    //   split:midsld        2/10 Türk Telekom,  0/10 Superonline  — last, on measurement
+    //   tlsrec:64+split:1  10/10 the home line, 10/10 SansürOn
+    //   tlsrec:64          10/10 the home line, 10/10 SansürOn
+    //   split:1            20/20 the home line,  0/10 SansürOn
+    //   split:midsld        2/10 the home line,  0/10 SansürOn  — last, on measurement
     [
         "tlsrec:64+split:1",
         "tlsrec:64",

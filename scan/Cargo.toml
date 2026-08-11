@@ -16,6 +16,13 @@ vigil-platform = { path = "../platform" }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# `CreateToolhelp32Snapshot`, to list running process *names* — so a report can say whether
+# another DPI-bypass tool was running while it was taken. A WinDivert filter is invisible from
+# where vigil sits, and a report that cannot say so sends the reader after wrong theories.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
 
 [[bin]]
 name = "vigil-scan"

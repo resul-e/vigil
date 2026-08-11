@@ -48,8 +48,6 @@ pub struct Ctx<'a, 'b> {
 
 /// A single technique. Pure: same inputs, same plan, always.
 pub trait Transform {
-    fn name(&self) -> &'static str;
-
     /// Produce the writes to issue for this flight.
     ///
     /// Implementations must guarantee that concatenating the returned chunks reproduces

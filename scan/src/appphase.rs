@@ -26,7 +26,7 @@ use crate::apps;
 ///
 /// It was two, which is not enough and is a confound rather than a delay: the control arm runs
 /// first, so the arm that matters always starts against a cold cache and a Squirrel launcher
-/// that was killed moments ago. The 2026-08-07 Superonline report has "5 processes with vigil,
+/// that was killed moments ago. The 2026-08-07 SansürOn report has "5 processes with vigil,
 /// 5 without" and this is one of the reasons that comparison cannot be trusted on its own.
 #[cfg(windows)]
 const SETTLE: u64 = 8;
@@ -74,7 +74,7 @@ pub struct AppRun {
     /// Which *other* programs reached the proxy meanwhile. Program names only, never what they
     /// asked for.
     ///
-    /// This is the discriminator the Superonline run needed and did not have: if a browser
+    /// This is the discriminator the SansürOn run needed and did not have: if a browser
     /// appears here then Windows' proxy setting was in force for WinINET clients, and an
     /// Electron application that sent us nothing did so for its own reasons. If nothing but
     /// environment-variable clients appear, the registry channel is the suspect.
@@ -105,7 +105,7 @@ impl AppRun {
             // The one that used to read as success and is not: it talked to us and then died.
             (false, 0) => "BIZE GELDI AMA ACILMADI (surec kalmadi)",
             // Some of it reached us and the part it cannot start without did not. This is the
-            // Superonline run of 2026-08-07: Discord's updater arrived, `discord.com` never
+            // SansürOn run of 2026-08-07: Discord's updater arrived, `discord.com` never
             // did, the process count was identical with vigil on and off — and the report
             // called that "opened, uses the proxy". One name arriving is not the application
             // working, and the two must not share a verdict.
@@ -151,7 +151,7 @@ pub struct Outcome {
     pub listen: String,
     pub strategy: String,
     /// What auto-calibration settled on, per host. The single most useful line for a network
-    /// nobody here can reach: on Superonline every `split:*` is 0/10 and `tlsrec:64` is 10/10,
+    /// nobody here can reach: on SansürOn every `split:*` is 0/10 and `tlsrec:64` is 10/10,
     /// so "which one did it pick" is the difference between a bug and a working tool — and the
     /// report could not answer it until somebody asked whether it could.
     pub learned: Vec<(String, String)>,
@@ -175,6 +175,31 @@ pub struct Outcome {
     /// Which of the machine's own programs used vigil and which went around it.
     pub observed: Vec<crate::observe::Program>,
     pub observe_seconds: u64,
+    /// **What happened to the environment-variable channel**, in the report rather than only on the
+    /// console.
+    ///
+    /// The volunteer sends the *file*. This was an `eprintln!`, so if his `HTTPS_PROXY` belonged to
+    /// something else — which is the one case where vigil deliberately refuses to touch it — then
+    /// that channel pointed at nothing for the whole measurement and **nothing in the report said
+    /// so**, while the registry channel got a reported line twice. It is also the channel Roblox
+    /// depends on exclusively, and the plausible reason its arm has never produced anything.
+    pub env_channel: String,
+    /// Why the observation window did not happen, when it was asked for and did not.
+    ///
+    /// Empty means it ran, or was never asked for. **The section must not simply disappear**: the
+    /// 180-second watch is the measurement that decides whether this project writes a kernel driver,
+    /// and a missing section is byte-identical to a run that watched and saw nothing — which reads as
+    /// "no program bypassed vigil", the wrong turn in the expensive direction. Tonight's earlier fix
+    /// replaced a false claim with a hole; a hole in this particular number is not acceptable either.
+    pub observe_failed: String,
+    /// Why the application phase did not happen, when it was asked for and did not.
+    ///
+    /// The same rule as [`Self::observe_failed`] and the same reason: this section's verdicts are what
+    /// the driver question is read from. It used to print its heading, the claim that the applications
+    /// were started with protection on, **and "90 seconds was given to each arm"** — with no rows —
+    /// on a run where neither arm existed. Ninety seconds attributed to two measurements that never
+    /// ran, in the section that decides the most expensive question this project has.
+    pub apps_failed: String,
 }
 
 /// Render this half as report sections, appended to the network half's report.
@@ -182,10 +207,13 @@ pub fn render(o: &Outcome) -> String {
     let mut s = String::new();
     s.push_str("\n\nUYGULAMA TESTI — vigil devredeyken\n");
     s.push_str(&"-".repeat(72));
-    s.push_str(&format!(
-        "\nvigil {} , strateji {}\n\n",
-        o.listen, o.strategy
-    ));
+    s.push_str(&format!("\nvigil {} , strateji {}\n", o.listen, o.strategy));
+    // Both channels, named, before any verdict below is read. The registry half was reported twice
+    // and the environment half not at all, and the environment half is the one Roblox needs.
+    if !o.env_channel.is_empty() {
+        s.push_str(&format!("HTTPS_PROXY/ALL_PROXY: {}\n", o.env_channel));
+    }
+    s.push('\n');
 
     s.push_str("  Siteler: dogrudan vs vigil uzerinden\n\n");
     s.push_str(&format!(
@@ -219,17 +247,64 @@ pub fn render(o: &Outcome) -> String {
         }
     }
 
-    s.push_str("\n  Uygulamalar: vigil'i kullaniyorlar mi?\n");
-    s.push_str("  (koruma acikken baslatildi, bize gelen baglantilara bakildi)\n");
-    if o.app_wait > 0 {
+    // **A failure here suppresses these rows and nothing else.** This used to `return`, which is
+    // how one failed section deleted three unrelated ones below it — the observation window, the
+    // learned strategies and the engine counters — all of which were measured, and the first of
+    // which is the number the driver question is read from. Both of the neighbouring failures come
+    // from the *same* `hold::engage` refusal, so the one machine that trips this is the one machine
+    // where the whole rest of the report silently vanished.
+    if !o.apps_failed.is_empty() {
+        s.push_str("\n  Uygulamalar: OLCULEMEDI\n");
         s.push_str(&format!(
-            "  Sira: once vigil KAPALI kol, sonra vigil ACIK kol. Her kola {} saniye verildi.\n\
-             \x20 Iki kol simetrik degil — kapali kol once kostugu icin acik kol soguk\n\
-             \x20 baslar. Surec sayilarini karsilastirirken bunu hesaba kat.\n",
-            o.app_wait
+            "  Bu bolum HIC CALISMADI: {}\n             \x20 Yani \"Discord/Roblox vigil'i kullaniyor mu\" sorusu bu raporda CEVAPSIZ —\n             \x20 bolumun bos olmasina \"kullanmiyorlar\" diye bakilmamali.\n",
+            o.apps_failed
         ));
+    } else {
+        s.push_str("\n  Uygulamalar: vigil'i kullaniyorlar mi?\n");
+        s.push_str("  (koruma acikken baslatildi, bize gelen baglantilara bakildi)\n");
+        if o.app_wait > 0 {
+            s.push_str(&format!(
+                "  Sira: once vigil KAPALI kol, sonra vigil ACIK kol. Her kola {} saniye verildi.\n\
+                 \x20 Iki kol simetrik degil — kapali kol once kostugu icin acik kol soguk\n\
+                 \x20 baslar. Surec sayilarini karsilastirirken bunu hesaba kat.\n",
+                o.app_wait
+            ));
+        }
+        s.push('\n');
+        s.push_str(&app_rows(o));
     }
-    s.push('\n');
+    s.push_str("\n  Kalibratorun ogrendigi strateji (host basina)\n");
+    if o.learned.is_empty() {
+        s.push_str("     (hicbir host icin karar verilmedi — asagidaki sayaclara bak)\n");
+    }
+    for (host, strat) in &o.learned {
+        s.push_str(&format!("     {host:<34} {strat}\n"));
+    }
+    s.push_str("\n  Motorun sayaclari\n");
+    for (k, v) in &o.counters {
+        s.push_str(&format!("     {k:<24} {v}\n"));
+    }
+
+    if !o.observe_failed.is_empty() {
+        s.push_str("\n\n  GOZLEM — YAPILAMADI\n");
+        s.push_str(&"-".repeat(72));
+        s.push_str(&format!(
+            "\n  Makineyi izleme bolumu HIC CALISMADI: {}\n",
+            o.observe_failed
+        ));
+        s.push_str(
+            "  Yani \"hangi program vigil'i kullaniyor, hangisi etrafindan doleniyor\"\n             \x20 sorusu bu raporda CEVAPSIZ. Bolumun yokluguna \"hicbir program\n             \x20 baypas etmedi\" diye bakilmamali — olculmedi.\n",
+        );
+    } else if !o.observed.is_empty() || o.observe_seconds > 0 {
+        s.push_str(&crate::observe::render(&o.observed, o.observe_seconds));
+    }
+    s
+}
+
+/// The per-application rows — split out only so that the failure branch above cannot swallow
+/// anything but these.
+fn app_rows(o: &Outcome) -> String {
+    let mut s = String::new();
     for a in &o.apps {
         s.push_str(&format!("  {:<10} {}\n", a.app, a.verdict()));
         if let Some(e) = &a.exe {
@@ -273,7 +348,7 @@ pub fn render(o: &Outcome) -> String {
         }
         if a.others > 0 {
             s.push_str(&format!(
-                "     (bu sirada baska programlardan {} baglanti geldi, adlari yazilmadi)\n",
+                "     (bu sirada bu uygulamanin son ek listesi disindan {} ayri AD geldi;\n     \x20     bunlar baska programlar da olabilir, uygulamanin kendisi de — adlar yazilmadi)\n",
                 a.others
             ));
         }
@@ -287,21 +362,6 @@ pub fn render(o: &Outcome) -> String {
                     .join(", ")
             ));
         }
-    }
-    s.push_str("\n  Kalibratorun ogrendigi strateji (host basina)\n");
-    if o.learned.is_empty() {
-        s.push_str("     (hicbir host icin karar verilmedi — asagidaki sayaclara bak)\n");
-    }
-    for (host, strat) in &o.learned {
-        s.push_str(&format!("     {host:<34} {strat}\n"));
-    }
-    s.push_str("\n  Motorun sayaclari\n");
-    for (k, v) in &o.counters {
-        s.push_str(&format!("     {k:<24} {v}\n"));
-    }
-
-    if !o.observed.is_empty() || o.observe_seconds > 0 {
-        s.push_str(&crate::observe::render(&o.observed, o.observe_seconds));
     }
     s
 }
@@ -353,16 +413,40 @@ pub fn run(
     // Watching and launching are independent: `--no-apps --observe N` is a perfectly sensible
     // run, and wiring the watch inside the launch phase silently swallowed it.
     if apps_on {
-        let (runs, engaged) = measure_apps(&server, &actual.to_string(), app_wait);
+        let (runs, engaged, env, failed) = measure_apps(&server, &actual.to_string(), app_wait);
         out.apps = runs;
         out.engaged_proxy = engaged;
+        out.env_channel = env;
+        // No arm ran, so nothing may be claimed about how long each was given.
+        if !failed.is_empty() {
+            out.apps_failed = failed;
+            out.app_wait = 0;
+        }
     }
     out.observed = if observe > 0 {
-        observe_machine(&actual, observe)
+        let (o, env, ran) = observe_machine(&actual, observe);
+        // **Only claim a window that happened**, and say so when it did not. This was
+        // unconditional, so an engage that failed rendered "watched for 180 seconds with protection
+        // on — no program connected", which is byte-identical to a real and completely idle window.
+        // Zeroing it removed the false claim and left a hole, and a hole in *this* number reads as
+        // "nothing bypassed vigil" — the wrong turn in the most expensive direction there is.
+        out.observe_seconds = if ran { observe } else { 0 };
+        if !ran {
+            out.observe_failed = if env.is_empty() {
+                "ayarlar devreye alınamadı".to_string()
+            } else {
+                env.clone()
+            };
+        }
+        // The apps phase reports the same channel; keep whichever was actually reached, and prefer
+        // the apps phase because that is the arm the verdicts are read from.
+        if out.env_channel.is_empty() {
+            out.env_channel = env;
+        }
+        o
     } else {
         Vec::new()
     };
-    out.observe_seconds = observe;
     out.learned = server
         .cache
         .lock()
@@ -395,6 +479,17 @@ pub fn run(
             st.first_flight_retries.load(Relaxed),
         ),
         ("kalibre edilen".into(), st.calibrated.load(Relaxed)),
+        // The three that say whether the relay actually carried anything. `cevapsiz kapanan` is the
+        // one to read on a line whose censorship is silence: a connection the upstream accepted and
+        // then said nothing over.
+        ("cevapsiz kapanan".into(), st.closed_empty.load(Relaxed)),
+        // Non-zero means a host's learned strategy stopped working during this very run.
+        ("strateji terk edilen".into(), st.abandoned.load(Relaxed)),
+        ("bayt -> sunucu".into(), st.bytes_to_upstream.load(Relaxed)),
+        (
+            "bayt <- sunucu".into(),
+            st.bytes_from_upstream.load(Relaxed),
+        ),
         ("http-connect".into(), st.by_http_connect.load(Relaxed)),
         ("socks4".into(), st.by_socks4.load(Relaxed)),
         ("socks5".into(), st.by_socks5.load(Relaxed)),
@@ -413,12 +508,19 @@ fn measure_via(proxy: &str, trials: usize) -> Vec<ViaCell> {
         let (mut direct_ok, mut via_ok) = (0usize, 0usize);
         let mut notes: Vec<String> = Vec::new();
         for _ in 0..trials {
+            // Both arms label their reason. `via_proxy` already distinguishes a refused CONNECT
+            // from a reset and a timeout, and this — its only caller — threw that away with
+            // `.is_ok()`: the row that would trigger v2 recorded no reason for vigil's *own*
+            // failure. Both are labelled rather than only the new one, because the column has no
+            // header and a bare `rst` beside a `vigil:rst` would be ambiguous about which arm it
+            // came from.
             match crate::net::direct(host) {
                 Ok(()) => direct_ok += 1,
-                Err(e) => notes.push(e),
+                Err(e) => notes.push(format!("dogrudan:{e}")),
             }
-            if crate::net::via_proxy(proxy, host).is_ok() {
-                via_ok += 1;
+            match crate::net::via_proxy(proxy, host) {
+                Ok(()) => via_ok += 1,
+                Err(e) => notes.push(format!("vigil:{e}")),
             }
         }
         notes.sort();
@@ -436,33 +538,244 @@ fn measure_via(proxy: &str, trials: usize) -> Vec<ViaCell> {
     out
 }
 
+/// What to write back into the **shared** proxy snapshot file when the live setting is no longer
+/// ours, or `None` to leave it alone. Pure, so the one decision that can cost a machine its internet
+/// is testable on Linux — `mod hold` below is `#[cfg(windows)]` and the fast loop cannot reach it.
+///
+/// # The race this exists for
+///
+/// The scanner and the tray application share one snapshot file, and nothing serialises them: the
+/// instance lock has two callers and neither is `scan/` or `ui/`. So during the observation window —
+/// the one the console explicitly invites the volunteer to use the computer in — a click on
+/// "Korumayı aç" produces this:
+///
+/// 1. scan engaged on `:1085` and saved the user's real setting to the shared file.
+/// 2. vigil-app reads the live value, sees `https=127.0.0.1:1085`, and correctly concludes it belongs
+///    to somebody else — `engage::start` has no "occupied" answer, it snapshots and takes over. The
+///    user's real setting is **overwritten with a port that will be dead in a minute.**
+/// 3. scan's restore sees a value that is not its own, says `NotOurs`, and rightly touches nothing.
+/// 4. vigil-app exits and faithfully restores `https=127.0.0.1:1085`. Every WinINET client on the
+///    machine is offline, and `vigil-repair` can only fall back to disabling the proxy, losing what
+///    the user had.
+///
+/// The scanner is the half that knows: it still holds the value it saved. So when the live setting is
+/// no longer ours *and the file on disk now names our own listener*, somebody snapshotted us, and the
+/// honest repair is to put our own saved value back into the file. Whoever took over then restores
+/// the user's real setting when it exits.
+///
+/// It is deliberately narrow. Anything else on disk is left alone: a snapshot that names a third
+/// party is theirs to restore, and one we cannot account for is not ours to overwrite.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn snapshot_to_repair(
+    on_disk: Option<&str>,
+    ours: Option<&str>,
+    listen: &str,
+) -> Option<String> {
+    use vigil_platform::sysproxy;
+    let live = sysproxy::snapshot_from_text(on_disk?)?;
+    // The file claims that "before vigil, the machine pointed at *us*" — which cannot be true, and
+    // means our own saved value was overwritten by another instance snapshotting our listener.
+    if !sysproxy::points_at_us(&live, listen) {
+        return None;
+    }
+    Some(ours?.to_string())
+}
+
+/// Engaging and restoring the host settings **the way the rest of the project does it**.
+///
+/// This was two pairs of `registry::apply` / `envreg::apply` calls holding the previous values in
+/// local variables — one pair in `measure_apps`, one in `observe_machine`. Three things were missing
+/// and each is the difference between an instrument and a hazard:
+///
+/// 1. **Nothing was written to disk**, so closing the black window during the "use your computer
+///    normally" phase left the system proxy *and* `HTTPS_PROXY`/`ALL_PROXY` pointing at a dead
+///    `127.0.0.1:<port>` across reboots — and the volunteer running this is exactly the person who
+///    closes a black window. `vigil-repair` could then only fix the registry half.
+/// 2. **No stop handler**, so Ctrl-C and the window's close button skipped the restore entirely.
+/// 3. **It wrote over settings that were not ours.** `engage::start` and `envproxy::start` exist to
+///    refuse that case; going straight to `apply` bypassed both.
+///
+/// So this module is the same four steps `ui` and `proxy` use, in one place, with the restore
+/// idempotent and reachable from a signal handler.
+#[cfg(windows)]
+mod hold {
+    use std::sync::Mutex;
+    use vigil_platform::{engage as e, envproxy, envreg, paths, registry, shutdown, sysproxy};
+
+    /// What we engaged for, so the stop handler — which takes a plain `fn()` and can carry no
+    /// state of its own — knows what to compare the live setting against.
+    static LISTEN: Mutex<Option<String>> = Mutex::new(None);
+    /// The snapshot text this run wrote, kept so it can be put back if another instance
+    /// overwrites the shared file with *our* listener. See [`super::snapshot_to_repair`].
+    static SAVED: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Engage both channels. Returns a one-line description of what happened to the environment
+    /// half, for the report; reports what it refused on the console too. Never panics.
+    pub fn engage(listen: &str) -> Result<String, String> {
+        // Installed before anything is written, so an interruption in the middle of the first
+        // write is still covered.
+        if !shutdown::on_stop(restore_hook) {
+            eprintln!("  not: bu platformda kapanış işleyicisi kurulamadı");
+        }
+        if let Ok(mut g) = LISTEN.lock() {
+            *g = Some(listen.to_string());
+        }
+
+        let current = registry::read_current().map_err(|x| x.to_string())?;
+        // **Refuse when the machine is already pointed at a loopback proxy that is not ours.**
+        //
+        // For the tray application, overwriting a foreign setting is right: a user's own proxy is
+        // snapshotted and restored exactly. Here it is not. A loopback proxy on a machine running
+        // this scanner is almost always vigil's own tray app on another port, and `engage::start`
+        // would faithfully snapshot `https=127.0.0.1:1080` as "what was there before" — into the
+        // *shared* snapshot file that `vigil-app` and `vigil-repair` also use. The end of the run
+        // then writes a dead port back and deletes the record, which is the documented way to strand
+        // a machine permanently.
+        //
+        // It also ruins the measurement it was called for: the arm labelled "vigil kapalı" would be
+        // measured while something on loopback was still protecting the machine.
+        if sysproxy::is_stranded(&current, "127.0.0.1:")
+            && !sysproxy::points_at_us(&current, listen)
+        {
+            return Err(format!(
+                "sistem proxy'si zaten {} adresini gösteriyor — vigil-app açık olabilir.                  Kapatıp tekrar dene; ölçüm bu hâlde yanlış olur.",
+                current.server
+            ));
+        }
+        match e::start(&current, listen) {
+            // Already ours from an earlier run: keep whatever snapshot is on disk, because
+            // snapshotting our own setting is how a machine gets stranded permanently.
+            e::Start::AlreadyEngaged => {}
+            e::Start::Engage { apply, snapshot } => {
+                let text = sysproxy::snapshot_to_text(&snapshot);
+                write(paths::snapshot(), &text)?;
+                if let Ok(mut g) = SAVED.lock() {
+                    *g = Some(text);
+                }
+                registry::apply(&apply).map_err(|x| x.to_string())?;
+            }
+        }
+
+        let env_now = envreg::read_current().map_err(|x| x.to_string())?;
+        match envproxy::start(&env_now, listen) {
+            envproxy::Start::AlreadyEngaged => {
+                return Ok("zaten vigil'i gösteriyordu".into());
+            }
+            // Somebody else's variables. Overwriting them would break whatever set them, and the
+            // measurement is worth less than the machine.
+            envproxy::Start::Occupied => {
+                let msg = "BASKASINA AIT, dokunulmadi — bu olcumde HTTPS_PROXY vigil'i GOSTERMIYOR";
+                eprintln!("  ortam değişkenleri {msg}");
+                return Ok(msg.into());
+            }
+            envproxy::Start::Engage { apply, snapshot } => {
+                write(
+                    paths::env_snapshot(),
+                    &envproxy::snapshot_to_text(&snapshot),
+                )?;
+                envreg::apply(&apply).map_err(|x| x.to_string())?;
+            }
+        }
+        Ok(format!("vigil'e yonlendirildi -> {listen}"))
+    }
+
+    /// Put both back. Idempotent, and safe to call when nothing was ever engaged.
+    pub fn restore() {
+        let Some(listen) = LISTEN.lock().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        // Registry first. It is the half with no fallback, and the environment half ends in a
+        // `HWND_BROADCAST` whose timeout Windows applies per window.
+        if let Ok(current) = registry::read_current() {
+            let on_disk = read(paths::snapshot());
+            let snap = on_disk.as_deref().and_then(sysproxy::snapshot_from_text);
+            match e::stop(&current, snap.as_ref(), &listen) {
+                e::Stop::Restore(s) => {
+                    if registry::apply(&s).is_ok() {
+                        if let Some(p) = paths::snapshot() {
+                            let _ = std::fs::remove_file(p);
+                        }
+                    }
+                }
+                // Somebody else owns the setting now. Leave it — but if they snapshotted *us* on the
+                // way in, the file no longer holds the user's real value and their exit would write
+                // a dead port. Put ours back so their restore is correct.
+                e::Stop::NotOurs => {
+                    let ours = SAVED.lock().ok().and_then(|g| g.clone());
+                    if let Some(fix) =
+                        super::snapshot_to_repair(on_disk.as_deref(), ours.as_deref(), &listen)
+                    {
+                        let _ = write(paths::snapshot(), &fix);
+                        eprintln!("  not: ayarı başka bir vigil devraldı; anlık görüntü onarıldı");
+                    }
+                }
+            }
+        }
+        if let Ok(current) = envreg::read_current() {
+            let snap = read(paths::env_snapshot()).map(|t| envproxy::snapshot_from_text(&t));
+            if let envproxy::Stop::Restore(s) = envproxy::stop(&current, snap.as_ref(), &listen) {
+                if envreg::apply(&s).is_ok() {
+                    if let Some(p) = paths::env_snapshot() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_hook() {
+        restore();
+        eprintln!("\n  kesildi — ayarlar geri yazıldı");
+    }
+
+    fn write(path: Option<std::path::PathBuf>, text: &str) -> Result<(), String> {
+        let Some(p) = path else {
+            return Err("anlık görüntü yazacak yer yok".into());
+        };
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        std::fs::write(&p, text).map_err(|x| x.to_string())
+    }
+
+    fn read(path: Option<std::path::PathBuf>) -> Option<String> {
+        path.and_then(|p| std::fs::read_to_string(p).ok())
+    }
+}
+
 /// Watch the machine for a while with everything engaged.
 #[cfg(windows)]
-fn observe_machine(listen: &std::net::SocketAddr, seconds: u64) -> Vec<crate::observe::Program> {
-    use vigil_platform::{envproxy, envreg, registry, sysproxy};
-    let reg_before = registry::read_current().ok();
-    let env_before = envreg::read_current().ok();
-    if registry::apply(&sysproxy::settings_for(&listen.to_string())).is_err() {
-        return Vec::new();
-    }
-    let _ = envreg::apply(&envproxy::ours(&listen.to_string()));
+fn observe_machine(
+    listen: &std::net::SocketAddr,
+    seconds: u64,
+) -> (Vec<crate::observe::Program>, String, bool) {
+    let env = match hold::engage(&listen.to_string()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("  ayarlar devreye alınamadı, izleme atlandı: {e}");
+            hold::restore();
+            return (
+                Vec::new(),
+                format!("HİÇBİRİ — devreye alınamadı: {e}"),
+                false,
+            );
+        }
+    };
     eprintln!(
         "  {seconds} saniye boyunca izleniyor — bilgisayarı normal kullan (Discord, oyun, tarayıcı)"
     );
     let out = crate::observe::run(listen.port(), seconds);
-    if let Some(r) = &reg_before {
-        let _ = registry::apply(r);
-    }
-    if let Some(e) = &env_before {
-        let _ = envreg::apply(e);
-    }
+    hold::restore();
     eprintln!("  gözlem bitti, ayarlar geri yazıldı");
-    out
+    (out, env, true)
 }
 
 #[cfg(not(windows))]
-fn observe_machine(_listen: &std::net::SocketAddr, _seconds: u64) -> Vec<crate::observe::Program> {
-    Vec::new()
+fn observe_machine(
+    _listen: &std::net::SocketAddr,
+    _seconds: u64,
+) -> (Vec<crate::observe::Program>, String, bool) {
+    (Vec::new(), String::new(), false)
 }
 
 #[cfg(windows)]
@@ -470,12 +783,13 @@ fn measure_apps(
     server: &Arc<Server>,
     listen: &str,
     wait: u64,
-) -> (Vec<AppRun>, Option<vigil_platform::proxydiag::Diagnosis>) {
-    use vigil_platform::{envproxy, envreg, registry, sysproxy};
-
+) -> (
+    Vec<AppRun>,
+    Option<vigil_platform::proxydiag::Diagnosis>,
+    String,
+    String,
+) {
     let mut out = Vec::new();
-    let reg_before = registry::read_current().ok();
-    let env_before = envreg::read_current().ok();
 
     // The control arm first, with nothing engaged: how far does each application get on this
     // line *without* vigil? Without this number the report can only say the tool did
@@ -508,13 +822,18 @@ fn measure_apps(
         control.push((app.name.to_string(), exe, n, false));
     }
 
-    if let Err(e) = registry::apply(&sysproxy::settings_for(listen)) {
-        eprintln!("  sistem proxy ayarlanamadı: {e}");
-        return (out, None);
-    }
-    if let Err(e) = envreg::apply(&envproxy::ours(listen)) {
-        eprintln!("  ortam değişkenleri ayarlanamadı: {e}");
-    }
+    let env_channel = match hold::engage(listen) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("  sistem proxy ayarlanamadı: {e}");
+            hold::restore();
+            // The reason goes in its own field. It used to come back as the environment channel's
+            // state and be rendered under `HTTPS_PROXY/ALL_PROXY:`, so a *registry* refusal — the
+            // "another vigil already owns this setting" one, for instance — appeared as a statement
+            // about environment variables that had not been touched at all.
+            return (out, None, "hiçbiri — bölüm çalışmadı".to_string(), e);
+        }
+    };
     // Named exactly, because this project has a measured fact that says HTTP_PROXY breaks
     // Discord and `envproxy::ours` deliberately never sets it. A log line claiming otherwise is
     // an invitation to attribute a stall to the wrong cause, which is the mistake this whole
@@ -608,14 +927,9 @@ fn measure_apps(
         }
     }
 
-    if let Some(r) = &reg_before {
-        let _ = registry::apply(r);
-    }
-    if let Some(e) = &env_before {
-        let _ = envreg::apply(e);
-    }
+    hold::restore();
     eprintln!("  koruma kapatıldı, ayarlar geri yazıldı");
-    (out, Some(engaged))
+    (out, Some(engaged), env_channel, String::new())
 }
 
 #[cfg(not(windows))]
@@ -623,9 +937,14 @@ fn measure_apps(
     _server: &Arc<Server>,
     _listen: &str,
     _wait: u64,
-) -> (Vec<AppRun>, Option<vigil_platform::proxydiag::Diagnosis>) {
+) -> (
+    Vec<AppRun>,
+    Option<vigil_platform::proxydiag::Diagnosis>,
+    String,
+    String,
+) {
     eprintln!("  (uygulama testi sadece Windows'ta çalışır)");
-    (Vec::new(), None)
+    (Vec::new(), None, String::new(), String::new())
 }
 
 #[cfg(windows)]
@@ -926,6 +1245,9 @@ mod tests {
         let text = render(&Outcome {
             listen: "127.0.0.1:1085".into(),
             strategy: "tlsrec:64+split:1".into(),
+            env_channel: "vigil'e yonlendirildi".into(),
+            observe_failed: String::new(),
+            apps_failed: String::new(),
             cells: vec![],
             apps: vec![a],
             learned: vec![],
@@ -940,7 +1262,7 @@ mod tests {
         assert!(text.contains("vigil KAPALI 6"), "{text}");
     }
 
-    /// The Superonline run of 2026-08-07, as the report printed it. Discord's updater reached
+    /// The SansürOn run of 2026-08-07, as the report printed it. Discord's updater reached
     /// the proxy, `discord.com` never did, and the process count was five with vigil on and
     /// five with it off — the same number this machine reaches when Discord is blocked. The
     /// report said "opened, uses the proxy", which sent us looking at the network for a fault
@@ -965,6 +1287,9 @@ mod tests {
         let text = render(&Outcome {
             listen: "127.0.0.1:1085".into(),
             strategy: "tlsrec:64+split:1".into(),
+            env_channel: "vigil'e yonlendirildi".into(),
+            observe_failed: String::new(),
+            apps_failed: String::new(),
             cells: vec![],
             apps: vec![a],
             learned: vec![],
@@ -979,7 +1304,7 @@ mod tests {
         assert!(text.contains("discord.com"), "{text}");
     }
 
-    /// The line that would have settled the Superonline question in one run.
+    /// The line that would have settled the SansürOn question in one run.
     ///
     /// Two facts the old report could not carry: how many times a name was asked for, and which
     /// program asked. A browser among the *other* programs proves Windows' proxy setting was in
@@ -1001,6 +1326,9 @@ mod tests {
         let text = render(&Outcome {
             listen: "127.0.0.1:1085".into(),
             strategy: "tlsrec:64+split:1".into(),
+            env_channel: "vigil'e yonlendirildi".into(),
+            observe_failed: String::new(),
+            apps_failed: String::new(),
             app_wait: 90,
             apps: vec![AppRun {
                 app: "Discord".into(),
@@ -1078,6 +1406,9 @@ mod tests {
         let o = Outcome {
             listen: "127.0.0.1:1085".into(),
             strategy: "tlsrec:64+split:1".into(),
+            env_channel: "vigil'e yonlendirildi".into(),
+            observe_failed: String::new(),
+            apps_failed: String::new(),
             cells: vec![cell(0, 5)],
             learned: Vec::new(),
             counters: Vec::new(),
@@ -1099,9 +1430,204 @@ mod tests {
             }],
         };
         let text = render(&o);
-        assert!(text.contains("37 baglanti"));
+        // **A count of names, and the text has to say so.** It read "37 baglanti geldi" for a
+        // number that counts distinct *hostnames* in a bucket that means "outside this app's own
+        // suffix list" — which on one run was entirely the launched application's own process. A
+        // number whose label is wrong is worse than no number: it was used to argue a conclusion
+        // about other programs that the report could not support.
+        assert!(text.contains("37 ayri AD"), "{text}");
+        assert!(!text.contains("37 baglanti"), "{text}");
+        assert!(text.contains("uygulamanin kendisi de"), "{text}");
         assert!(text.contains("apis.roblox.com"));
-        assert!(text.contains("adlari yazilmadi"));
+        assert!(text.contains("adlar yazilmadi"));
         assert!(text.contains("ENGELLI -> vigil ACIYOR"));
+    }
+
+    /// **Both channels have to be in the file, not just on the console.** The volunteer sends the
+    /// report; if his environment variables belonged to something else then that channel pointed at
+    /// nothing for the whole measurement, and it is the channel Roblox depends on exclusively.
+    #[test]
+    fn the_environment_channel_says_what_happened_to_it() {
+        let mut o = Outcome {
+            listen: "127.0.0.1:1085".into(),
+            strategy: "tlsrec:64+split:1".into(),
+            env_channel: "BASKASINA AIT, dokunulmadi".into(),
+            ..Default::default()
+        };
+        let text = render(&o);
+        assert!(text.contains("HTTPS_PROXY/ALL_PROXY"), "{text}");
+        assert!(text.contains("BASKASINA AIT"), "{text}");
+
+        // And it is above the verdicts, because a reader who has already believed the table below
+        // will not come back for it.
+        let at_channel = text.find("HTTPS_PROXY/ALL_PROXY").expect("present");
+        let at_table = text.find("Siteler").expect("present");
+        assert!(at_channel < at_table, "the channel line must come first");
+
+        // Nothing to say is nothing printed, rather than an empty label.
+        o.env_channel = String::new();
+        assert!(!render(&o).contains("HTTPS_PROXY/ALL_PROXY"));
+    }
+
+    /// **The strand the two programs can produce between them, as a unit test.**
+    ///
+    /// `mod hold` is `#[cfg(windows)]`, so until this existed the fast Linux loop could not reach the
+    /// one decision in the scanner that can cost a machine its internet. The decision is pure, so it
+    /// can be tested here even though the thing it repairs is a Windows registry value.
+    ///
+    /// The scenario: the scanner saved the user's real setting, the tray application then engaged
+    /// during the observation window and snapshotted *the scanner's own listener* over it, and the
+    /// tray application's exit would restore a port that is about to be dead.
+    #[test]
+    fn a_snapshot_that_names_our_own_listener_is_put_back() {
+        use vigil_platform::sysproxy::{settings_for, snapshot_to_text, ProxySettings};
+
+        let ours_saved = snapshot_to_text(&ProxySettings {
+            enabled: true,
+            server: "http=corp-proxy:8080".into(),
+            bypass: "intranet".into(),
+        });
+        // What the tray application wrote over it: "before vigil there was 127.0.0.1:1085", which is
+        // the scanner's own listener and therefore cannot be true.
+        let clobbered = snapshot_to_text(&settings_for("127.0.0.1:1085"));
+
+        let fix = snapshot_to_repair(Some(&clobbered), Some(&ours_saved), "127.0.0.1:1085")
+            .expect("our own value must be put back");
+        assert_eq!(fix, ours_saved);
+
+        // A snapshot naming a third party is theirs to restore, and is left alone.
+        let theirs = snapshot_to_text(&ProxySettings {
+            enabled: true,
+            server: "http=127.0.0.1:10809".into(),
+            bypass: String::new(),
+        });
+        assert_eq!(
+            snapshot_to_repair(Some(&theirs), Some(&ours_saved), "127.0.0.1:1085"),
+            None,
+            "somebody else's snapshot must not be overwritten"
+        );
+
+        // Nothing on disk, or nothing of ours to put back: nothing to do rather than a guess.
+        assert_eq!(
+            snapshot_to_repair(None, Some(&ours_saved), "127.0.0.1:1085"),
+            None
+        );
+        assert_eq!(
+            snapshot_to_repair(Some(&clobbered), None, "127.0.0.1:1085"),
+            None
+        );
+        // And a file we cannot parse is not ours to replace.
+        assert_eq!(
+            snapshot_to_repair(Some("garbage"), Some(&ours_saved), "127.0.0.1:1085"),
+            None
+        );
+    }
+
+    /// **A watch that did not happen must say so, not vanish.**
+    ///
+    /// The 180-second window is the measurement that decides whether this project writes a kernel
+    /// driver. When the engage failed, the section was simply not rendered — byte-identical to a run
+    /// that watched and saw nothing, which reads as "no program bypassed vigil". That is the wrong
+    /// turn in the most expensive direction available.
+    #[test]
+    fn a_watch_that_never_ran_is_reported_as_missing_not_as_empty() {
+        let failed = Outcome {
+            listen: "127.0.0.1:1085".into(),
+            strategy: "tlsrec:64+split:1".into(),
+            observe_failed: "ayarlar devreye alınamadı".into(),
+            ..Default::default()
+        };
+        let text = render(&failed);
+        assert!(text.contains("GOZLEM — YAPILAMADI"), "{text}");
+        assert!(text.contains("CEVAPSIZ"), "{text}");
+        assert!(text.contains("olculmedi"), "{text}");
+        // And it must not look like a window that ran and saw nothing.
+        assert!(!text.contains("hicbir program baglanmadi"), "{text}");
+
+        // A run that never asked for one stays silent, as before.
+        let never = Outcome {
+            listen: "127.0.0.1:1085".into(),
+            strategy: "tlsrec:64+split:1".into(),
+            ..Default::default()
+        };
+        let text = render(&never);
+        assert!(!text.contains("GOZLEM"), "{text}");
+    }
+
+    /// **An application phase that did not run must not claim ninety seconds per arm.**
+    ///
+    /// The section printed its heading, "started with protection on", and "each arm was given 90
+    /// seconds" with zero rows — ninety seconds attributed to two measurements that never existed, in
+    /// the section whose verdicts decide whether this project writes a kernel driver. The trigger is
+    /// ordinary: any enabled loopback proxy on another port makes the engage refuse.
+    #[test]
+    fn an_application_phase_that_never_ran_says_so_and_claims_no_time() {
+        let failed = Outcome {
+            listen: "127.0.0.1:1085".into(),
+            strategy: "tlsrec:64+split:1".into(),
+            apps_failed: "sistem proxy'si zaten 127.0.0.1:1080 adresini gösteriyor".into(),
+            app_wait: 0,
+            ..Default::default()
+        };
+        let text = render(&failed);
+        assert!(text.contains("Uygulamalar: OLCULEMEDI"), "{text}");
+        assert!(text.contains("CEVAPSIZ"), "{text}");
+        assert!(
+            text.contains("127.0.0.1:1080"),
+            "the reason must be there: {text}"
+        );
+        // The three claims that must be gone.
+        assert!(!text.contains("saniye verildi"), "{text}");
+        assert!(!text.contains("koruma acikken baslatildi"), "{text}");
+        assert!(!text.contains("Sira: once vigil KAPALI"), "{text}");
+    }
+
+    /// **One section failing must not delete the sections below it.**
+    ///
+    /// The two failures above are not independent: `measure_apps` and `observe_machine` call the
+    /// *same* `hold::engage`, so the machine that trips one trips both — and that was the machine
+    /// where the apps failure `return`ed out of `render` and took the observation notice, the
+    /// learned strategies and the engine counters with it. Everything below the apps rows is
+    /// measured *before* the engage is attempted, so none of it has any business disappearing with
+    /// it. The combination is the case no other test constructs, which is why it survived.
+    #[test]
+    fn a_failed_application_phase_does_not_delete_the_sections_below_it() {
+        let both_failed = Outcome {
+            listen: "127.0.0.1:1085".into(),
+            strategy: "tlsrec:64+split:1".into(),
+            apps_failed: "sistem proxy'si zaten 127.0.0.1:1080 adresini gösteriyor".into(),
+            observe_failed: "sistem proxy'si zaten 127.0.0.1:1080 adresini gösteriyor".into(),
+            learned: vec![
+                ("discord.com".into(), "tlsrec:64+split:1".into()),
+                ("updates.discord.com".into(), "split:1".into()),
+            ],
+            counters: vec![
+                ("cevapsiz kapanan".into(), 3),
+                ("strateji terk edilen".into(), 1),
+            ],
+            ..Default::default()
+        };
+        let text = render(&both_failed);
+
+        // The apps failure is still reported...
+        assert!(text.contains("Uygulamalar: OLCULEMEDI"), "{text}");
+        assert!(!text.contains("Sira: once vigil KAPALI"), "{text}");
+
+        // ...and so is everything that was measured before it.
+        assert!(
+            text.contains("GOZLEM — YAPILAMADI"),
+            "the watch notice must survive an apps failure: {text}"
+        );
+        assert!(
+            text.contains("Kalibratorun ogrendigi strateji"),
+            "the learned table must survive an apps failure: {text}"
+        );
+        assert!(text.contains("discord.com"), "{text}");
+        assert!(text.contains("updates.discord.com"), "{text}");
+        assert!(
+            text.contains("Motorun sayaclari"),
+            "the engine counters must survive an apps failure: {text}"
+        );
+        assert!(text.contains("strateji terk edilen"), "{text}");
     }
 }

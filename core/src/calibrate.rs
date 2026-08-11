@@ -336,8 +336,8 @@ mod tests {
     }
 
     /// The sweep must open with the candidate that works on the most measured networks, not
-    /// the one that works best on the developer's. `split:1` is 20/20 on Türk Telekom and
-    /// **0/10** on Superonline; `tlsrec:64+split:1` is 10/10 on both. Starting anywhere else
+    /// the one that works best on the developer's. `split:1` is 20/20 on the home line and
+    /// **0/10** on SansürOn; `tlsrec:64+split:1` is 10/10 on both. Starting anywhere else
     /// costs half the country a burnt connection before the calibrator moves on.
     #[test]
     fn the_first_candidate_tried_is_the_one_measured_on_the_most_networks() {
@@ -358,7 +358,7 @@ mod tests {
         }
     }
 
-    /// `split:midsld` measured 2/10 on Türk Telekom and 0/10 on Superonline. It stays in the
+    /// `split:midsld` measured 2/10 on the home line and 0/10 on SansürOn. It stays in the
     /// list because it costs nothing to try last, but it must never be tried early.
     #[test]
     fn the_flakiest_candidate_is_tried_last() {

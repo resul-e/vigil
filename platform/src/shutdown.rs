@@ -19,12 +19,36 @@ static ON_STOP: OnceLock<fn()> = OnceLock::new();
 ///
 /// Returns whether a handler could actually be installed; on platforms where it cannot, the
 /// caller still gets its normal exit path and nothing is silently pretended.
+///
+/// **A second call reports the first call's answer, not failure.** It used to return `false` as soon
+/// as `ON_STOP.set` failed — which is exactly what a *successful* second call looks like, since the
+/// handler is already registered and pointing at the same function. `vigil-scan` engages twice in a
+/// default run (the application phase, then the watch window), so every double-click printed "no
+/// shutdown handler here — use vigil-repair if this is killed" immediately before the three minutes
+/// in which the volunteer is told to use his computer normally, and it named the one safety net this
+/// whole project is organised around as absent while it was armed.
+///
+/// The cached value is `install()`'s, not `true`: a genuine `SetConsoleCtrlHandler` failure has to
+/// keep reporting itself, because a caller branches on it.
 pub fn on_stop(f: fn()) -> bool {
-    if ON_STOP.set(f).is_err() {
-        return false;
-    }
-    install()
+    // **One initialisation, not two.** This used to `ON_STOP.set(f)`, then `install()`, then
+    // `INSTALLED.set(ok)` — three steps across two separate `OnceLock`s, with a window between the
+    // first and the last. A second caller arriving inside that window found `ON_STOP` already
+    // taken and `INSTALLED` still empty, so it reported `false` for a handler that was in the act
+    // of being installed successfully: the same false "no shutdown handler here" the cache was
+    // added to stop, now reachable by timing instead of by call count.
+    //
+    // `get_or_init` closes it: exactly one caller runs the body, and every other caller blocks
+    // until it finishes and then reads the same answer. `ON_STOP` is still set first inside it,
+    // because on Windows the handler can fire the instant `install()` returns and it reads that.
+    *INSTALLED.get_or_init(|| {
+        let _ = ON_STOP.set(f);
+        install()
+    })
 }
+
+/// Whether the platform handler was installed, so a second `on_stop` can answer truthfully.
+static INSTALLED: OnceLock<bool> = OnceLock::new();
 
 /// Only the Windows handler calls this; on other platforms nothing can invoke it, which is
 /// the honest state of affairs rather than something to paper over.
@@ -133,7 +157,12 @@ mod tests {
     /// one installed by whoever engaged the system proxy.
     #[test]
     fn only_the_first_registration_wins() {
-        assert!(ON_STOP.set(bump).is_ok() || ON_STOP.get().is_some());
+        // Through `on_stop`, not `ON_STOP.set`. These tests share one process and one `OnceLock`,
+        // so a test that sets `ON_STOP` behind the entry point's back leaves `INSTALLED` empty —
+        // and then whichever test runs next sees a state the real program can never be in. That
+        // made `a_second_registration_reports_what_the_first_installed` fail 2 runs in 40,
+        // depending only on which test won the race.
+        on_stop(bump);
         let first = *ON_STOP.get().expect("registered");
         let _ = on_stop(bump);
         assert_eq!(
@@ -147,9 +176,64 @@ mod tests {
     /// not a panic.
     #[test]
     fn running_the_registered_hook_calls_it() {
-        let _ = ON_STOP.set(bump);
+        on_stop(bump); // see `only_the_first_registration_wins`: never `ON_STOP.set` directly
         let before = CALLS.load(Ordering::SeqCst);
         run_registered();
         assert_eq!(CALLS.load(Ordering::SeqCst), before + 1);
+    }
+
+    /// **A second registration must report the installation, not describe itself.**
+    ///
+    /// `vigil-scan` engages twice in a default run, and the second call returned `false` because
+    /// `ON_STOP.set` failed — which is precisely what success looks like the second time. Every
+    /// double-click printed "no shutdown handler here — use vigil-repair if this is killed" right
+    /// before the window in which the volunteer is told to use his computer normally, naming the one
+    /// safety net this project is organised around as absent while it was armed.
+    #[test]
+    fn a_second_registration_reports_what_the_first_installed() {
+        // Whatever ran before in this process, the handler is registered by the end of this line.
+        let first = on_stop(bump);
+        let second = on_stop(bump);
+        assert_eq!(
+            second, first,
+            "the second call must answer for the installation, not for itself"
+        );
+        // And the answer is the *installation's*, cached — not a fixed `true`, so a platform where
+        // `install()` fails keeps reporting that on every later call rather than being papered over.
+        assert_eq!(INSTALLED.get().copied(), Some(first));
+        // A third call too: nothing about the count may change the answer.
+        assert_eq!(on_stop(bump), first);
+        // Honest limit of this test: on Linux `install()` succeeds, so replacing the cached value
+        // with a constant `true` is indistinguishable here. What pins that is the equality above —
+        // the returned value and the cache must be the same thing — and a platform where `install()`
+        // fails would then fail this test rather than quietly reporting success.
+    }
+
+    /// **Concurrent callers must all get the installation's answer.**
+    ///
+    /// `on_stop` was three steps over two `OnceLock`s — set the function, install, cache the
+    /// result — and a caller arriving between the first and the last found the function already
+    /// registered and the cache still empty, so it answered `false` for a handler that was being
+    /// installed successfully at that moment. That is the same false "no shutdown handler here —
+    /// use vigil-repair if this is killed" the cache exists to prevent, reachable by timing rather
+    /// than by call count. It surfaced as `a_second_registration...` failing 2 runs in 40 and then
+    /// 6 in 60, which is what a race looks like when it is mistaken for an ordering problem.
+    ///
+    /// Every thread must agree, and none may say `false` while another says `true`.
+    #[test]
+    fn concurrent_registrations_all_report_the_same_installation() {
+        let answers: Vec<bool> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..16).map(|_| s.spawn(|| on_stop(bump))).collect();
+            hs.into_iter().map(|h| h.join().expect("thread")).collect()
+        });
+        assert!(
+            answers.windows(2).all(|w| w[0] == w[1]),
+            "callers disagreed about whether the handler was installed: {answers:?}"
+        );
+        assert_eq!(
+            INSTALLED.get().copied(),
+            Some(answers[0]),
+            "the cache and the answers must be the same thing"
+        );
     }
 }

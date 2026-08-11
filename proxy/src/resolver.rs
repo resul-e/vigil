@@ -39,8 +39,8 @@ use vigil_core::dnsmsg;
 /// one of these, we have not resolved the name, we have been handed a censor's address, and
 /// connecting to it would produce a measurement — or a user experience — of the wrong thing.
 ///
-/// `195.175.254.2` is Türk Telekom's block page, documented by OONI and observed directly.
-/// Vodafone AS15897 has been documented answering `127.0.0.1` for `twitter.com`.
+/// `195.175.254.2` is the home line's block page, documented by OONI and observed directly.
+/// another provider another provider has been documented answering `127.0.0.1` for `twitter.com`.
 const BLOCK_PAGES: &[Ipv4Addr] = &[
     Ipv4Addr::new(195, 175, 254, 2),
     Ipv4Addr::new(127, 0, 0, 1),
@@ -173,6 +173,12 @@ fn ask_one(server: SocketAddr, host: &str, timeout: Duration, id: u16) -> Reply 
             // IPv6. The server spoke and the answer is "nothing here" — the distinction this whole
             // enum exists for, and `dnsmsg` had it all along as its own error variant.
             Err(dnsmsg::Error::NoAddress) => return Reply::Nothing,
+            // SERVFAIL / REFUSED / NOTIMP / FORMERR. The server answered *about itself*, not about
+            // the name, so this is `Silent` and not `Nothing`: the sweep must go on to the next
+            // upstream — which is the entire reason there are four of them — and nothing may be
+            // written to the negative cache. On the wire this is byte-for-byte the shape of
+            // NXDOMAIN, so it read as an authoritative no until `dnsmsg` started reading the rcode.
+            Err(dnsmsg::Error::SoftFailure) => return Reply::Silent,
             // A response that is not ours — a spoof, or a straggler. Keep reading.
             Err(dnsmsg::Error::Malformed) => continue,
             Err(_) => return Reply::Silent,
@@ -479,7 +485,7 @@ mod tests {
 
     #[test]
     fn documented_censor_answers_are_recognised() {
-        // Vodafone AS15897 answered 127.0.0.1 for twitter.com (OONI, 2023).
+        // another provider another provider answered 127.0.0.1 for twitter.com (OONI, 2023).
         assert!(is_block_page(&v4(127, 0, 0, 1)));
         assert!(is_block_page(&v4(0, 0, 0, 0)));
     }
@@ -661,6 +667,77 @@ mod tests {
             }
         });
         at
+    }
+
+    /// A stub upstream that answers every question with a given failure rcode and no records —
+    /// SERVFAIL, REFUSED, whatever the caller passes. **On the wire this is the same shape as the
+    /// authoritative no above**: our id, QR set, one question, zero answers. Only byte 3 differs.
+    fn stub_failing(rcode: u8) -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind stub");
+        let addr = sock.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let Ok(q) = dnsmsg::parse_question(&buf[..n]) else {
+                    continue;
+                };
+                if let Ok(r) = dnsmsg::encode_response(&buf[..n], &q, &[], 30, rcode) {
+                    let _ = sock.send_to(&r, from);
+                }
+            }
+        });
+        addr
+    }
+
+    /// **"I could not answer" is not "the name does not exist".**
+    ///
+    /// The four upstreams exist so that one bad one cannot take a name down. But a SERVFAIL or a
+    /// REFUSED is byte-for-byte the shape of an authoritative no — same id, QR set, one question,
+    /// zero answers — and until the codec read the rcode it was scored as one. So a single
+    /// rate-limited reply from the *first* upstream ended the sweep before a packet was sent to any
+    /// of the other three, and wrote a twenty-second negative entry: every program on the machine
+    /// then got SERVFAIL for a name the second resolver would have answered on the first try.
+    ///
+    /// Both halves are load-bearing. The address proves the sweep continued; the empty cache proves
+    /// we did not record one server's bad day as a fact about the name.
+    #[test]
+    fn a_server_that_could_not_answer_does_not_end_the_sweep() {
+        for rcode in [
+            dnsmsg::RCODE_SERVFAIL,
+            5, /* REFUSED */
+            4, /* NOTIMP */
+        ] {
+            let mut r = Resolver::new(
+                vec![
+                    stub_failing(rcode),
+                    stub_answering(Ipv4Addr::new(203, 0, 113, 7)),
+                ],
+                false,
+            );
+            r.timeout = Duration::from_millis(500);
+
+            assert_eq!(
+                r.lookup("busy.example"),
+                vec![v4(203, 0, 113, 7)],
+                "rcode {rcode} stopped the sweep before the upstream that had the answer"
+            );
+            assert_eq!(
+                r.cached("busy.example"),
+                Some(vec![v4(203, 0, 113, 7)]),
+                "rcode {rcode}: the good answer is what gets remembered"
+            );
+        }
+
+        // And with no second upstream to save it, the failure must leave *no* trace: remembering an
+        // empty vector here is what took the name off the machine for twenty seconds.
+        let mut r = Resolver::new(vec![stub_failing(dnsmsg::RCODE_SERVFAIL)], false);
+        r.timeout = Duration::from_millis(500);
+        assert!(r.lookup("busy2.example").is_empty());
+        assert_eq!(
+            r.cached("busy2.example"),
+            None,
+            "a server's own failure is not a fact about the name and must not be cached"
+        );
     }
 
     /// An authoritative "no such name" ends the sweep; a censored answer does not.

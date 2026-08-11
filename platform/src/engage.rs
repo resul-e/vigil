@@ -14,7 +14,9 @@
 //! 3. **The user changed it while we ran.** If the live setting is no longer ours, restoring
 //!    our snapshot would undo their change. We leave it alone.
 
-use crate::sysproxy::{disabled, points_at_us, settings_for, ProxySettings};
+use crate::sysproxy::{
+    disabled, looks_like_our_own_writing, points_at_us, settings_for, ProxySettings,
+};
 
 /// What to do at startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,11 +58,37 @@ pub fn start(current: &ProxySettings, listen: &str) -> Start {
 /// what was there before, but we do know that leaving the machine pointing at a listener that
 /// is about to stop is the worst of the available options. Disabling is the same fallback
 /// `vigil-repair` uses.
+///
+/// # A snapshot that names one of our own listeners is not a snapshot
+///
+/// Case 1 in the module header — "snapshotting `https=127.0.0.1:1080` as what was there before"
+/// — is described there as the way a machine is stranded permanently, and [`start`] refuses to
+/// create one. **It was still restored if somebody else created it**, and somebody else does:
+/// `start` has no "occupied" answer (unlike `envproxy::start`), so a second vigil engaging over the
+/// first snapshots the first's listener into the *shared* file. Whichever exits later then faithfully
+/// writes back a port that is about to be dead, and the file is deleted with it.
+///
+/// So the value is checked before it is honoured. `disabled()` is the floor and deliberately not
+/// `NotOurs`: the live setting *is* ours, and walking away from it leaves the machine enabled on a
+/// listener that is about to stop — the exact failure, arrived at by being careful. Disabling costs
+/// the user a setting they will notice; the alternative costs them their internet and tells them
+/// nothing. A caller that kept its own copy of what it wrote should prefer that, and the scanner
+/// does.
 pub fn stop(current: &ProxySettings, snapshot: Option<&ProxySettings>, listen: &str) -> Stop {
     if !points_at_us(current, listen) {
         return Stop::NotOurs;
     }
     match snapshot {
+        // Anything vigil itself wrote cannot be "what was there before vigil".
+        //
+        // Both tests, and the second is the one that matters: `points_at_us` is an exact compare
+        // against *this* listener, and the race is **two vigils on two ports** — the scanner runs on
+        // 1085 and the tray on 1080, so the snapshot each takes of the other names neither's own
+        // address and the exact test never fires. `looks_like_our_own_writing` recognises the whole
+        // triple `settings_for` produces, whichever port it names.
+        Some(s) if points_at_us(s, listen) || looks_like_our_own_writing(s) => {
+            Stop::Restore(disabled())
+        }
         Some(s) => Stop::Restore(s.clone()),
         None => Stop::Restore(disabled()),
     }
@@ -232,5 +260,84 @@ mod tests {
         assert_eq!(start(&apply, LISTEN), Start::AlreadyEngaged);
         // and the snapshot on disk is still the original, so shutdown restores it.
         assert_eq!(stop(&apply, Some(&snapshot), LISTEN), Stop::Restore(before));
+    }
+
+    /// **A snapshot that names our own listener must never be written back.**
+    ///
+    /// The module header calls that state the way a machine is stranded forever, and `start` refuses
+    /// to create one — but `start` has no "occupied" answer, so a second vigil engaging over the
+    /// first snapshots the first's listener into the shared file. Whichever exits later restored a
+    /// port that was about to be dead, and deleted the record on the way.
+    ///
+    /// `Restore(disabled())` and deliberately not `NotOurs`: the live setting *is* ours, so walking
+    /// away leaves the machine enabled on a listener that is about to stop, which is the failure this
+    /// guard exists to prevent, reached by being careful.
+    #[test]
+    fn a_snapshot_naming_our_own_listener_is_never_restored() {
+        // **Including the port the race actually produces.** The scanner runs on 1085 and the tray
+        // on 1080, so the snapshot each takes of the other names *neither's* own listener — an exact
+        // compare against `listen` cannot see it, and this is the case that reaches a real machine.
+        for snapshot in [
+            ours(),
+            settings_for("127.0.0.1:1080"),
+            settings_for("127.0.0.1:1085"),
+            settings_for("127.0.0.1:1090"),
+        ] {
+            assert_eq!(
+                stop(&ours(), Some(&snapshot), LISTEN),
+                Stop::Restore(disabled()),
+                "an impossible snapshot must not be written back: {snapshot:?}"
+            );
+        }
+        // **And a user's own local proxy is still restored exactly.** Widening this to "any loopback
+        // address" is the tempting version and it blanks a v2rayN, Clash or Fiddler configuration on
+        // every quit, with nothing to put back — verbatim the regression `points_at_us` was narrowed
+        // to prevent, and the whole suite stays green while doing it.
+        for theirs in [
+            "http=127.0.0.1:10809;https=127.0.0.1:10809",
+            "http=127.0.0.1:7890",
+            "https=127.0.0.1:8888",
+        ] {
+            let t = ProxySettings {
+                enabled: true,
+                server: theirs.into(),
+                bypass: "<local>".into(),
+            };
+            assert_eq!(
+                stop(&ours(), Some(&t), LISTEN),
+                Stop::Restore(t.clone()),
+                "somebody else's local proxy must be restored exactly: {theirs}"
+            );
+        }
+        // Nearly ours is not ours: the same address with a bypass list we did not write.
+        let nearly = ProxySettings {
+            bypass: "<local>".into(),
+            ..settings_for("127.0.0.1:1085")
+        };
+        assert_eq!(
+            stop(&ours(), Some(&nearly), LISTEN),
+            Stop::Restore(nearly.clone())
+        );
+
+        // A snapshot of somebody else's proxy, or of nothing, is still restored exactly.
+        let corp = ProxySettings {
+            enabled: true,
+            server: "http=corp-proxy:8080".into(),
+            bypass: "intranet".into(),
+        };
+        assert_eq!(
+            stop(&ours(), Some(&corp), LISTEN),
+            Stop::Restore(corp.clone())
+        );
+        assert_eq!(
+            stop(&ours(), Some(&nothing()), LISTEN),
+            Stop::Restore(nothing())
+        );
+        // And a *different* port of ours is still ours to refuse: the scanner runs on 1085.
+        let other = settings_for("127.0.0.1:1085");
+        assert_eq!(
+            stop(&other, Some(&other), "127.0.0.1:1085"),
+            Stop::Restore(disabled())
+        );
     }
 }

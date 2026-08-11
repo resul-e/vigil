@@ -93,8 +93,16 @@ fn broadcast() {
 
     let param: Vec<u16> = "Environment\0".encode_utf16().collect();
     let mut result: usize = 0;
-    // A hung top-level window must not hold the interface thread: this returns after the
-    // timeout whatever else the desktop is doing.
+    // A hung top-level window must not hold the interface thread — hence the timeout and
+    // `SMTO_ABORTIFHUNG`.
+    //
+    // **But "returns after the timeout" is not what this does, and the comment used to say it was.**
+    // Windows documents `HWND_BROADCAST` as applying the timeout *per window*, so the worst case is
+    // the timeout multiplied by however many top-level windows the desktop has. Measured here at
+    // ~220 ms on a machine with 280 of them, seventeen already not responding — cheap in practice,
+    // and unbounded in principle. That is why the caller does this **last** when disengaging: the
+    // one path where being slow costs a stranded machine is session end, and there the registry
+    // restore has to be finished before anything can decide we are hung.
     unsafe {
         SendMessageTimeoutW(
             HWND_BROADCAST,

@@ -350,6 +350,36 @@ pub fn resume_state(verified: bool, required: usize, outstanding: usize) -> Resu
     }
 }
 
+/// May a staged-but-not-started folder be offered when the endpoints cannot be reached?
+///
+/// **Phase B needs no network.** The bytes are already down, already hash-checked against a
+/// manifest carrying two signatures, and installing them is a sequence of renames. So a fetch
+/// failure is not a reason to hide them — and it did: `--check` printed `unreachable`,
+/// `UpdateState::Unreachable` offers no action, and the tray rechecks itself every six hours, so a
+/// user who staged an update on Tuesday and whose line began blocking `github.com` on Wednesday
+/// simply lost the install button. That condition is not exotic; it is the entire premise of this
+/// product.
+///
+/// All four conditions are load-bearing:
+///
+/// - `verified` — the staged manifest still verifies against the compiled-in keys.
+/// - `ready` — the `ready.txt` marker is present. **Not implied by the other three.** A *later*
+///   `stage` for a newer manifest removes the marker first and deletes staged files it does not
+///   want; if that run then dies on the network, the *previous* manifest and signatures are still
+///   on disk, still verify, and still say `NotStarted`, while the files they describe are gone.
+/// - `newer_than_running` — otherwise a leftover folder for a version already installed is
+///   offered forever.
+/// - [`Resume::NotStarted`] — `Finishable` is answered earlier as `interrupted`, and `Nothing`
+///   means there is no complete set to offer.
+pub fn offer_staged_offline(
+    verified: bool,
+    ready: bool,
+    newer_than_running: bool,
+    resume: Resume,
+) -> bool {
+    verified && ready && newer_than_running && matches!(resume, Resume::NotStarted)
+}
+
 /// The runner: a copy of this executable inside the staging folder, so the one in the application
 /// folder is idle and can be replaced like any other file.
 pub fn runner_path(app_folder: &Path) -> PathBuf {
@@ -411,6 +441,40 @@ mod resume_tests {
         // Zero required files with something outstanding cannot happen from `outstanding()`, which
         // counts only required ones — but if it ever does, the safe reading is "not started".
         assert_eq!(resume_state(true, 0, 1), Resume::NotStarted);
+    }
+
+    /// **A finished download must not be hidden by a dead endpoint.**
+    ///
+    /// `--check` answered `unreachable` over the top of a complete, verified, ready staging set —
+    /// and `Unreachable` offers no install action, so the update became uninstallable until an
+    /// endpoint answered again, even though phase B needs no network whatsoever. The trigger is the
+    /// ordinary one: the line starts blocking `github.com` between staging and installing.
+    #[test]
+    fn a_ready_staged_set_is_offered_when_the_endpoints_are_gone() {
+        assert!(offer_staged_offline(true, true, true, Resume::NotStarted));
+
+        // Each condition alone must be able to withhold the offer.
+        assert!(
+            !offer_staged_offline(false, true, true, Resume::NotStarted),
+            "a staged set whose signatures no longer verify is not installable"
+        );
+        assert!(
+            !offer_staged_offline(true, false, true, Resume::NotStarted),
+            "no ready marker: a later stage may have deleted the files this manifest describes \
+             while leaving the manifest itself on disk"
+        );
+        assert!(
+            !offer_staged_offline(true, true, false, Resume::NotStarted),
+            "a folder staged for a version we are already running is not an update"
+        );
+        assert!(
+            !offer_staged_offline(true, true, true, Resume::Nothing),
+            "nothing complete is staged"
+        );
+        assert!(
+            !offer_staged_offline(true, true, true, Resume::Finishable { outstanding: 2 }),
+            "a half-applied folder is `interrupted`, which is answered before this and says more"
+        );
     }
 }
 
@@ -575,7 +639,6 @@ mod tests {
                 steps: NAMES
                     .iter()
                     .map(|(n, r)| SwapStep {
-                        order: 0,
                         name: n.to_string(),
                         required: *r,
                         digest: sha256::hash(&new_body(n)),
@@ -596,6 +659,68 @@ mod tests {
                 assert!(out.replaced.contains(&"vigil-app.exe".to_string()));
             }
         }
+    }
+
+    /// **A failed apply must leave the staging folder standing, so the next start can resume.**
+    ///
+    /// The module's contract says the folder survives any failure and the next `--check` finishes
+    /// the job — and nothing tested it. A one-line `stage::discard` on the error path left the
+    /// whole suite green while destroying the new binaries, the manifest and both signatures on a
+    /// half-applied folder. What is left after that is the worst state this design has: the
+    /// application is old, `vigil-update.exe` is already new, and `Version::running()` is the
+    /// *updater's* version — so `--check` answers "current" forever with nothing left to resume
+    /// from and no way for an update to fix it, because the code that applies an update is always
+    /// the old version's code.
+    ///
+    /// The resume deliberately re-plans from disk rather than reusing the first plan: the first
+    /// apply consumed the staged `vigil-repair.exe` by renaming it, so a reused plan would fail on
+    /// a missing source and the test would look like it caught the mutation while actually
+    /// catching plan staleness. "Apply some of it, plan again, and you get the rest" is the
+    /// design's own claim, and this is what checks it.
+    #[test]
+    fn a_failed_apply_leaves_the_folder_resumable() {
+        let target = "vigil.exe"; // required, and not the safety net
+        let sb = Sandbox::ready("resumable");
+        std::fs::remove_file(staging_dir(sb.path()).join(target)).expect("remove staged");
+
+        let plan = Plan {
+            steps: NAMES
+                .iter()
+                .map(|(n, r)| SwapStep {
+                    name: n.to_string(),
+                    required: *r,
+                    digest: sha256::hash(&new_body(n)),
+                })
+                .collect(),
+            skipped: Vec::new(),
+        };
+        let mut check = ok_check();
+        let got = apply(sb.path(), &plan, &mut check, None);
+        assert!(
+            matches!(got, Err(ApplyError::RequiredSwapFailed { ref name, .. }) if name == target),
+            "the test needs a required file to fail, got {got:?}"
+        );
+
+        // The two assertions the contract turns on.
+        assert!(
+            staging_dir(sb.path()).exists(),
+            "a failed apply destroyed the staging folder; there is nothing left to resume from"
+        );
+        assert!(
+            staging_dir(sb.path()).join(READY).exists(),
+            "the ready marker went with it, so a resume would refuse as NotReady"
+        );
+
+        // And the folder really is resumable: put the file back — as a released lock would — and
+        // plan again from what is on disk.
+        std::fs::write(staging_dir(sb.path()).join(target), new_body(target)).expect("re-stage");
+        let mut check2 = ok_check();
+        let out = apply(sb.path(), &sb.plan(), &mut check2, None).expect("resumes");
+        assert!(out.finished(), "{out:?}");
+        assert!(
+            folder_matches(sb.path(), &manifest_of()),
+            "the resume did not finish the job"
+        );
     }
 
     /// **The crash matrix, on Linux.** Stop at every boundary the plan has, and at each one assert
@@ -692,7 +817,6 @@ mod tests {
         // A plan without the safety net has no repair boundaries to stop at.
         let bare = Plan {
             steps: vec![SwapStep {
-                order: 0,
                 name: "vigil-scan.exe".into(),
                 required: true,
                 digest: sha256::hash(b"x"),

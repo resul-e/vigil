@@ -94,10 +94,9 @@ pub struct Request {
 impl Request {
     /// `host:port` as the upstream connector wants it.
     pub fn target(&self) -> String {
-        match &self.addr {
-            Addr::V6(_) => format!("{}:{}", self.addr, self.port),
-            _ => format!("{}:{}", self.addr, self.port),
-        }
+        // Bracketing for IPv6 lives in `impl fmt::Display for Addr`, so every variant formats
+        // the same way here. This used to be a two-arm match with character-identical bodies.
+        format!("{}:{}", self.addr, self.port)
     }
 }
 

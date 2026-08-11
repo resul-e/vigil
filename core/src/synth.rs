@@ -562,6 +562,71 @@ mod tests {
         }
     }
 
+    /// **The extension set is the instrument's calibration, and nothing pinned it.**
+    ///
+    /// This hello is what every size and strategy sweep is measured with, and it only measures
+    /// *censorship* if a real server will complete a handshake with it. Drop `supported_versions`,
+    /// `key_share` or `alpn` and Cloudflare starts refusing it — at which point every cell in every
+    /// sweep is a mixture of the censor and the server, and by the docs' own precedent that reads
+    /// as roughly 9/20 where the truth is 20/20. The instrument would be fabricating findings about
+    /// the network, silently, and the whole suite would stay green.
+    ///
+    /// The temptation is concrete and recorded: dropping those three lowers the 221 B floor toward
+    /// the 175 B the Discord updater emits, which is a length this project has actively wanted to
+    /// reach. See `docs/12-dpi-scan.md` §2 before shortening anything here.
+    #[test]
+    fn the_extension_set_is_exactly_what_a_server_will_complete_a_handshake_with() {
+        let types_in = |ch: &[u8]| -> Vec<u16> {
+            let mut i = 5 + 4 + 2 + 32;
+            i += 1 + ch[i] as usize; // session id
+            let cs = u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
+            i += 2 + cs; // cipher suites
+            i += 1 + ch[i] as usize; // compression methods
+            let end = i + 2 + u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
+            i += 2;
+            let mut out = Vec::new();
+            while i < end {
+                out.push(u16::from_be_bytes([ch[i], ch[i + 1]]));
+                i += 4 + u16::from_be_bytes([ch[i + 2], ch[i + 3]]) as usize;
+            }
+            out
+        };
+
+        let expected = vec![
+            EXT_SERVER_NAME,
+            EXT_EXTENDED_MASTER_SECRET,
+            EXT_RENEGOTIATION_INFO,
+            EXT_SESSION_TICKET,
+            EXT_STATUS_REQUEST,
+            EXT_SUPPORTED_GROUPS,
+            EXT_EC_POINT_FORMATS,
+            EXT_SIGNATURE_ALGORITHMS,
+            EXT_ALPN,
+            EXT_SUPPORTED_VERSIONS,
+            EXT_PSK_KEY_EXCHANGE_MODES,
+            EXT_KEY_SHARE,
+        ];
+
+        // At the floor there is no room for padding, so this is the set exactly.
+        let floor = min_len("discord.com").unwrap();
+        assert_eq!(
+            types_in(&client_hello("discord.com", floor, NONCE).unwrap()),
+            expected,
+            "the fixed extension set changed; a server may now refuse this hello"
+        );
+
+        // Above the floor the only permitted addition is padding, and it comes last.
+        let mut padded = expected.clone();
+        padded.push(EXT_PADDING);
+        for len in [600usize, 1460, 2000] {
+            assert_eq!(
+                types_in(&client_hello("discord.com", len, NONCE).unwrap()),
+                padded,
+                "at {len} B the set must be the fixed extensions plus padding, nothing else"
+            );
+        }
+    }
+
     /// No input, however hostile, may panic the builder.
     #[test]
     fn arbitrary_inputs_never_panic() {

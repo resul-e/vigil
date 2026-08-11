@@ -42,6 +42,9 @@ use crate::model::{self, Command, Snapshot};
 /// a reason. Held only long enough to read or replace it — never across a syscall, and never while
 /// painting.
 static UPDATE: std::sync::Mutex<Option<UpdateState>> = std::sync::Mutex::new(None);
+/// Set by the menu item, cleared when the answer is given. The recurring check never sets it, which
+/// is the whole distinction: a check nobody asked for stays silent, a check somebody pressed answers.
+static ASKED_FOR_A_CHECK: AtomicBool = AtomicBool::new(false);
 
 fn update_state() -> UpdateState {
     UPDATE
@@ -74,15 +77,21 @@ fn updater_path() -> std::path::PathBuf {
 /// Runs on its own thread. A wedged updater on a silently-dropping line is then a separate process
 /// with its own deadlines, and closing the application does not wait for it.
 fn check_for_updates_in_background(owner: HWND) {
+    let hwnd = owner.0 as isize;
     let exe = updater_path();
     if !exe.exists() {
         set_update_state(UpdateState::Unreachable {
             why: "vigil-update.exe is missing".into(),
         });
+        // **This path must repaint too.** It used to `return` before the post, so a user-pressed
+        // "check for updates" in an install missing the updater set the state and told nothing:
+        // no box, no tray change, no repaint of the details window. Whether the state is set from
+        // the thread or from here, the invariant is "this function always ends by posting
+        // `WM_APP_UPDATE`", and it is structural now rather than remembered.
+        post_update_done(hwnd);
         return;
     }
     set_update_state(UpdateState::Checking);
-    let hwnd = owner.0 as isize;
     std::thread::spawn(move || {
         let out = no_window(std::process::Command::new(&exe).arg("--check")).output();
         let state = match out {
@@ -108,16 +117,22 @@ fn check_for_updates_in_background(owner: HWND) {
             .ok()
             .map(|d| d.as_secs());
         let _ = vigil_platform::prefs::write(&prefs);
-        // Repaint from the message thread rather than from here.
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(hwnd as *mut _)),
-                WM_APP_UPDATE,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
+        post_update_done(hwnd);
     });
+}
+
+/// Tell the message thread the update state changed. The only way out of
+/// [`check_for_updates_in_background`], on every path.
+fn post_update_done(hwnd: isize) {
+    // Repaint from the message thread rather than from wherever this was called.
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(hwnd as *mut _)),
+            WM_APP_UPDATE,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
 }
 
 /// Our own messages: "start a check" and "a check finished".
@@ -485,7 +500,16 @@ impl App {
             by_http_connect: self.stats.by_http_connect.load(Relaxed),
             autostart: vigil_platform::autostart::is_enabled(&self.exe),
             learned,
-            exclude_patterns: Vec::new(),
+            // Asked of the engine, never restated here. This was `Vec::new()`, so the one screen a
+            // user opens to check that banking and government domains are untouched said the list
+            // was empty — of the safety rail whose own module header calls it "not an optimisation,
+            // a safety rail". The exclusion itself always worked; only the reporting of it did not.
+            exclude_patterns: self
+                .server
+                .excludes()
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
         }
     }
 }
@@ -858,6 +882,9 @@ fn apply(cmd: Command) -> bool {
         }
         Command::CheckForUpdates => {
             if let Some((owner, _, _)) = handles() {
+                // Remember that a person is waiting for this one. The recurring check must stay
+                // quiet; this one must not. See `answer_for_a_check_the_user_asked_for`.
+                ASKED_FOR_A_CHECK.store(true, AtomicOrdering::SeqCst);
                 check_for_updates_in_background(owner);
                 if let Some(snap) = snapshot_now() {
                     unsafe { refresh_tray(owner, &snap) };
@@ -977,8 +1004,25 @@ fn repaint_full() {
 fn engage(on: bool, listen: &str) -> Result<(), String> {
     // The environment variables go first when engaging and last when disengaging, so at no
     // point is a client told to use a proxy that the registry says is not there.
-    let env = engage_env(on, listen);
-    let r = engage_registry(on, listen);
+    //
+    // **And it did the same thing in both directions until 2026-08-10**, which put the slow half
+    // first on the one path that must not be slow. `engage_env(false)` ends in
+    // `SendMessageTimeoutW(HWND_BROADCAST, …)`, which Windows documents as able to spend its full
+    // timeout *per top-level window* — measured at ~220 ms here, on a machine with 280 of them and
+    // 17 already not responding. Force-terminated inside that broadcast during session end, the
+    // registry restore below never runs at all, and the machine boots pointing at a vigil that is
+    // gone: the 2026-08-06 failure, reached through the very code written to prevent it.
+    //
+    // Disengaging registry-first also loses nothing. The variables' broadcast exists to tell running
+    // applications that the setting changed, and at session end every process that would hear it is
+    // about to die.
+    let (env, r) = if on {
+        let env = engage_env(on, listen);
+        (env, engage_registry(on, listen))
+    } else {
+        let r = engage_registry(on, listen);
+        (engage_env(on, listen), r)
+    };
     // Both are reported, but the registry's failure is the one that decides the outcome: it
     // is what the interface's engaged/stranded state is read from.
     match (&r, env) {
@@ -1101,16 +1145,26 @@ fn forget(host: Option<&str>) {
 /// take a machine's name resolution down, so it snapshots first and always writes a public
 /// fallback after itself. Everything about *what* to write is decided in
 /// `vigil_platform::sysdns`, which is pure and tested.
-/// Is any interface pointed at us, right now, according to Windows?
+/// Is any interface pointed at us **that we hold a snapshot for**, right now, according to
+/// Windows?
+///
+/// The snapshot half is what makes this "engaged" rather than "something local answers DNS here":
+/// a user running AdGuard or dnscrypt-proxy has an adapter on `127.0.0.1` that vigil never wrote
+/// and cannot put back, and answering `true` for that makes the quit path delete their
+/// configuration. See `sysdns::ours_to_restore`.
 ///
 /// `None` when the interfaces could not be read at all, which is the only case where there is
 /// nothing better to do than keep believing what was there before.
 fn read_back_dns_engaged() -> Option<bool> {
-    use vigil_platform::{dnsclient, sysdns};
+    use vigil_platform::{dnsclient, paths, sysdns};
 
+    let snapshot: Vec<sysdns::Interface> = paths::dns_snapshot()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| sysdns::parse(&t))
+        .unwrap_or_default();
     dnsclient::read_interfaces()
         .ok()
-        .map(|ifaces| !sysdns::stranded(&ifaces).is_empty())
+        .map(|ifaces| !sysdns::ours_to_restore(&ifaces, &snapshot).is_empty())
 }
 
 fn set_system_dns(on: bool) -> Result<bool, DnsFailure> {
@@ -1156,17 +1210,24 @@ fn set_system_dns(on: bool) -> Result<bool, DnsFailure> {
         }
         Ok(true)
     } else {
-        let stranded: Vec<sysdns::Interface> =
-            sysdns::stranded(&ifaces).into_iter().cloned().collect();
-        if stranded.is_empty() {
-            return Ok(false);
-        }
         let snapshot: Vec<sysdns::Interface> = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|t| sysdns::parse(&t))
             .unwrap_or_default();
-        let changes: Vec<(u32, Option<Vec<String>>)> = stranded
+        // **Only interfaces we hold a snapshot for.** `stranded` alone also matches a loopback
+        // resolver somebody else configured — AdGuard, dnscrypt-proxy, YogaDNS — which vigil
+        // deliberately never wrote to and so never snapshotted. Restoring one of those took the
+        // `None` branch below, and `None` means "back to DHCP": a user who never touched the DNS
+        // menu got a consent prompt on quit and lost their own resolver configuration.
+        let mine: Vec<sysdns::Interface> = sysdns::ours_to_restore(&ifaces, &snapshot)
+            .into_iter()
+            .cloned()
+            .collect();
+        if mine.is_empty() {
+            return Ok(false);
+        }
+        let changes: Vec<(u32, Option<Vec<String>>)> = mine
             .iter()
             .map(|i| {
                 (
@@ -1260,6 +1321,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
             if let Some(full) = full_window() {
                 unsafe {
                     let _ = InvalidateRect(Some(full), None, true);
+                }
+            }
+            // A check the user pressed gets an answer. A check that happened by itself does not:
+            // the flag is only set by the menu item, and it is cleared here whichever way it goes.
+            if ASKED_FOR_A_CHECK.swap(false, AtomicOrdering::SeqCst) {
+                let state = UPDATE
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_default();
+                if let Some(answer) = state.answer_for_a_check_the_user_asked_for(lang()) {
+                    message_box(&answer);
                 }
             }
             LRESULT(0)
@@ -1577,9 +1650,13 @@ pub fn run() {
                 dns: dns_stats,
                 // Read once at startup: a machine already pointing at us — because a previous
                 // run left it that way — must show as engaged rather than as a fresh start.
-                dns_engaged: vigil_platform::dnsclient::read_interfaces()
-                    .map(|i| !vigil_platform::sysdns::stranded(&i).is_empty())
-                    .unwrap_or(false),
+                //
+                // Through the snapshot, not through `stranded` alone: a user whose adapter points
+                // at *their own* local DNS proxy would otherwise see the item ticked on a vigil
+                // that had done nothing, and — worse — `restore_host()` would then act on it at
+                // quit and hand that adapter back to DHCP. The tray must not claim an engagement
+                // it has no record of and therefore cannot undo.
+                dns_engaged: read_back_dns_engaged().unwrap_or(false),
             })
         });
 

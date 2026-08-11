@@ -29,9 +29,9 @@ impl CellResult {
 /// How a network refuses a name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mechanism {
-    /// Injected TCP reset. Türk Telekom and Superonline fibre both do this.
+    /// Injected TCP reset. the home line and SansürOn fibre both do this.
     ResetInjection,
-    /// Silent drop. Turkcell mobile does this, and it needs a different countermeasure.
+    /// Silent drop. SansürOn mobile does this, and it needs a different countermeasure.
     SilentDrop,
     /// The connection completed but the far end was not the far end.
     Interception,
@@ -289,13 +289,25 @@ pub fn render(ctx: &Context, results: &[CellResult], dns: &[Comparison]) -> Stri
         s.push_str("2. IS IT THE NAME OR THE ADDRESS?\n");
         s.push_str(&bar(78));
         s.push('\n');
-        s.push_str("The same server, asked for a permitted name. If these succeed, the block is\n");
-        s.push_str("triggered by the name in the TLS handshake, not by the address.\n");
+        // **"The same server" was a claim this run does not establish.** The column printed a
+        // borrowed *hostname*, never an address, and the two cells resolve independently — a CDN
+        // name has many addresses, so the permitted name may well have been asked of a different
+        // machine. The address actually dialled is in `r.addr` and is now printed, which is the
+        // evidence the section was pretending to.
+        s.push_str(
+            "An address the blocked host resolves to, asked for a permitted name. If these\n",
+        );
+        s.push_str(
+            "succeed, the block is triggered by the name in the TLS handshake, not by the\n",
+        );
+        s.push_str("address. (Both cells resolve on their own, so the address is printed rather\n");
+        s.push_str("than assumed to be shared.)\n");
         for r in &same {
             s.push_str(&format!(
-                "  {:<26} at {:<22} {:>3}/{:<2}  {}\n",
+                "  {:<26} at {:<22} ({:<21}) {:>3}/{:<2}  {}\n",
                 r.cell.host,
                 r.cell.via_host_addr.clone().unwrap_or_default(),
+                r.addr,
                 r.tally.successes(),
                 r.tally.trials(),
                 r.tally.verdict()
@@ -313,14 +325,32 @@ pub fn render(ctx: &Context, results: &[CellResult], dns: &[Comparison]) -> Stri
         s.push_str("3. WHAT DEFEATS IT\n");
         s.push_str(&bar(78));
         s.push('\n');
-        let mut hosts: Vec<&str> = strat.iter().map(|r| r.cell.host.as_str()).collect();
-        hosts.dedup();
+        // **Every host once, whatever order the cells arrived in.** This was `Vec::dedup`, which
+        // removes only *consecutive* duplicates — so when a cell for the first host was appended
+        // after the second host's cells (which is exactly what the browser-sized transform cells
+        // do), the list became `[first, second, first]` and the first host's whole block was
+        // rendered **twice**, identical rows and all.
+        let mut hosts: Vec<&str> = Vec::new();
+        for r in &strat {
+            let h = r.cell.host.as_str();
+            if !hosts.contains(&h) {
+                hosts.push(h);
+            }
+        }
         for h in hosts {
             s.push_str(&format!("  {h}\n"));
             for r in strat.iter().filter(|r| r.cell.host == h) {
+                // The length belongs in the label when the cell fixes one. Without it, the same
+                // strategy measured at two ClientHello sizes renders as two identical labels with
+                // different numbers — which reads as a contradiction rather than as a finding, and
+                // the finding is the whole reason those cells exist.
+                let label = match r.cell.client_hello_len {
+                    Some(n) => format!("{} @{n}B", r.cell.strategy),
+                    None => r.cell.strategy.clone(),
+                };
                 s.push_str(&format!(
                     "    {:<20} {:>3}/{:<2}  {:<11} {}\n",
-                    r.cell.strategy,
+                    label,
                     r.tally.successes(),
                     r.tally.trials(),
                     r.tally.verdict().to_string(),
@@ -481,7 +511,7 @@ mod tests {
         assert_eq!(mechanism(&t, &[]), Mechanism::SilentDrop);
     }
 
-    /// Turkcell mobile closes rather than resetting; that is still a silent drop, and it needs
+    /// SansürOn mobile closes rather than resetting; that is still a silent drop, and it needs
     /// a different countermeasure from an injector.
     #[test]
     fn closes_count_as_a_silent_drop() {
@@ -684,5 +714,49 @@ mod tests {
     fn rendering_an_empty_run_does_not_panic() {
         let text = render(&Context::default(), &[], &[]);
         assert!(text.contains("RUN IS VOID"));
+    }
+
+    /// **Every host once, and two lengths of the same strategy told apart.**
+    ///
+    /// Two defects in one line of rendering. `Vec::dedup` removes only *consecutive* duplicates, so
+    /// a cell for the first host arriving after the second host's cells — which is exactly what the
+    /// browser-sized transform cells do — rendered the first host's entire block twice. And the row
+    /// label was the strategy alone, so the same transform measured at two ClientHello sizes printed
+    /// two identical labels with different results, which reads as a contradiction instead of as the
+    /// finding those cells exist to produce.
+    #[test]
+    fn section_three_lists_each_host_once_and_labels_the_hello_length() {
+        let mut small = result(Phase::Strategy, "a.example", &vec![Outcome::Ok; 8]);
+        small.cell.strategy = "tlsrec:64".into();
+        let mut other = result(Phase::Strategy, "b.example", &vec![Outcome::Ok; 8]);
+        other.cell.strategy = "tlsrec:64".into();
+        // Appended after the second host, and at a browser-sized hello.
+        let mut large = result(Phase::Strategy, "a.example", &vec![Outcome::Timeout; 8]);
+        large.cell.strategy = "tlsrec:64".into();
+        large.cell.client_hello_len = Some(1800);
+
+        let text = render(&Context::default(), &[small, other, large], &[]);
+        let section = text
+            .split("3. WHAT DEFEATS IT")
+            .nth(1)
+            .expect("section 3")
+            .split("4. ")
+            .next()
+            .expect("end of section");
+
+        assert_eq!(
+            section.matches("  a.example\n").count(),
+            1,
+            "the host is listed twice:\n{section}"
+        );
+        assert!(
+            section.contains("tlsrec:64 @1800B"),
+            "the large-hello cell must say so:\n{section}"
+        );
+        // And the ordinary cell keeps its plain label, so nothing else in the report moves.
+        assert!(
+            section.contains("tlsrec:64  "),
+            "the minimum-length cell keeps its plain label:\n{section}"
+        );
     }
 }

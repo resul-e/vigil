@@ -39,7 +39,20 @@ pub const NAMES: [&str; 4] = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROX
 /// engine's own exclude list: those hosts are already passed through untouched, and repeating
 /// it here means a client that reads `NO_PROXY` never even opens the connection — the
 /// step-8 promise holds one layer earlier.
-pub const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1,*.com.tr,*.gov.tr,*.edu.tr,*.org.tr";
+///
+/// **The suffixes are written `.com.tr`, not `*.com.tr`, and that one character is the whole
+/// value of the entry.** The curl convention — which curl, git, pip and Python's urllib all
+/// implement — matches a leading dot as "this domain and any subdomain of it"; a literal `*` is
+/// not a wildcard, it is a character that appears in no hostname. Measured against Windows' own
+/// curl 8.21.0: with the starred form a request to a `.gov.tr` host went **through the proxy**,
+/// and with the dotted form it went direct. (Go strips a leading `*`, so the old value was not
+/// universally dead — just dead everywhere it mattered here.)
+///
+/// The engine enforces the exclusion anyway, one layer down and with tests, so nothing was
+/// unprotected. What was broken is the promise this constant makes on its own: after a vigil that
+/// died without restoring, a working `NO_PROXY` is what keeps banking and e-Devlet reachable for
+/// every command-line tool on the machine.
+pub const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1,.com.tr,.gov.tr,.edu.tr,.org.tr";
 
 /// The environment as it stands: the values of [`NAMES`], `None` where unset.
 ///
@@ -107,15 +120,56 @@ pub fn ours(listen: &str) -> EnvProxy {
 ///
 /// Only the three proxy variables decide it. `NO_PROXY` is a list that anyone may extend, and
 /// treating a changed `NO_PROXY` as "not ours" would strand the other three.
+/// Compared **exactly**, not by substring: `http://127.0.0.1:1080` is a substring of
+/// `http://127.0.0.1:10809`, which is v2rayN's default, and reading a third party's proxy as ours
+/// means deleting their variables on the way out. A trailing slash is tolerated because both forms
+/// are written by hand and mean the same thing.
 pub fn points_at_us(current: &EnvProxy, listen: &str) -> bool {
     let url = url_for(listen);
-    let mentions = |v: &Option<String>| v.as_deref().is_some_and(|s| s.contains(&url));
-    mentions(&current.http) || mentions(&current.https) || mentions(&current.all)
+    let want = url.trim_end_matches('/');
+    let same = |v: &Option<String>| {
+        v.as_deref()
+            .is_some_and(|s| s.trim().trim_end_matches('/') == want)
+    };
+    same(&current.http) || same(&current.https) || same(&current.all)
 }
 
 /// Set by something that is not us, and therefore not ours to overwrite.
 pub fn belongs_to_someone_else(current: &EnvProxy, listen: &str) -> bool {
     !current.is_empty() && !points_at_us(current, listen)
+}
+
+/// What `vigil-repair` should write for the environment variables, given the snapshot it found.
+///
+/// Pure, and its own function because the tool that calls it has **no tests at all** and this is the
+/// decision that matters in it.
+///
+/// **It always has an answer**, which is why it returns an `EnvProxy` and not an `Option`. It had
+/// an `Option` no arm made `None` and a `force` parameter no arm read, and the cost was a dead match
+/// arm in the caller carrying a confident message — the same shape as the arm that was deleted from
+/// the registry half, reintroduced in the same file on the same night.
+///
+/// Called only once the caller has established that a repair is wanted — either `is_stranded`
+/// matched, or `--force`. That precondition is what condemns the behaviour this replaced: reaching
+/// the no-snapshot case without `--force` *means* a variable is pointing at a loopback listener, so
+/// printing "these variables are not vigil's, leaving them alone" and **returning success** was false
+/// by construction, and it left `git`, `pip`, `npm`, `curl` and Roblox talking to a dead port while
+/// the tool people are told to run when their internet dies reported that it had repaired something.
+///
+/// **What it still cannot tell** is a dead vigil from another local proxy on a port we do not use:
+/// both look like "a loopback address with no snapshot of ours". Clearing is the right answer for the
+/// first and destroys a configuration in the second. The missing question is whether anything is
+/// listening there, which is I/O and therefore not this function's to ask.
+///
+/// The registry half has always cleared in this case, for the reason stated there: leaving a machine
+/// pointing at a listener that is gone is the worst of the available options.
+pub fn repair_target(snapshot: Option<&str>) -> EnvProxy {
+    match snapshot {
+        Some(t) => snapshot_from_text(t),
+        // No snapshot, and the caller has already established a repair is wanted — so a variable
+        // names a loopback listener that is not answering. Clear it.
+        None => EnvProxy::default(),
+    }
 }
 
 /// A machine left pointing at a vigil that is not there.
@@ -208,6 +262,50 @@ pub fn snapshot_from_text(t: &str) -> EnvProxy {
 
 #[cfg(test)]
 mod tests {
+
+    /// The safety net must not report success while leaving the machine broken.
+    ///
+    /// Reaching the no-snapshot case at all means a variable points at loopback — that is the
+    /// caller's precondition — so "not ours, leaving them alone" was a false statement with a
+    /// `true` return behind it. Both arms now write something.
+    #[test]
+    fn repair_always_has_an_answer_once_a_repair_is_wanted() {
+        // With a snapshot: exactly what was there, including a state with nothing in it.
+        let back = repair_target(Some("HTTPS_PROXY=http://corp:8080\n"));
+        assert_eq!(back.https.as_deref(), Some("http://corp:8080"));
+
+        // Without one: cleared. This is the case that used to be a no-op claiming success.
+        assert!(
+            repair_target(None).is_empty(),
+            "a stranded machine with no snapshot must be cleared"
+        );
+    }
+
+    /// The environment half of the same mistake: `http://127.0.0.1:1080` is a substring of
+    /// `http://127.0.0.1:10809`. Reading a third party's variables as ours means deleting them —
+    /// including their `NO_PROXY` — when vigil exits.
+    #[test]
+    fn a_longer_port_in_the_variables_is_somebody_elses() {
+        let theirs = EnvProxy {
+            http: Some("http://127.0.0.1:10809".into()),
+            https: Some("http://127.0.0.1:10809".into()),
+            all: None,
+            no_proxy: None,
+        };
+        assert!(!points_at_us(&theirs, "127.0.0.1:1080"));
+        // Still ours with or without the trailing slash people type by hand.
+        for v in ["http://127.0.0.1:1080", "http://127.0.0.1:1080/"] {
+            let ours = EnvProxy {
+                http: None,
+                https: Some(v.into()),
+                all: None,
+                no_proxy: None,
+            };
+            assert!(points_at_us(&ours, "127.0.0.1:1080"), "{v}");
+        }
+        // And a strand is still a strand on any port, which is what vigil-repair asks.
+        assert!(is_stranded(&theirs, "127.0.0.1:"));
+    }
     use super::*;
 
     const LISTEN: &str = "127.0.0.1:1080";
@@ -261,20 +359,34 @@ mod tests {
     }
 
     /// The one thing a client must never do is send `localhost` through us.
+    ///
+    /// **This test used to pin the bug it was written to prevent.** It asserted `*.gov.tr`, so
+    /// writing the value that curl actually honours turned it red — a test that fails when the code
+    /// is corrected is worse than no test. The entries are now checked as whole comma-separated
+    /// fields, and the starred form is asserted **absent**, because a `*` in a `NO_PROXY` list is a
+    /// character that matches no hostname anywhere the convention is implemented properly.
     #[test]
-    fn loopback_and_the_turkish_suffixes_are_excluded() {
+    fn loopback_and_the_turkish_suffixes_are_excluded_in_the_form_clients_honour() {
         let o = ours(LISTEN);
         let no = o.no_proxy.unwrap_or_default();
+        let fields: Vec<&str> = no.split(',').map(str::trim).collect();
         for must in [
             "localhost",
             "127.0.0.1",
-            "*.gov.tr",
-            "*.com.tr",
-            "*.edu.tr",
-            "*.org.tr",
+            ".gov.tr",
+            ".com.tr",
+            ".edu.tr",
+            ".org.tr",
         ] {
-            assert!(no.contains(must), "{must} missing from NO_PROXY: {no}");
+            assert!(
+                fields.contains(&must),
+                "{must} missing from NO_PROXY as a whole entry: {no}"
+            );
         }
+        assert!(
+            !no.contains('*'),
+            "a literal * matches no hostname in the curl convention: {no}"
+        );
     }
 
     #[test]

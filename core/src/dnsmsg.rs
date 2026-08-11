@@ -1,6 +1,6 @@
 //! DNS message encoding and decoding. Pure — no sockets, no clock.
 //!
-//! This exists because the system resolver cannot be trusted. Measured on Türk Telekom,
+//! This exists because the system resolver cannot be trusted. Measured on the home line,
 //! 2026-08-04: the ISP resolver answered `discord.com`, `updates.discord.com`,
 //! `cdn.discordapp.com`, `roblox.com` and `4chan.org` with `195.175.254.2` — its own block
 //! page — and outbound queries for exactly those names to `1.1.1.1`, `9.9.9.9` and `8.8.8.8`
@@ -29,8 +29,20 @@ pub enum Error {
     BadName,
     /// The response was not a well-formed answer to our question.
     Malformed,
-    /// A well-formed response carrying no A record.
+    /// A well-formed response carrying no A record: NOERROR with an empty answer section
+    /// (NODATA), or NXDOMAIN. **An authoritative "there is nothing here."**
     NoAddress,
+    /// The server answered that it could not answer: SERVFAIL, REFUSED, NOTIMP, FORMERR.
+    ///
+    /// This is **not** [`Self::NoAddress`] and the distinction is the whole point of the variant.
+    /// On the wire the two are the same shape — our id, QR set, one question, zero answers — so
+    /// until this existed a rate-limited or DNSSEC-failing upstream was recorded as an
+    /// authoritative "this name does not exist". The caller's fallback sweep exists precisely so
+    /// that one bad upstream cannot take a name down, and the sweep stops on an authoritative no:
+    /// so one REFUSED from the first resolver stopped the sweep, was negative-cached for 20 s,
+    /// and every program on the machine got SERVFAIL for a name the next resolver would have
+    /// answered correctly.
+    SoftFailure,
     /// Nothing came back.
     NoReply,
 }
@@ -41,6 +53,7 @@ impl core::fmt::Display for Error {
             Error::BadName => "bad name",
             Error::Malformed => "malformed response",
             Error::NoAddress => "no A record",
+            Error::SoftFailure => "server could not answer",
             Error::NoReply => "no reply",
         })
     }
@@ -110,6 +123,18 @@ pub fn decode_answers(buf: &[u8], id: u16) -> Result<Vec<Ipv4Addr>, Error> {
     }
     if buf[2] & 0x80 == 0 {
         return Err(Error::Malformed); // not a response
+    }
+    // Byte 3's low nibble is the rcode, and reading it is the difference between "this name does
+    // not exist" and "this server is having a bad day". Only NOERROR (0 — NODATA when the answer
+    // section is empty) and NXDOMAIN (3) are answers *about the name*; everything else is the
+    // server declining, and telling the caller that a name is absent on the strength of a REFUSED
+    // is how one rate-limited upstream takes a hostname down for the whole machine.
+    //
+    // After the id check above, deliberately: a forged failure carrying somebody else's id stays
+    // `Malformed` rather than becoming a cheap way to make us give up on a name.
+    let rcode = buf[3] & 0x0F;
+    if rcode != 0 && rcode != 3 {
+        return Err(Error::SoftFailure);
     }
     let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let an = u16::from_be_bytes([buf[6], buf[7]]) as usize;
@@ -550,6 +575,80 @@ mod tests {
     fn a_response_with_no_a_record_says_so() {
         let r = response(5, &[]);
         assert_eq!(decode_answers(&r, 5), Err(Error::NoAddress));
+    }
+
+    /// **"This server could not answer" must not read as "this name does not exist".**
+    ///
+    /// The two are identical on the wire apart from four bits in byte 3 — same id, QR set, one
+    /// question, zero answers — and this decoder used to read byte 2 and skip straight past byte 3.
+    /// So a rate-limited or DNSSEC-failing upstream produced `NoAddress`, which the resolver treats
+    /// as an authoritative no: sweep stopped at the first server, name negative-cached for the
+    /// whole machine. NXDOMAIN(3) and NOERROR(0) are the only two rcodes that say anything about
+    /// the *name*, and they must stay on the `NoAddress` path or `wpad` — NXDOMAIN here and asked
+    /// for constantly by Windows — goes back to sweeping four upstreams on every single ask.
+    #[test]
+    fn a_server_failure_is_not_an_authoritative_no() {
+        let question = parse_question(&encode_query("busy.example", 11).unwrap()).unwrap();
+        let query = encode_query("busy.example", 11).unwrap();
+        let with = |rcode: u8| {
+            decode_answers(
+                &encode_response(&query, &question, &[], 30, rcode).unwrap(),
+                11,
+            )
+        };
+
+        // The name says nothing about itself: authoritative, cacheable, stops the sweep.
+        assert_eq!(with(0), Err(Error::NoAddress), "NOERROR/NODATA");
+        assert_eq!(with(3), Err(Error::NoAddress), "NXDOMAIN");
+
+        // The server says something about itself: keep asking, remember nothing.
+        assert_eq!(with(RCODE_SERVFAIL), Err(Error::SoftFailure), "SERVFAIL");
+        assert_eq!(with(5), Err(Error::SoftFailure), "REFUSED");
+        assert_eq!(with(4), Err(Error::SoftFailure), "NOTIMP");
+        assert_eq!(with(1), Err(Error::SoftFailure), "FORMERR");
+
+        // A failure carrying *someone else's* id stays a forgery, not a reason to give up: the id
+        // check has to come first, or an off-path spoofer gets a cheap way to kill a name.
+        assert_eq!(
+            decode_answers(
+                &encode_response(&query, &question, &[], 30, RCODE_SERVFAIL).unwrap(),
+                999
+            ),
+            Err(Error::Malformed)
+        );
+    }
+
+    /// **An A record whose `rdlen` is not 4 must be skipped, not read as an address.**
+    ///
+    /// The guard is `rtype == 1 && rdlen == 4`, and the `rdlen` half had no test: dropping it makes
+    /// `Ipv4Addr::new(data[0], .., data[3])` index a slice that may be shorter, panicking the
+    /// thread that parses replies for the whole machine — on input that arrives from the network,
+    /// from anybody who can guess a source port.
+    #[test]
+    fn an_a_record_with_the_wrong_length_is_skipped_rather_than_read() {
+        // A well-formed response, then its single answer's rdlen bent to 2 with the body cut to
+        // match, so the record is internally consistent and only its *type* is a lie.
+        let good = response(21, &[v4(9, 9, 9, 9)]);
+        let mut bent = good.clone();
+        let n = bent.len();
+        // rdlen is the last two bytes before the 4-byte body.
+        bent[n - 6] = 0;
+        bent[n - 5] = 2;
+        bent.truncate(n - 2);
+        assert_eq!(
+            decode_answers(&bent, 21),
+            Err(Error::NoAddress),
+            "a 2-byte A record is not an address and must not be read as one"
+        );
+
+        // And the same at every length from 0 to 8, none of which may panic.
+        for rdlen in 0u16..=8 {
+            let mut b = response(22, &[v4(1, 2, 3, 4)]);
+            let n = b.len();
+            b[n - 6] = (rdlen >> 8) as u8;
+            b[n - 5] = (rdlen & 0xFF) as u8;
+            let _ = decode_answers(&b, 22);
+        }
     }
 
     #[test]

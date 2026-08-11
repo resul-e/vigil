@@ -33,6 +33,10 @@ use crate::manifest::{FileEntry, Manifest};
 pub struct Digests(Vec<(String, Digest)>);
 
 impl Digests {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn new() -> Digests {
         Digests(Vec::new())
     }
@@ -55,10 +59,6 @@ impl Digests {
     pub fn len(&self) -> usize {
         self.0.len()
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 impl FromIterator<(String, Digest)> for Digests {
@@ -70,7 +70,6 @@ impl FromIterator<(String, Digest)> for Digests {
 /// One replacement to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwapStep {
-    pub order: u32,
     pub name: String,
     /// Whether failing this one fails the whole update.
     pub required: bool,
@@ -136,10 +135,6 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn is_empty(&self) -> bool {
-        self.steps.is_empty()
-    }
-
     /// Is the folder already exactly what the manifest describes?
     pub fn nothing_to_do(&self) -> bool {
         self.steps.is_empty()
@@ -187,7 +182,6 @@ pub fn plan(m: &Manifest, on_disk: &Digests, staged: &Digests) -> Result<Plan, R
 
 fn step(f: &FileEntry) -> SwapStep {
     SwapStep {
-        order: f.order,
         name: f.name.clone(),
         required: f.required,
         digest: f.digest,

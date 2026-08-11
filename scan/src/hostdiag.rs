@@ -9,7 +9,7 @@
 //! is undocumented, and a diagnostic that wrote to it could take somebody's machine off the
 //! internet in a way `vigil-repair` was never designed to undo.
 //!
-//! It exists because of the 2026-08-07 Superonline run: every network measurement said the
+//! It exists because of the 2026-08-07 SansürOn run: every network measurement said the
 //! block was defeated, and Discord's Chromium half never sent us a single request. Nothing in
 //! the report could distinguish "Chromium never asked" from "Chromium asked and went direct",
 //! and the four candidate explanations all lived in registry values the tool never read.
@@ -72,6 +72,16 @@ pub struct HostFacts {
     /// Facts about the Discord install: which `app-*` directories exist, what the Squirrel log
     /// last said, whether the update-skip keys are set.
     pub discord: Vec<(String, String)>,
+    /// **Anything else on this machine that also touches the same packets.** See [`rivals`].
+    pub rivals: Vec<(String, String)>,
+    /// **Which resolvers this machine is actually configured with**, per interface.
+    ///
+    /// The DNS half of the report asks four public resolvers and compares them against the *system*
+    /// resolver — and "the system resolver" means whatever this machine happens to be pointed at.
+    /// Every bypass tool configures DNS as its first step, so a `system=` column can silently be
+    /// describing a resolver the user set months ago rather than the provider's. `read_interfaces()`
+    /// has existed in `platform` since the DNS work and nothing in `scan/` ever called it.
+    pub resolvers: Vec<(String, String)>,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -96,6 +106,40 @@ pub fn scrub(s: &str, profile: Option<&str>) -> String {
     }
     out.push_str(&s[at..]);
     out
+}
+
+/// Does this process name belong to another tool that bypasses DPI?
+///
+/// Pure and matched case-insensitively on a substring, because these ship under names like
+/// `ByeByeDPI_new.exe`, `zapret-winws.exe` and `goodbyedpi-x86_64.exe`, and a volunteer's copy is
+/// as likely to be renamed as not. A substring match over-reports rather than under-reports, which
+/// is the right direction: the cost of a false positive is one puzzled line in a report, and the
+/// cost of a false negative is a day spent explaining a measurement that two tools produced
+/// together.
+///
+/// The list cannot be complete and does not have to be — the WinDivert driver check beside it
+/// catches the family, whatever a given member is called.
+///
+/// There was a guard here against matching our own binaries. Mutation testing removed it and no
+/// test went red, which is the answer: none of our names contains any of these substrings, so the
+/// guard defended nothing. The test that asserts it stays — it is the guard now, and it will fail
+/// the day somebody adds an entry short enough to catch us.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn looks_like_a_rival(name: &str) -> bool {
+    const KNOWN: [&str; 10] = [
+        "byebyedpi",
+        "byedpi",
+        "goodbyedpi",
+        "zapret",
+        "winws",
+        "spoofdpi",
+        "greendpi",
+        "powertunnel",
+        "nodpi",
+        "sikedpi",
+    ];
+    let lower = name.to_ascii_lowercase();
+    KNOWN.iter().any(|k| lower.contains(k))
 }
 
 /// The line that belongs at the *top* of the report, not in a numbered section halfway down.
@@ -232,6 +276,40 @@ pub fn render(f: &HostFacts) -> String {
         }
     }
 
+    if !f.resolvers.is_empty() {
+        s.push_str("\n  Bu makine hangi DNS sunucularını kullanıyor?\n");
+        for (k, v) in &f.resolvers {
+            s.push_str(&format!("    {k:<28} {v}\n"));
+        }
+        s.push_str(
+            "    NOT: DNS bölümündeki \"system\" kolonu bunları kullanıyor. Yukarıda (ELLE)\n\
+             \x20        yazıyorsa o çözümleyici bu makinede elle ayarlanmış, yani o kolon\n\
+             \x20        sağlayıcının DNS'i hakkında bir şey söylemez. (DHCP) ise söyler.\n",
+        );
+    }
+
+    s.push_str("\n  Aynı paketlere dokunan başka bir şey var mı?\n");
+    if f.rivals.is_empty() {
+        // Read at one instant, before anything was measured — so it cannot claim anything about the
+        // half-hour that follows, and it used to say "in this measurement". The run repoints the
+        // machine's proxy for ten minutes plus the watch window, which is exactly when somebody
+        // whose fallback is another tool would reach for it.
+        s.push_str(
+            "    ölçüm BAŞLARKEN yok — o anda vigil'den başka bir engel aşma aracı
+                 görünmüyordu. Sonradan açılmışsa bu satır onu bilmez.
+",
+        );
+    } else {
+        for (k, v) in &f.rivals {
+            s.push_str(&format!("    {k:<28} {v}\n"));
+        }
+        s.push_str(
+            "    NOT: yukarıdakilerden biri ÇALIŞIYOR yazıyorsa, bu raporun BÜTÜN\n\
+             \x20        ölçümleri (yukarıdaki bölümler dahil) iki aracın ortak sonucudur,\n\
+             \x20        vigil'in değil — o hâlde ölçümü onlar kapalıyken tekrarla.\n",
+        );
+    }
+
     s
 }
 
@@ -242,6 +320,8 @@ pub fn collect() -> HostFacts {
         wpad: imp::wpad(),
         packaged: imp::packaged("roblox"),
         discord: imp::discord(),
+        rivals: imp::rivals(),
+        resolvers: imp::resolvers(),
     }
 }
 
@@ -416,6 +496,108 @@ mod imp {
         }
         out
     }
+
+    /// **What else on this machine is doing the same job as vigil.**
+    ///
+    /// Added 2026-08-09, after a volunteer's screenshot showed him running ByeByeDPI — one of this
+    /// project's own deleted iterations — on the line whose reports we had been reading for two
+    /// days. It was closed during the tests, and that mattered enormously, and **no report could
+    /// have said so**. A WinDivert filter is invisible from where vigil sits: it takes packets out
+    /// of the stack below every socket we own.
+    ///
+    /// An hour was spent on a wrong theory that a single line in the report would have killed. So
+    /// the report says it now. Two questions, both read-only:
+    ///
+    /// 1. Is a **WinDivert driver** installed or running? That is the mechanism every tool in this
+    ///    family uses on Windows, whatever it calls itself, so it catches ones not on any list.
+    /// 2. Is a process running whose name is one of the known tools?
+    ///
+    /// Names only, never paths or command lines: a report gets forwarded.
+    pub fn rivals() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+
+        // The driver, by its service key and by the file it loads. `WinDivert` since 2.x,
+        // `WinDivert1.4` and `WinDivert1.3` for the versions the older tools carry.
+        for svc in ["WinDivert", "WinDivert1.4", "WinDivert1.3"] {
+            if let Ok(k) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(
+                    format!(r"SYSTEM\CurrentControlSet\Services\{svc}"),
+                    winreg::enums::KEY_READ,
+                )
+            {
+                let start: Option<u32> = k.get_value("Start").ok();
+                out.push((
+                    format!("{svc} servisi"),
+                    match start {
+                        Some(4) => "kayıtlı, kapalı".to_string(),
+                        Some(n) => format!("KAYITLI (Start={n})"),
+                        None => "kayıtlı".to_string(),
+                    },
+                ));
+            }
+        }
+        if std::path::Path::new(r"C:\Windows\System32\drivers\WinDivert64.sys").exists() {
+            out.push((
+                "WinDivert64.sys".into(),
+                "System32\\drivers içinde duruyor".into(),
+            ));
+        }
+
+        // And the tools themselves, by process name. The decision is `looks_like_a_rival`, which
+        // is pure and tested on Linux; this half only supplies the names.
+        for name in running_process_names() {
+            if super::looks_like_a_rival(&name) {
+                out.push(("ÇALIŞIYOR".into(), name));
+            }
+        }
+        out
+    }
+
+    /// Every running process's image name, from `CreateToolhelp32Snapshot`. Names only.
+    fn running_process_names() -> Vec<String> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        };
+        let mut out = Vec::new();
+        let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+            return out;
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: core::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if unsafe { Process32FirstW(snap, &mut e) }.is_ok() {
+            loop {
+                let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(0);
+                if n > 0 {
+                    out.push(String::from_utf16_lossy(&e.szExeFile[..n]));
+                }
+                if unsafe { Process32NextW(snap, &mut e) }.is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(snap) };
+        out
+    }
+
+    /// Every interface's configured DNS servers, and whether they came from DHCP or were set by
+    /// hand. Names and addresses of *resolvers*, which is what the DNS section compares against —
+    /// no user data.
+    pub fn resolvers() -> Vec<(String, String)> {
+        match vigil_platform::dnsclient::read_interfaces() {
+            Err(_) => Vec::new(),
+            Ok(ifaces) => ifaces
+                .into_iter()
+                .filter(|i| !i.servers.is_empty())
+                .map(|i| {
+                    let how = if i.is_dhcp() { "DHCP" } else { "ELLE" };
+                    (i.alias.clone(), format!("{} ({how})", i.servers.join(", ")))
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -430,11 +612,60 @@ mod imp {
     pub fn discord() -> Vec<(String, String)> {
         Vec::new()
     }
+    pub fn rivals() -> Vec<(String, String)> {
+        Vec::new()
+    }
+    pub fn resolvers() -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The report has to be able to say what else was running.** A volunteer's screenshot on
+    /// 2026-08-09 showed him running ByeByeDPI on the line whose reports we had been reading for
+    /// two days; it was closed during the tests, which mattered enormously, and no report could
+    /// have said so. The names are the ones actually seen in the wild, renamed the way people
+    /// rename them.
+    #[test]
+    fn the_tools_people_actually_run_are_recognised_however_they_renamed_them() {
+        for name in [
+            "ByeByeDPI_new.exe",
+            "byebyedpi.exe",
+            "GoodbyeDPI.exe",
+            "goodbyedpi-x86_64.exe",
+            "zapret-winws.exe",
+            "winws.exe",
+            "ByeDPI.exe",
+            "SpoofDPI.exe",
+            "PowerTunnel.exe",
+            "NoDPI_v2_final.exe",
+        ] {
+            assert!(super::looks_like_a_rival(name), "missed {name}");
+        }
+    }
+
+    /// And the ordinary machine is not accused of anything — least of all by us, about us.
+    #[test]
+    fn nothing_ordinary_is_mistaken_for_one_and_neither_are_we() {
+        for name in [
+            "chrome.exe",
+            "Discord.exe",
+            "svchost.exe",
+            "RobloxPlayerBeta.exe",
+            "Update.exe",
+            "explorer.exe",
+            // Ours. `vigil-scan.exe` reporting itself as a rival would be worse than reporting
+            // nothing, and `nodpi` is a substring away from more names than it looks.
+            "vigil-app.exe",
+            "vigil-scan.exe",
+            "vigil-update.exe",
+        ] {
+            assert!(!super::looks_like_a_rival(name), "accused {name}");
+        }
+    }
 
     #[test]
     fn a_profile_path_is_replaced_everywhere_it_appears() {

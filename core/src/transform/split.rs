@@ -77,10 +77,6 @@ impl Split {
 }
 
 impl Transform for Split {
-    fn name(&self) -> &'static str {
-        "split"
-    }
-
     fn apply<'a>(
         &self,
         flight: &'a [u8],
