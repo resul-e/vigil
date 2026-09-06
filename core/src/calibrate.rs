@@ -24,6 +24,20 @@ pub const ABANDON: usize = 3;
 pub enum Trial {
     Reached,
     Failed,
+    /// The trial proved nothing either way, so it must teach the calibrator nothing.
+    ///
+    /// This exists because the two-state version was wrong in both directions on a
+    /// silent-drop line. Scoring silence as `Reached` settles a strategy that is not
+    /// working and `ABANDON` can then never fire; scoring it as `Failed` walks a
+    /// slow-but-alive server off a strategy that *is* working — a control host on that
+    /// very line answered at **5984 ms** against a 2500 ms peek, so the headroom is under
+    /// 2x and the naive fix loses.
+    ///
+    /// The caller's job is therefore to resolve silence into one of the other two where it
+    /// can — see the proxy's deferred verdict, which waits for the connection to end and
+    /// asks whether the upstream ever sent a byte. `Inconclusive` is what is left when even
+    /// that cannot answer, and the only safe thing to do with it is nothing.
+    Inconclusive,
 }
 
 /// Where the sweep currently stands.
@@ -94,6 +108,8 @@ impl Calibrator {
     ///
     /// A failure resets the run to zero rather than decrementing: five successes and a
     /// failure is not "four successes", it is a strategy that does not hold.
+    ///
+    /// [`Trial::Inconclusive`] changes nothing at all, which is the whole point of it.
     pub fn record(&mut self, t: Trial) -> Progress {
         if self.settled.is_some() {
             return self.progress();
@@ -111,6 +127,10 @@ impl Calibrator {
                 self.consecutive = 0;
                 self.index += 1;
             }
+            // Deliberately nothing: no run, no advance, no settle. An inconclusive trial is
+            // not a small failure and not a weak success, and treating it as either is the
+            // bug this variant exists to prevent.
+            Trial::Inconclusive => {}
         }
         self.progress()
     }
@@ -309,6 +329,80 @@ mod tests {
         assert_eq!(c.current(), Some(&strat("split:2")));
         c.record(Trial::Failed);
         assert_eq!(c.current(), Some(&strat("tlsrec:64")));
+    }
+
+    // ------------------------------------------- the third state
+
+    /// The variant exists to teach nothing, so assert exactly that: not the run, not the
+    /// index, not the settled strategy.
+    #[test]
+    fn an_inconclusive_trial_changes_nothing_at_all() {
+        let mut c = Calibrator::new(vec![strat("split:1"), strat("split:2")]);
+        c.record(Trial::Reached);
+        c.record(Trial::Reached);
+        let before = c.progress();
+        c.record(Trial::Inconclusive);
+        assert_eq!(
+            c.progress(),
+            before,
+            "an inconclusive trial moved the calibrator"
+        );
+        assert_eq!(
+            c.current(),
+            Some(&strat("split:1")),
+            "it advanced the candidate"
+        );
+        assert!(!c.is_settled());
+    }
+
+    /// **The half that scoring silence as `Reached` got wrong.** However long the line stays
+    /// silent, silence must never confirm a strategy — that is how a strategy that is not
+    /// working gets cached forever and `ABANDON` never fires.
+    #[test]
+    fn silence_alone_never_settles_a_strategy() {
+        let mut c = Calibrator::with_builtin_candidates();
+        for _ in 0..CONFIRM * 4 {
+            c.record(Trial::Inconclusive);
+        }
+        assert!(!c.is_settled(), "silence confirmed a strategy");
+        assert!(c.result().is_none());
+    }
+
+    /// **The half that scoring silence as `Failed` got wrong.** A trial that proved nothing
+    /// must not break a run of real successes, or a slow server walks the calibrator off a
+    /// strategy that works. Four successes, one connection we could not read, a fifth
+    /// success — that is five successes and no failure.
+    #[test]
+    fn an_inconclusive_trial_does_not_break_a_run_of_successes() {
+        let mut c = Calibrator::new(vec![strat("split:1"), strat("split:2")]);
+        for _ in 0..CONFIRM - 1 {
+            c.record(Trial::Reached);
+        }
+        c.record(Trial::Inconclusive);
+        assert!(
+            !c.is_settled(),
+            "an inconclusive trial should not settle anything"
+        );
+        c.record(Trial::Reached);
+        assert_eq!(
+            c.result(),
+            Some(&strat("split:1")),
+            "the run of successes was thrown away by a trial that proved nothing"
+        );
+    }
+
+    /// Silence must not launder a real failure either: the failure still advances.
+    #[test]
+    fn inconclusive_trials_do_not_hide_a_failure() {
+        let mut c = Calibrator::new(vec![strat("split:1"), strat("split:2")]);
+        c.record(Trial::Inconclusive);
+        c.record(Trial::Failed);
+        c.record(Trial::Inconclusive);
+        assert_eq!(
+            c.current(),
+            Some(&strat("split:2")),
+            "the failure did not advance"
+        );
     }
 
     #[test]

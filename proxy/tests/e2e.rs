@@ -608,6 +608,94 @@ fn unrecognised_opening_bytes_are_counted_and_dropped() {
     );
 }
 
+/// **A name that resolves to nothing is refused as unreachable, and counted as DNS.**
+///
+/// Nothing exercised an empty resolve, so `dns_failures` and the `Unreachable` refusal were
+/// indistinguishable from the connect-refused path the suite does cover — and on this line those
+/// are the two situations that need completely different answers: "the censor owns your DNS" and
+/// "the server is down".
+///
+/// A resolver with no servers and no system fallback answers nothing, deterministically and with
+/// no network: `ask_all` returns immediately on an empty server list.
+#[test]
+fn a_name_that_resolves_to_nothing_is_a_dns_failure_not_an_upstream_one() {
+    use std::sync::atomic::Ordering;
+
+    let cfg = Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        strategy: Strategy::passthrough(),
+        io_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let server =
+        vigil_proxy::Server::new(cfg).with_resolver(vigil_proxy::Resolver::new(Vec::new(), false));
+    let listener = server.bind().expect("bind proxy");
+    let proxy = listener.local_addr().expect("addr");
+    let stats = std::sync::Arc::clone(&server.stats);
+    std::thread::spawn(move || server.serve(listener));
+
+    // SOCKS5 by name, so the proxy has to resolve it.
+    let mut s = TcpStream::connect(proxy).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(&[0x05, 0x01, 0x00]).unwrap();
+    let mut m = [0u8; 2];
+    s.read_exact(&mut m).expect("method reply");
+    let host = "nothing-resolves-here.example";
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&443u16.to_be_bytes());
+    s.write_all(&req).unwrap();
+    let mut rep = [0u8; 10];
+    s.read_exact(&mut rep).expect("connect reply");
+
+    assert_ne!(
+        rep[1], 0x00,
+        "a name that resolves to nothing must be refused"
+    );
+    assert_eq!(
+        stats.dns_failures.load(Ordering::Relaxed),
+        1,
+        "the refusal must be counted as DNS, not folded into upstream errors"
+    );
+    assert_eq!(stats.upstream_errors.load(Ordering::Relaxed), 1);
+}
+
+/// **A peer that connects and says nothing is not an unrecognised dialect.**
+///
+/// `unrecognised` is surfaced on the panel and in the field report, where it is read as "something
+/// spoke a protocol vigil does not answer" — the evidence for adding one. `read_dialect` used to
+/// collapse three outcomes into a bare `None`: an unknown first byte, a peer that closed before
+/// sending one, and any read error including the 60-second `io_timeout`. A port scanner and a
+/// health check that connects and hangs up both counted as a missing protocol.
+#[test]
+fn a_peer_that_sends_nothing_is_a_handshake_error_not_an_unknown_dialect() {
+    use std::sync::atomic::Ordering;
+    let (proxy, stats) = start_proxy("none");
+
+    // Connect and close without writing a byte — a health check.
+    let s = TcpStream::connect(proxy).expect("connect");
+    drop(s);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while stats.handshake_errors.load(Ordering::Relaxed) == 0
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        stats.handshake_errors.load(Ordering::Relaxed),
+        1,
+        "a peer that said nothing should still be a failed handshake"
+    );
+    assert_eq!(
+        stats.unrecognised.load(Ordering::Relaxed),
+        0,
+        "nothing spoke an unknown protocol here — counting this as `unrecognised` is what makes \
+         a port scanner read as evidence that vigil is missing a dialect"
+    );
+}
+
 /// Switching mode while the proxy is running changes what the next connection puts on the
 /// wire — and does not disturb the one already open.
 ///

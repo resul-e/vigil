@@ -130,6 +130,9 @@
 </div>
 
 <script>
+  // Stamped in by `route` when the page is served. Anything that changes state carries it —
+  // the panel is on loopback, which stops another machine and stops no page in this browser.
+  const TOKEN = "__VIGIL_TOKEN__";
 const $ = id => document.getElementById(id);
 const TILES = [
   ["accepted", "accepted"], ["completed", "completed"], ["transformed", "transformed"],
@@ -188,9 +191,9 @@ document.addEventListener("click", async ev => {
   if (!b) return;
   if (b.id === "forget-all") {
     if (!confirm("Forget every learned strategy and calibrate again from scratch?")) return;
-    await fetch("/api/forget", { method: "POST" });
+    await fetch("/api/forget?token=" + TOKEN, { method: "POST" });
   } else if (b.dataset.host) {
-    await fetch("/api/forget?host=" + encodeURIComponent(b.dataset.host), { method: "POST" });
+    await fetch("/api/forget?token=" + TOKEN + "&host=" + encodeURIComponent(b.dataset.host), { method: "POST" });
   } else return;
   tick();
 });

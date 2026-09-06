@@ -183,14 +183,49 @@ pub fn discovery(d: Depth) -> Vec<Cell> {
 /// Phase 2: everything that only makes sense once we know what is blocked.
 ///
 /// `blocked` is what discovery actually found, not what we hoped to find.
-/// Whether a TTL sweep can learn anything here.
+/// Whether a TTL sweep can learn anything from the **baseline** alone.
 ///
 /// The sweep finds the smallest TTL at which an injected reset appears. A censor that
-/// silently drops — which is what SansürOn does — produces a timeout at every TTL,
-/// indistinguishable from the packet expiring on the way. Running it anyway costs the
-/// volunteer two minutes and returns "inconclusive", which is worse than not asking.
+/// silently drops produces a timeout at every TTL, indistinguishable from the packet expiring
+/// on the way. Running it against silence costs the volunteer two minutes and returns
+/// "inconclusive", which is worse than not asking.
+///
+/// This is only the first of two routes. When the baseline is silent the sweep is skipped
+/// *here* and reconsidered after the strategy cells have run — see [`ttl_probe`], which uses
+/// the censor's own reaction as the ruler.
 pub fn ttl_sweep_can_work(baseline_resets: bool) -> bool {
     baseline_resets
+}
+
+/// A TTL sweep carried by a strategy that is **known to provoke a reset on this line**.
+///
+/// The second route, and the one that opens the measurement on a silent dropper. The plan
+/// used to give up whenever the baseline was silent, which left the hop count unmeasured on
+/// exactly the network that needs it most: every forged-packet technique takes a TTL, and a
+/// TTL that is wrong either fails to reach the inspector or sails past it to the server.
+///
+/// What makes it possible is a measured asymmetry rather than a trick. On the second network
+/// the baseline is a silent drop, but a `split:*` flight is **0/300 and converts that drop
+/// into an active reset**. A reset is exactly what the sweep needs to find, so running the
+/// sweep with the strategy that provokes one turns an unanswerable question into an ordinary
+/// one. The ruler is the censor's own behaviour, so no separate control host is needed.
+///
+/// The caller must only pass a strategy it has *observed* resetting in this run. Sweeping
+/// with a guess would produce timeouts at every TTL and read as "the injector is far away"
+/// when it means "this strategy does not provoke anything".
+pub fn ttl_probe(host: &str, strategy: &str, d: Depth) -> Vec<Cell> {
+    (1..=MAX_TTL)
+        .map(|t| Cell {
+            phase: Phase::Ttl,
+            host: host.to_string(),
+            via_host_addr: None,
+            strategy: strategy.to_string(),
+            client_hello_len: None,
+            ttl: Some(t),
+            trials: d.ttl_trials,
+            round: 0,
+        })
+        .collect()
 }
 
 /// Which of [`SIZES`] can actually be built for `host`, and which cannot.
@@ -318,6 +353,60 @@ pub fn connections(cells: &[Cell]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// **The sweep the old plan could never run.** On a silently-dropping line the baseline
+    /// provokes nothing, so `ttl_sweep_can_work` says no and the hop count goes unmeasured — on
+    /// exactly the network where every forged-packet technique needs one. `ttl_probe` carries the
+    /// sweep with a strategy observed to draw a reset instead.
+    #[test]
+    fn a_provoked_sweep_covers_every_hop_and_carries_its_strategy() {
+        let cells = ttl_probe("discord.com", "split:1", Depth::default());
+        assert_eq!(
+            cells.len(),
+            MAX_TTL as usize,
+            "a hop is missing from the sweep"
+        );
+        assert!(
+            cells.iter().all(|c| c.strategy == "split:1"),
+            "a cell fell back to an untransformed flight, which provokes nothing here"
+        );
+        assert!(
+            cells.iter().all(|c| c.phase == Phase::Ttl),
+            "a cell is not part of the TTL phase and would not reach the report's section 5"
+        );
+        let ttls: Vec<u32> = cells.iter().filter_map(|c| c.ttl).collect();
+        assert_eq!(
+            ttls,
+            (1..=MAX_TTL).collect::<Vec<_>>(),
+            "hops out of order or duplicated"
+        );
+    }
+
+    /// **The provoked sweep has to fit the budget that was already reserved.**
+    ///
+    /// `total` is computed once, before anything runs, with the sweep *assumed* to happen. The
+    /// provoked sweep is a third execution pass appended afterwards, so if it costs more
+    /// connections than `investigation` set aside the progress percentage walks past 100 and the
+    /// estimate the volunteer was given before starting becomes a lie.
+    #[test]
+    fn a_provoked_sweep_costs_exactly_what_the_budget_reserved() {
+        let d = Depth::default();
+        let blocked = vec!["discord.com".to_string()];
+        let reserved = connections(&investigation(&blocked, true, d))
+            - connections(&investigation(&blocked, false, d));
+        assert_eq!(
+            connections(&ttl_probe("discord.com", "split:1", d)),
+            reserved,
+            "the provoked sweep and the reserved budget disagree, so the progress estimate breaks"
+        );
+    }
+
+    /// The baseline route is unchanged: an injecting line still sweeps straight away, and a
+    /// silent one still declines to sweep on the baseline alone.
+    #[test]
+    fn the_baseline_route_still_decides_the_same_way() {
+        assert!(ttl_sweep_can_work(true));
+        assert!(!ttl_sweep_can_work(false));
+    }
 
     /// **The size × strategy cross must not be empty.** Every strategy cell fixes the hello at the
     /// synthetic minimum and every size cell fixes the strategy at `none`, so for two networks and

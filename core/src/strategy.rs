@@ -67,9 +67,16 @@ pub enum ParseStrategyError {
 
 /// Why `tlsrec` and an SNI-derived split cannot be combined. A named constant so the test and
 /// the implementation cannot drift apart.
+///
+/// The reason stated here used to be "tlsrec spreads the SNI across records". That is true of
+/// `tlsrec:8` and **false of `tlsrec:64`**, the size this crate ships: at 64 the hostname sits
+/// whole inside one record for every name measured, at both its own minimum length and a
+/// browser-sized hello (`core/tests/sni_across_records.rs`). The rejection is still correct —
+/// the rewrite moves every offset, so a marker resolved against the rewritten flight no longer
+/// describes the same bytes — but it was being justified by something that does not happen.
 pub const TLSREC_MARKER_CONFLICT: &str =
-    "tlsrec spreads the SNI across records, so an SNI-derived split position cannot resolve; \
-     use a byte offset with tlsrec";
+    "tlsrec rewrites the flight, so an SNI-derived position no longer describes the bytes being \
+     cut; use a byte offset with tlsrec";
 
 impl fmt::Display for ParseStrategyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

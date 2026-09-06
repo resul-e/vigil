@@ -121,6 +121,34 @@ fn differential_reported_offset_matches_a_raw_byte_search() {
 
 // ---------------------------------------------------------------- invariants
 
+/// A structurally valid record + handshake + body whose **extensions block is exactly `ext`**.
+///
+/// Every length is derived from the bytes actually emitted, so the only thing that can be wrong
+/// inside is whatever the caller put in `ext`. That is the point: it puts arbitrary bytes where the
+/// parser's length arithmetic actually runs, rather than in front of the content-type check that
+/// rejects them before any of it does.
+fn hello_with_extensions(ext: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
+    body.extend_from_slice(&[0u8; 32]); // random
+    body.push(0); // session id
+    body.extend_from_slice(&2u16.to_be_bytes()); // cipher suites
+    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.push(1); // compression methods
+    body.push(0);
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    body.extend_from_slice(ext);
+
+    let mut hs = vec![0x01u8];
+    hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    hs.extend_from_slice(&body);
+
+    let mut rec = vec![0x16u8, 0x03, 0x01];
+    rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&hs);
+    rec
+}
+
 /// Whatever the parser returns, its own accessors must agree with each other.
 fn assert_self_consistent(buf: &[u8]) {
     if let Ok(ch) = parse(buf) {
@@ -287,6 +315,53 @@ fn random_noise_is_not_mistaken_for_a_clienthello() {
     assert!(
         accepted_with_sni <= 2,
         "{accepted_with_sni} random buffers were accepted as ClientHellos with an SNI"
+    );
+}
+
+/// **Noise where the parser actually walks.**
+///
+/// The test above asserts a bound on a counter its own generator can never increment: a random
+/// buffer has to open `0x16 ?? ?? .. 0x01` before a single line of the extension walk runs, so
+/// 19 931 of its 20 000 iterations exercise the content-type check and nothing else. It is a real
+/// test of "do not accept garbage" and no test at all of the walk.
+///
+/// So: build a *structurally valid* hello and replace its extension block with noise, which is
+/// where the length arithmetic lives and where a lax walk would read past a bound. The contract is
+/// the same one `assert_self_consistent` states everywhere else — never a wrong hostname, never a
+/// panic, and any SNI returned must lie inside the buffer.
+#[test]
+fn noise_inside_the_extension_block_is_never_a_hostname() {
+    let mut rng = Rng(0x5EED_1234_u64);
+    let mut reached = 0usize;
+    let mut accepted_with_sni = 0usize;
+
+    for _ in 0..5_000 {
+        let n = 1 + rng.below(120);
+        let noise: Vec<u8> = (0..n).map(|_| (rng.next() & 0xFF) as u8).collect();
+        let b = hello_with_extensions(&noise);
+
+        // The header is valid by construction, so the walk really runs.
+        reached += 1;
+        assert_self_consistent(&b);
+        if let Ok(ch) = parse(&b) {
+            if let Some(sni) = ch.sni() {
+                accepted_with_sni += 1;
+                assert!(
+                    sni.host.end <= b.len(),
+                    "an SNI was reported outside the buffer: {:?} of {}",
+                    sni.host,
+                    b.len()
+                );
+            }
+        }
+    }
+
+    assert_eq!(reached, 5_000, "the generator stopped producing hellos");
+    // Random extension bytes can legitimately spell a server_name now and then — the point is
+    // that when they do, the range is still inside the buffer, which is asserted above.
+    assert!(
+        accepted_with_sni < reached,
+        "every noise buffer parsed as a hostname, which means the walk checks nothing"
     );
 }
 

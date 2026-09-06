@@ -702,3 +702,54 @@ fn apply_cmd(args: &[String]) -> std::process::ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::*;
+
+    /// **The producer of the one text contract between two binaries.**
+    ///
+    /// `vigil-app.exe` does not link this crate — that is the whole reason the updater is a
+    /// separate program — so this line of text is the entire interface between them. Only the
+    /// *consumer* was tested, against strings a human typed into `ui/src/model.rs`, so both sides
+    /// could drift together and neither test would notice. Asserted as exact bytes, deliberately:
+    /// a reader that splits on spaces is exactly what is on the other end.
+    #[test]
+    fn the_status_line_is_the_exact_bytes_the_tray_parses() {
+        assert_eq!(
+            status_line("current", &[]),
+            "vigil-update-status status=current"
+        );
+        assert_eq!(
+            status_line("staged", &[("version", "0.7.3"), ("critical", "1")]),
+            "vigil-update-status status=staged version=0.7.3 critical=1"
+        );
+        assert_eq!(
+            status_line("interrupted", &[("version", "0.7.3"), ("outstanding", "2")]),
+            "vigil-update-status status=interrupted version=0.7.3 outstanding=2"
+        );
+    }
+
+    /// A value with a space in it would silently become another field, and the reader on the far
+    /// side splits on spaces — so a reason like "no endpoint answered" would arrive as three.
+    #[test]
+    fn a_reason_with_spaces_cannot_invent_extra_fields() {
+        let line = status_line("unreachable", &[("why", "no endpoint answered")]);
+        assert_eq!(
+            line,
+            "vigil-update-status status=unreachable why=no_endpoint_answered"
+        );
+        assert_eq!(
+            line.split_whitespace().count(),
+            3,
+            "the reader splits on spaces: {line}"
+        );
+    }
+
+    /// The prefix is what the tray greps for out of a stream of other output. If it moves, every
+    /// check silently reports "could not look" on a machine where the updater ran perfectly.
+    #[test]
+    fn the_marker_is_the_one_the_tray_searches_for() {
+        assert!(status_line("current", &[]).starts_with("vigil-update-status "));
+    }
+}

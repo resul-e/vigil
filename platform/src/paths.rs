@@ -39,6 +39,25 @@ pub fn lock() -> Option<PathBuf> {
     state_dir().map(|d| d.join("instance.lock"))
 }
 
+/// The staging folder an update is downloaded into, **beside the binaries, not in the state dir**:
+/// the swap is a rename and a rename has to stay on one volume.
+///
+/// Here rather than in `update/` because two crates need it and only one of them may depend on the
+/// updater. `vigil-app.exe` copies the runner into this folder before handing over, and
+/// `vigil-update.exe` looks for it there — and until 2026-08-12 each spelled the two names itself,
+/// `ui/src/win.rs` with bare literals and `update/` with `stage::STAGING` / `apply::runner_path`.
+/// Nothing connected them, so changing one would have left the tray writing the runner somewhere
+/// the updater never looks, on the one path that cannot be fixed by a later update.
+///
+/// `ui` must not gain a dependency on `update` to share them — that is what keeps rustls and the
+/// signature verifier out of the binary every user runs, and `update/tests/dependency_isolation.rs`
+/// enforces it — so the shared home is the crate they both already depend on.
+pub const STAGING_DIR: &str = ".vigil-update";
+
+/// The copy of the updater that runs from inside [`STAGING_DIR`], so the one beside the
+/// application is idle and can be replaced like any other file.
+pub const RUNNER_EXE: &str = "runner.exe";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +74,15 @@ mod tests {
             assert_ne!(s, l);
             assert_eq!(s.parent(), state_dir().as_deref());
         }
+    }
+
+    /// The tray copies the runner in; the updater runs it from there. Two crates, one spelling.
+    #[test]
+    fn the_staging_names_are_shared_rather_than_spelled_twice() {
+        assert_eq!(STAGING_DIR, ".vigil-update");
+        assert_eq!(RUNNER_EXE, "runner.exe");
+        // Beside the binaries, never in the state directory: the swap is a rename.
+        assert!(!STAGING_DIR.contains('/') && !STAGING_DIR.contains('\\'));
     }
 
     /// The repair tool has its own copy of this path. If they ever disagree, a snapshot

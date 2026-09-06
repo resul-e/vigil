@@ -14,6 +14,9 @@ use vigil_core::strategy::Strategy;
 use vigil_proxy::ui::{self, PanelState};
 use vigil_proxy::{Mode, Stats};
 
+/// The panel's per-process token, fixed here so the tests can send it.
+const TOKEN: &str = "paneltesttoken";
+
 fn start(cache_path: Option<std::path::PathBuf>) -> (SocketAddr, Arc<PanelState>) {
     let mut cache = Cache::new();
     cache.insert("discord.com", Strategy::parse("split:1").unwrap());
@@ -22,6 +25,7 @@ fn start(cache_path: Option<std::path::PathBuf>) -> (SocketAddr, Arc<PanelState>
     let l = ui::bind("127.0.0.1:0".parse().unwrap()).expect("bind");
     let addr = l.local_addr().expect("addr");
     let state = Arc::new(PanelState {
+        token: TOKEN.to_string(),
         listen: addr.to_string(),
         mode: Mode::Auto,
         fixed: Strategy::measured_default(),
@@ -98,7 +102,10 @@ fn status_reflects_the_live_cache_and_counters() {
 #[test]
 fn forgetting_one_host_removes_only_that_host() {
     let (addr, st) = start(None);
-    let (status, _) = request(addr, "POST /api/forget?host=discord.com HTTP/1.1");
+    let (status, _) = request(
+        addr,
+        &format!("POST /api/forget?token={TOKEN}&host=discord.com HTTP/1.1"),
+    );
     assert_eq!(status, 200);
 
     let c = st.cache.lock().unwrap();
@@ -109,7 +116,7 @@ fn forgetting_one_host_removes_only_that_host() {
 #[test]
 fn forgetting_everything_empties_the_cache() {
     let (addr, st) = start(None);
-    let (status, _) = request(addr, "POST /api/forget HTTP/1.1");
+    let (status, _) = request(addr, &format!("POST /api/forget?token={TOKEN} HTTP/1.1"));
     assert_eq!(status, 200);
     assert!(st.cache.lock().unwrap().is_empty());
 }
@@ -122,7 +129,10 @@ fn a_forget_is_persisted() {
     let path = dir.join("cache.txt");
 
     let (addr, _st) = start(Some(path.clone()));
-    request(addr, "POST /api/forget?host=discord.com HTTP/1.1");
+    request(
+        addr,
+        &format!("POST /api/forget?token={TOKEN}&host=discord.com HTTP/1.1"),
+    );
 
     let text = std::fs::read_to_string(&path).expect("cache file written");
     let (reloaded, skipped) = Cache::from_text(&text);
@@ -133,6 +143,19 @@ fn a_forget_is_persisted() {
         "forget was not persisted"
     );
     assert!(reloaded.get("roblox.com").is_some(), "took the wrong one");
+
+    // **And "forget everything" reaches the disk too.** Only the single-host path was covered, so
+    // the panel's most destructive button could stop writing the file and a restart would bring
+    // every forgotten host straight back — with nothing to show it had happened.
+    let (status, _) = request(addr, &format!("POST /api/forget?token={TOKEN} HTTP/1.1"));
+    assert_eq!(status, 200);
+    let text = std::fs::read_to_string(&path).expect("cache file still written");
+    let (reloaded, skipped) = Cache::from_text(&text);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert!(
+        reloaded.is_empty(),
+        "forget-all did not reach the disk: {text:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

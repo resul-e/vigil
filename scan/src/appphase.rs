@@ -58,6 +58,21 @@ pub struct AppRun {
     /// names arriving, connections transformed — and the application was worse off. A tool
     /// that cannot say *"you made this worse"* will not say it.
     pub control_processes: usize,
+    /// **The application's own sockets while its window was open**, split by where they went.
+    ///
+    /// This is the gate the whole roadmap turns on, aimed at the one application under test rather
+    /// than at the machine. "Which names arrived at the proxy" answers *what we saw*; it cannot
+    /// distinguish an application that never got that far from one that got there and dialled the
+    /// internet directly — and those are a ten-line fix and a kernel driver respectively.
+    ///
+    /// `direct` counts distinct connections from this application's own processes to a
+    /// **non-loopback** `:443` while vigil was engaged. Any number above zero is the honest gate
+    /// firing: the traffic exists, we are engaged, and it did not come to us.
+    ///
+    /// The window used to be a plain `sleep`. Nothing was watched during the ninety seconds that
+    /// decide the most expensive question this project has.
+    pub via_proxy_sockets: usize,
+    pub direct_sockets: usize,
     /// Its own names that arrived at the proxy.
     pub seen: Vec<String>,
     /// Names it cannot start without, that never arrived.
@@ -101,7 +116,21 @@ impl AppRun {
             // Nothing reached us and nothing is running: it did not start at all, which says
             // nothing about the proxy either way.
             (true, 0) => "ACILMADI (hic baglanmadi, surec de kalmadi)",
-            (true, _) => "PROXY'YI KULLANMIYOR (calisiyor ama hicbir baglantisi bize gelmedi)",
+            // **The gate.** Nothing came to us, and its own processes opened connections straight
+            // to a non-loopback `:443` while we were engaged. That is not "it did not get far
+            // enough"; it is the traffic existing, us being engaged, and the application going
+            // round us — the one measurement that has ever been allowed to argue for a driver, and
+            // the one no report could make because the window was a `sleep`.
+            (true, _) if self.direct_sockets > 0 => {
+                "VIGIL'I BAYPAS EDIYOR (kendi surecleri dogrudan 443'e cikti, bize hic gelmedi)"
+            }
+            // Running, nothing to us, and no direct `:443` either — so it never opened a TLS
+            // connection at all in the window. That is a startup failure, not a proxy failure, and
+            // reading it as bypass is how a driver gets argued for from an application that stalled
+            // before it ever reached the network.
+            (true, _) => {
+                "PROXY'YI KULLANMIYOR (ama dogrudan 443 baglantisi da yok — hic baglanti kurmadi)"
+            }
             // The one that used to read as success and is not: it talked to us and then died.
             (false, 0) => "BIZE GELDI AMA ACILMADI (surec kalmadi)",
             // Some of it reached us and the part it cannot start without did not. This is the
@@ -109,8 +138,14 @@ impl AppRun {
             // did, the process count was identical with vigil on and off — and the report
             // called that "opened, uses the proxy". One name arriving is not the application
             // working, and the two must not share a verdict.
+            (false, _) if !self.missing_critical.is_empty() && self.direct_sockets > 0 => {
+                "BAZI ADLARI GELDI, GERISI BIZI BAYPAS ETTI (acilis adlari dogrudan cikti)"
+            }
             (false, _) if !self.missing_critical.is_empty() => {
                 "BAZI ADLARI GELDI AMA ACILAMADI (acilis icin gereken adlar gelmedi)"
+            }
+            (false, _) if self.direct_sockets > 0 => {
+                "acildi ama bir kismi bizi baypas ediyor (dogrudan 443 baglantilari var)"
             }
             (false, _) => "acildi, proxy'yi kullaniyor",
         }
@@ -315,6 +350,22 @@ fn app_rows(o: &Outcome) -> String {
                 "     ayakta olan surec: vigil ACIK {} , vigil KAPALI {}\n",
                 a.processes, a.control_processes
             ));
+            // **The line the driver question is actually read from.** Its own processes, watched
+            // for the whole window: how many connections came to vigil, and how many went straight
+            // out to a non-loopback :443 while we were engaged.
+            s.push_str(&format!(
+                "     kendi soketleri: vigil'e {} , DOGRUDAN 443'e {}\n",
+                a.via_proxy_sockets, a.direct_sockets
+            ));
+            if a.direct_sockets > 0 {
+                s.push_str(
+                    "       ^ bu sifirdan buyukse: trafik VAR, koruma ACIK, ve bize gelmiyor.\n                     \x20      Once programi tamamen kapatip tekrar denemek gerekir — Windows\n                     \x20      ortam degiskenlerini surece BASLANGICTA verir. Ondan sonra da\n                     \x20      boyleyse, bu paket seviyesinde bir cozumu tartisilir kilan olcum.\n",
+                );
+            } else if a.via_proxy_sockets == 0 {
+                s.push_str(
+                    "       ^ ikisi de sifir: bu program pencere boyunca hic 443 baglantisi\n                     \x20      kurmadi. Yani sorun proxy'de degil, daha once bir yerde.\n",
+                );
+            }
         }
         if !a.seen.is_empty() {
             s.push_str(&format!("     bize gelen adlari: {}\n", a.seen.join(", ")));
@@ -866,6 +917,11 @@ fn measure_apps(
             continue;
         }
         server.clear_seen();
+        // **Before the launch, not after.** `observe` discounts whatever was already open, and the
+        // application is about to be started — so a baseline taken after `launch_via_explorer`
+        // would already contain its first connections and would subtract them from the one number
+        // that decides whether it bypassed us.
+        let before_launch = crate::observe::baseline();
         let mut started = false;
         if let Some(path) = &exe {
             eprintln!("  {} başlatılıyor...", app.name);
@@ -876,8 +932,33 @@ fn measure_apps(
         } else {
             eprintln!("  {} kurulu değil, atlanıyor", app.name);
         }
-        if started {
-            std::thread::sleep(Duration::from_secs(wait));
+        // **Watch the window instead of sleeping through it.** `crate::observe::run` ssamples the
+        // machine's TCP table once a second with the proxy engaged and attributes every connection
+        // to the process that owns it — exactly the measurement this phase needs, already written
+        // and already tested. Filtering its rows to this application's own image names turns a
+        // machine-wide picture into a statement about the program under test.
+        let watched = if started {
+            // The proxy's port, so a connection to `127.0.0.1:<port>` is recognised as ours.
+            let port: u16 = listen
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(0);
+            crate::observe::run_from(before_launch, port, wait)
+        } else {
+            Vec::new()
+        };
+        let own_images: Vec<String> = app
+            .processes
+            .iter()
+            .map(|i| i.to_ascii_lowercase())
+            .collect();
+        let (mut via_proxy_sockets, mut direct_sockets) = (0usize, 0usize);
+        for row in &watched {
+            if own_images.contains(&row.name.to_ascii_lowercase()) {
+                via_proxy_sockets += row.via_proxy;
+                direct_sockets += row.direct;
+            }
         }
         let processes = if started { count_processes(app) } else { 0 };
         let detail = server.seen_detail();
@@ -891,10 +972,29 @@ fn measure_apps(
             .filter(|(h, _)| apps::belongs_to(app, h))
             .cloned()
             .collect();
+        // **Filtered by program, because that is what the field means.** It used to filter by
+        // *hostname* — take the rows whose name is outside the app's suffix list and collect their
+        // clients — which is neither sound nor complete. Not sound: the launched application
+        // itself appears the moment it connects to a name outside its own list, and
+        // `apps::APPS[Discord].suffixes` is documented as incomplete (four of Discord's own
+        // connections went to names outside it on 2026-08-08). Not complete: another program that
+        // happens to ask for a name *inside* the list is invisible.
+        //
+        // This is the column the driver question is read from — "which other programs reached
+        // vigil" — so a false name in it is an argument for the most expensive decision this
+        // project can make.
+        let own_images: Vec<String> = app
+            .processes
+            .iter()
+            .map(|i| i.to_ascii_lowercase())
+            .collect();
         let other_programs: std::collections::BTreeSet<String> = detail
             .iter()
-            .filter(|(h, _)| !apps::belongs_to(app, h))
             .flat_map(|(_, r)| r.clients.iter().cloned())
+            .filter(|c| {
+                let c = c.to_ascii_lowercase();
+                !own_images.contains(&c)
+            })
             .collect();
         let missing: Vec<String> = app
             .critical
@@ -916,6 +1016,8 @@ fn measure_apps(
             was_running: false,
             processes,
             control_processes,
+            via_proxy_sockets,
+            direct_sockets,
             seen: mine.iter().map(|s| (*s).to_string()).collect(),
             missing_critical: missing,
             others,
@@ -1343,6 +1445,12 @@ mod tests {
                 other_programs: others,
                 ..Default::default()
             }],
+            // The two sections below the apps rows, so their *populated* branch is rendered by
+            // something. Every existing test left both empty, so the sentinel arm was the only one
+            // any test executed — and the learned table is the single most useful line in a report
+            // from a network nobody here can reach.
+            learned: vec![("discord.com".into(), "tlsrec:64".into())],
+            counters: vec![("kabul edilen".into(), 7)],
             ..Default::default()
         });
         assert!(text.contains("31 baglanti"), "{text}");
@@ -1351,6 +1459,18 @@ mod tests {
         // The arms are not symmetric and the report has to say so, with the number used.
         assert!(text.contains("90 saniye"), "{text}");
         assert!(text.contains("simetrik degil"), "{text}");
+        // The learned table and the counters, populated. Both were rendered only in their empty
+        // form by every test in the file.
+        assert!(text.contains("Kalibratorun ogrendigi strateji"), "{text}");
+        assert!(text.contains("discord.com"), "{text}");
+        assert!(text.contains("tlsrec:64"), "{text}");
+        assert!(text.contains("Motorun sayaclari"), "{text}");
+        assert!(text.contains("kabul edilen"), "{text}");
+        assert!(text.contains('7'), "{text}");
+        assert!(
+            !text.contains("hicbir host icin karar verilmedi"),
+            "the empty sentinel was printed over a populated table: {text}"
+        );
     }
 
     /// Equal counts are not a regression. Most applications settle on the same number either
@@ -1520,6 +1640,96 @@ mod tests {
         assert_eq!(
             snapshot_to_repair(Some("garbage"), Some(&ours_saved), "127.0.0.1:1085"),
             None
+        );
+    }
+
+    /// **The gate, and the two things it must not be confused with.**
+    ///
+    /// "Which names arrived at the proxy" cannot separate an application that never got as far as
+    /// the network from one that got there and dialled the internet directly — and those are a
+    /// ten-line fix and a kernel driver respectively. Until 2026-08-12 the ninety-second window was
+    /// a plain `sleep`, so nothing was watched during the time that decides the most expensive
+    /// question this project has, and every report had to guess between the two.
+    #[test]
+    fn a_direct_socket_is_what_separates_bypassing_from_never_starting() {
+        let base = AppRun {
+            app: "Discord".into(),
+            exe: Some("x".into()),
+            started: true,
+            processes: 5,
+            control_processes: 5,
+            ..Default::default()
+        };
+
+        // Running, nothing reached us, and its own processes went straight out. The gate.
+        let bypass = AppRun {
+            direct_sockets: 5,
+            ..base.clone()
+        };
+        assert!(bypass.verdict().contains("BAYPAS"), "{}", bypass.verdict());
+
+        // Running, nothing reached us, and no direct :443 either — it never connected at all, so
+        // the fault is before the proxy and reading it as bypass would argue for a driver from an
+        // application that stalled on its own.
+        let stalled = base.clone();
+        assert!(
+            !stalled.verdict().contains("BAYPAS"),
+            "an application that opened no connections must not read as bypassing: {}",
+            stalled.verdict()
+        );
+        assert!(stalled.verdict().contains("hic baglanti kurmadi"));
+
+        // And the two must not share a verdict, which is the whole point.
+        assert_ne!(bypass.verdict(), stalled.verdict());
+    }
+
+    /// Partly ours, partly not, is its own answer — and it is the shape the second network's
+    /// Discord actually produced: the updater arrived, `discord.com` never did.
+    #[test]
+    fn some_names_arriving_while_the_rest_goes_direct_is_not_success() {
+        let a = AppRun {
+            app: "Discord".into(),
+            exe: Some("x".into()),
+            started: true,
+            processes: 5,
+            control_processes: 5,
+            seen: vec!["updates.discord.com".into()],
+            missing_critical: vec!["discord.com".into()],
+            direct_sockets: 4,
+            via_proxy_sockets: 1,
+            ..Default::default()
+        };
+        let v = a.verdict();
+        assert!(v.contains("BAYPAS"), "{v}");
+        assert!(!v.contains("proxy'yi kullaniyor"), "{v}");
+    }
+
+    /// The report has to print the numbers the verdict rests on, and say what a non-zero means —
+    /// including the innocent explanation, because "already running when protection came on" is
+    /// the common one and Windows hands a process its environment at start.
+    #[test]
+    fn the_socket_counts_are_printed_with_what_they_mean() {
+        let text = render(&Outcome {
+            listen: "127.0.0.1:1085".into(),
+            strategy: "tlsrec:64+split:1".into(),
+            app_wait: 90,
+            apps: vec![AppRun {
+                app: "Discord".into(),
+                exe: Some("x".into()),
+                started: true,
+                processes: 5,
+                control_processes: 5,
+                direct_sockets: 5,
+                via_proxy_sockets: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(text.contains("kendi soketleri"), "{text}");
+        assert!(text.contains("DOGRUDAN 443"), "{text}");
+        assert!(
+            text.contains("kapatip tekrar denemek"),
+            "the innocent explanation must be beside the number: {text}"
         );
     }
 

@@ -192,12 +192,15 @@ fn an_extension_may_not_spill_past_the_extensions_block() {
         - (2 + 2 + 2 + 1 + 2 + "discord.com".len()) // the server_name extension
         - 2; // the extensions_length field itself
     b[ext_len_pos..ext_len_pos + 2].copy_from_slice(&4u16.to_be_bytes());
-    if let Ok(ch) = parse(&b) {
-        assert!(
-            ch.sni().is_none(),
-            "accepted an SNI whose body lies outside the declared extensions block"
-        );
-    }
+    // **Refused, not merely "parsed without an SNI".** `if let Ok(..)` tolerated both answers, so
+    // the branch that decides between them was pinned by nothing: a complete record whose extension
+    // body runs past the declared block is malformed, and saying so is what lets a caller tell it
+    // from an honest hello that simply carries no server_name.
+    assert!(
+        matches!(parse(&b), Err(ParseError::Malformed)),
+        "an extension spilling past the declared block must be Malformed, got {:?}",
+        parse(&b)
+    );
 }
 
 // ---------------------------------------------------------------------------

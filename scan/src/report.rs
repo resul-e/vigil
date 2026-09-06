@@ -406,6 +406,21 @@ pub fn render(ctx: &Context, results: &[CellResult], dns: &[Comparison]) -> Stri
         s.push_str("5. HOW FAR AWAY IS THE INJECTOR?\n");
         s.push_str(&bar(78));
         s.push('\n');
+        // Which strategy carried the sweep, always — it is no longer always `none`. On a line
+        // that drops silently the baseline provokes nothing to measure, so the sweep is carried
+        // by a strategy observed to draw a reset in this same run. A reader who assumed `none`
+        // would take "the injector is N hops away" as a fact about the line when it is a fact
+        // about the line *under that transform*, and the two need not be the same distance.
+        let carried = ttls[0].cell.strategy.as_str();
+        if carried == "none" {
+            s.push_str("  Swept with an untransformed flight.\n");
+        } else {
+            s.push_str(&format!(
+                "  Swept with `{carried}`, because the baseline here drops silently and gives the\n\
+                 \x20 sweep nothing to find. That strategy was measured to draw a reset in this run,\n\
+                 \x20 so the distance below is the distance to whatever answers *it*.\n"
+            ));
+        }
         let samples: Vec<(u32, Tally)> = ttls
             .iter()
             .filter_map(|r| r.cell.ttl.map(|t| (t, r.tally.clone())))

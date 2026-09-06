@@ -32,7 +32,7 @@ use crate::plan::Digests;
 /// The staging directory, inside the application folder and dotted so Explorer keeps it out of the
 /// way. Inside the folder rather than in `%TEMP%` deliberately: the swap must be a same-volume
 /// rename, and `%TEMP%` is not guaranteed to be on the same volume.
-pub const STAGING: &str = ".vigil-update";
+pub const STAGING: &str = vigil_platform::paths::STAGING_DIR;
 /// Written last. Its presence means every file staged and verified.
 pub const READY: &str = "ready.txt";
 
@@ -570,13 +570,23 @@ mod tests {
         let m = manifest_of();
         for (target, required) in NAMES {
             let sb = Sandbox::new("unfetchable").with_old_binaries();
+            // **Count them.** That a fetch which fails outright is retried `ATTEMPTS` times was
+            // untested — only the wrong-length path counted calls — so collapsing the retry to a
+            // single attempt survived the suite. On a line whose mechanism is a silent drop, the
+            // retry is most of why a download ever completes.
+            let mut tries = 0usize;
             let out = stage(sb.path(), &m, |url| {
                 let name = url.rsplit('/').next().unwrap_or("");
                 if name == *target {
+                    tries += 1;
                     return Err("silently dropped".into());
                 }
                 Ok(body_for(name))
             });
+            assert_eq!(
+                tries, ATTEMPTS,
+                "{target}: a fetch that fails outright must be retried ATTEMPTS times"
+            );
             if *required {
                 assert_eq!(
                     out,

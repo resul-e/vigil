@@ -84,6 +84,8 @@ fn main() {
     // measured against the same address.
     let resolver = vigil_proxy::resolver::Resolver::default();
     let mut control_failures = 0usize;
+    // Cells that actually ran, so a control skipped before measurement cannot read as a pass.
+    let mut control_cells = 0usize;
 
     for (group, hosts) in [("blocked", BLOCKED), ("control", CONTROLS)] {
         for host in hosts {
@@ -123,8 +125,11 @@ fn main() {
                 }
 
                 let v = tally.verdict();
-                if group == "control" && v != Verdict::Reliable {
-                    control_failures += 1;
+                if group == "control" {
+                    control_cells += 1;
+                    if v != Verdict::Reliable {
+                        control_failures += 1;
+                    }
                 }
 
                 let breakdown = tally
@@ -153,11 +158,26 @@ fn main() {
         }
     }
 
-    if control_failures > 0 {
-        eprintln!(
-            "HARNESS SUSPECT: {control_failures} control cell(s) did not come back RELIABLE. \
-             Controls must pass or the run proves nothing — do not trust the blocked rows."
-        );
+    // **A control that never ran is not a control that passed.** `control_failures` counts cells
+    // that came back unreliable, and the two `continue`s above — a name that would not resolve, and
+    // one that resolves to the block page — skip a host *before* any cell runs, so they increment
+    // nothing. A run whose control could not be resolved therefore printed one line about DNS and
+    // then reported a clean harness over blocked rows nobody should have trusted.
+    let expected_control_cells = CONTROLS.len() * strategies().len();
+    if control_failures > 0 || control_cells < expected_control_cells {
+        if control_cells < expected_control_cells {
+            eprintln!(
+                "HARNESS SUSPECT: only {control_cells} of {expected_control_cells} control cells \
+                 ran at all — a control host was skipped before it was measured (see the lines \
+                 above). A control that did not run cannot vouch for anything below it."
+            );
+        }
+        if control_failures > 0 {
+            eprintln!(
+                "HARNESS SUSPECT: {control_failures} control cell(s) did not come back RELIABLE. \
+                 Controls must pass or the run proves nothing — do not trust the blocked rows."
+            );
+        }
         std::process::exit(1);
     }
 }

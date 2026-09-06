@@ -116,22 +116,37 @@ pub fn render(programs: &[Program], seconds: u64) -> String {
     s
 }
 
+/// What is open right now, to be discounted from a window that has not started yet.
+///
+/// Separate from [`run`] because **the caller sometimes has to take it earlier than the window
+/// begins.** The application phase launches a program and then watches it: if the baseline were
+/// captured after the launch, the connections that program made in its first moments would already
+/// be in it and would be excluded — from precisely the count that decides whether it bypassed us.
+#[cfg(windows)]
+pub fn baseline() -> BTreeSet<(u32, String)> {
+    tcp_connections().into_iter().collect()
+}
+
 /// Sample the machine's TCP table every second for `seconds`, with the proxy engaged.
 ///
 /// Only connections that appear *after* the window opens are counted — see the baseline below.
 #[cfg(windows)]
 pub fn run(port: u16, seconds: u64) -> Vec<Program> {
-    use std::time::{Duration, Instant};
-
-    let me = std::process::id();
-    let mut samples: Vec<(String, String, bool)> = Vec::new();
-
     // Connections that already existed when we engaged are not evidence of anything: a socket
     // opened before the setting changed could not have used it. Without this, Spotify's and
     // nvidia's long-lived sessions are reported as "bypassing vigil" every single run — an
     // artefact that would have sent us after a driver for programs that never got the chance
     // to obey.
-    let baseline: BTreeSet<(u32, String)> = tcp_connections().into_iter().collect();
+    run_from(baseline(), port, seconds)
+}
+
+/// [`run`] against a baseline the caller captured itself. See [`baseline`].
+#[cfg(windows)]
+pub fn run_from(baseline: BTreeSet<(u32, String)>, port: u16, seconds: u64) -> Vec<Program> {
+    use std::time::{Duration, Instant};
+
+    let me = std::process::id();
+    let mut samples: Vec<(String, String, bool)> = Vec::new();
 
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut names = pid_names();

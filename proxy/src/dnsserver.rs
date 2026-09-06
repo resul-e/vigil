@@ -26,9 +26,10 @@
 //! "structural" is worth having twice in the one place on this machine that parses packets
 //! from anybody.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vigil_core::dnsmsg::{self, Question, RCODE_NOERROR, RCODE_SERVFAIL, TYPE_A};
@@ -113,6 +114,21 @@ pub struct DnsStats {
 pub struct DnsServer {
     resolver: Arc<Resolver>,
     pub stats: Arc<DnsStats>,
+    /// Names asked for this run, and how many times — **opt-in, and off in the shipped product.**
+    ///
+    /// What a person resolves is their browsing; a testbench needs something else entirely, and it
+    /// is the one measurement that separates the three ways an application can fail on a censored
+    /// line. A name that was **never asked for** means the application did not get that far. A name
+    /// that was **asked for here and never arrived at the proxy** means it resolved through vigil
+    /// and then went somewhere else — which is the whole question about Discord's Electron half,
+    /// and no report has ever been able to state it. A name asked for *and* delivered leaves only
+    /// the transform, which is the half already measured 120/120.
+    ///
+    /// `vigil-scan` turns this on for the minutes it runs and reports only the names belonging to
+    /// the applications it was asked about; everything else is counted and never written down —
+    /// the same rule `Config::record_hosts` follows on the proxy side.
+    seen: Mutex<BTreeMap<String, usize>>,
+    record_names: bool,
 }
 
 impl DnsStats {
@@ -141,6 +157,32 @@ impl DnsServer {
         DnsServer {
             resolver,
             stats: Arc::new(DnsStats::default()),
+            seen: Mutex::new(BTreeMap::new()),
+            record_names: false,
+        }
+    }
+
+    /// Keep the set of names asked for, in memory, for a measurement run. See [`Self::seen`].
+    pub fn recording_names(mut self) -> Self {
+        self.record_names = true;
+        self
+    }
+
+    /// Every name asked of us this run, with how many times, sorted. Empty unless recording.
+    ///
+    /// The count is as load-bearing as the name: one query is a lookup, thirty in a minute is a
+    /// client retrying, and those read completely differently next to a proxy that saw nothing.
+    pub fn seen_names(&self) -> Vec<(String, usize)> {
+        self.seen
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Forget what has been asked for, so a phase can measure only its own window.
+    pub fn clear_seen(&self) {
+        if let Ok(mut m) = self.seen.lock() {
+            m.clear();
         }
     }
 
@@ -296,6 +338,15 @@ impl DnsServer {
                 return None;
             }
         };
+        if self.record_names {
+            if let Ok(mut m) = self.seen.lock() {
+                // Bounded: a runaway client must not turn a measurement into a memory leak. The
+                // same cap the proxy's host recording uses.
+                if m.len() < 4096 {
+                    *m.entry(q.name.to_ascii_lowercase()).or_insert(0) += 1;
+                }
+            }
+        }
         // Anything that is not an internet A question gets NODATA: the name may well exist,
         // we simply have no record of that kind. NXDOMAIN here would make Windows stop asking
         // for the A record too, and the name would go dark on a machine we are fixing.
@@ -339,6 +390,61 @@ mod tests {
         // No upstream servers and no system fallback: every lookup fails, which is what makes
         // the failure paths testable without a network.
         DnsServer::new(Arc::new(Resolver::new(Vec::new(), false)))
+    }
+
+    /// **What a person resolves is their browsing; what a testbench needs is a different thing.**
+    ///
+    /// Off unless a measurement turns it on, and the same rule the proxy's host recording follows.
+    #[test]
+    fn names_are_not_recorded_unless_a_measurement_asks() {
+        let s = server();
+        let _ = s.answer(&dnsmsg::encode_query("discord.com", 1).expect("query"));
+        assert!(
+            s.seen_names().is_empty(),
+            "the shipped product must not keep a list of what was resolved"
+        );
+    }
+
+    /// **The discriminator no report has ever carried.**
+    ///
+    /// Three ways an application fails on a censored line, and until this existed a report could
+    /// separate none of them: the name was never asked for (it did not get that far), it was asked
+    /// for here and never arrived at the proxy (it resolved through vigil and went somewhere else),
+    /// or it arrived and the transform is the question. Discord's Electron half on the second
+    /// network is exactly the middle case and nothing could say so.
+    ///
+    /// The count matters as much as the name: one query is a lookup, thirty in a minute is a
+    /// client retrying, and those read completely differently beside a proxy that saw nothing.
+    #[test]
+    fn a_recording_server_keeps_the_names_and_how_often_they_were_asked() {
+        let s = server().recording_names();
+        for _ in 0..3 {
+            let _ = s.answer(&dnsmsg::encode_query("discord.com", 1).expect("query"));
+        }
+        let _ = s.answer(&dnsmsg::encode_query("updates.discord.com", 2).expect("query"));
+
+        assert_eq!(
+            s.seen_names(),
+            vec![
+                ("discord.com".to_string(), 3),
+                ("updates.discord.com".to_string(), 1),
+            ]
+        );
+
+        // A phase can measure only its own window.
+        s.clear_seen();
+        assert!(s.seen_names().is_empty());
+    }
+
+    /// A question we could not answer is still a question that was asked — and on a censored line
+    /// that is the interesting half. Recording only the successes would hide exactly the names
+    /// that fail.
+    #[test]
+    fn a_name_is_recorded_even_when_nothing_could_be_resolved() {
+        let s = server().recording_names();
+        let _ = s.answer(&dnsmsg::encode_query("nothing.example", 7).expect("query"));
+        assert_eq!(s.seen_names(), vec![("nothing.example".to_string(), 1)]);
+        assert_eq!(s.stats.answered.load(Ordering::Relaxed), 0);
     }
 
     #[test]

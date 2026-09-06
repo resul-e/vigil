@@ -383,7 +383,7 @@ pub fn offer_staged_offline(
 /// The runner: a copy of this executable inside the staging folder, so the one in the application
 /// folder is idle and can be replaced like any other file.
 pub fn runner_path(app_folder: &Path) -> PathBuf {
-    staging_dir(app_folder).join("runner.exe")
+    staging_dir(app_folder).join(vigil_platform::paths::RUNNER_EXE)
 }
 
 /// Put a copy of `me` in the staging folder and return where it went.

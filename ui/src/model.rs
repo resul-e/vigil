@@ -1115,6 +1115,69 @@ mod tests {
         }
     }
 
+    /// **The two ordinary arms of `status_line`, which nothing asserted.**
+    ///
+    /// Only the `Stranded` arm was pinned, so the other two could be swapped — telling a protected
+    /// user they are off and an idle one they are protected — or made identical, and the suite
+    /// stayed green. This is the line at the top of both windows: it is the whole answer to "is it
+    /// working", and it is what somebody reads before deciding whether to trust the tool.
+    #[test]
+    fn the_status_line_distinguishes_protecting_from_idle() {
+        for lang in [Lang::Turkish, Lang::English] {
+            let on = Snapshot {
+                lang,
+                engaged: true,
+                listening: true,
+                ..snap()
+            };
+            let off = Snapshot {
+                engaged: false,
+                ..on.clone()
+            };
+            assert_eq!(Health::of(&on), Health::Protecting);
+            assert_eq!(Health::of(&off), Health::Idle);
+
+            let (a, b) = (status_line(&on), status_line(&off));
+            assert_ne!(a, b, "{lang:?}: protecting and idle read the same");
+            assert!(
+                a.contains(&on.listen),
+                "{lang:?}: the protecting line must name the address a client points at: {a}"
+            );
+            // Neither ordinary state may borrow the emergency wording.
+            for line in [&a, &b] {
+                assert_ne!(
+                    line.as_str(),
+                    t(lang, "health.stranded"),
+                    "{lang:?}: an ordinary state rendered as stranded"
+                );
+            }
+        }
+    }
+
+    /// Every `Health` renders a distinct, non-empty label in both languages.
+    ///
+    /// `Health::label` is a three-arm match of which only `Stranded` was ever called; the other two
+    /// could return the same string, or an empty one, unnoticed.
+    #[test]
+    fn every_health_has_its_own_label_in_both_languages() {
+        for lang in [Lang::Turkish, Lang::English] {
+            let all = [Health::Protecting, Health::Idle, Health::Stranded];
+            let labels: Vec<&str> = all.iter().map(|h| h.label(lang)).collect();
+            for (h, l) in all.iter().zip(&labels) {
+                assert!(!l.is_empty(), "{lang:?} {h:?} has no label");
+            }
+            for i in 0..labels.len() {
+                for j in (i + 1)..labels.len() {
+                    assert_ne!(
+                        labels[i], labels[j],
+                        "{lang:?}: {:?} and {:?} share a label",
+                        all[i], all[j]
+                    );
+                }
+            }
+        }
+    }
+
     /// A listener that is down while nothing points at us is not an emergency.
     #[test]
     fn not_listening_and_not_engaged_is_still_only_idle() {

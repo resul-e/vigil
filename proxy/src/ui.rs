@@ -56,11 +56,19 @@ impl Response {
             body: format!("{why}\n"),
         }
     }
+    pub fn forbidden(why: &str) -> Self {
+        Response {
+            status: 403,
+            content_type: "text/plain; charset=utf-8",
+            body: format!("{why}\n"),
+        }
+    }
 
     pub fn to_wire(&self) -> Vec<u8> {
         let reason = match self.status {
             200 => "OK",
             400 => "Bad Request",
+            403 => "Forbidden",
             404 => "Not Found",
             _ => "Error",
         };
@@ -87,6 +95,9 @@ pub struct View<'a> {
     pub stats: &'a Stats,
     pub cache: &'a Cache,
     pub rules: &'a HostRules,
+    /// A per-process secret the page is served with and must send back on anything that changes
+    /// state. See [`route`].
+    pub token: &'a str,
 }
 
 /// What a request asked us to change.
@@ -107,21 +118,61 @@ pub fn route(request_line: &str, v: &View<'_>) -> (Response, Action) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
     match (method, path) {
-        ("GET", "/") => (Response::ok_html(PAGE), Action::None),
+        ("GET", "/") => (
+            Response::ok_html(PAGE.replace(TOKEN_PLACEHOLDER, v.token)),
+            Action::None,
+        ),
         ("GET", "/api/status") => (Response::ok_json(status_json(v)), Action::None),
-        ("POST", "/api/forget") => match query_value(query, "host") {
-            Some(h) if !h.is_empty() => {
-                (Response::ok_json(r#"{"ok":true}"#), Action::ForgetHost(h))
+        // **The one endpoint that changes state, and the only one that needs the token.**
+        //
+        // The panel listens on loopback, which stops another machine reaching it and stops nothing
+        // else: any page in the user's browser can `fetch("http://127.0.0.1:1081/api/forget",
+        // {method:"POST"})` and throw away every learned strategy on the machine. The browser
+        // refuses to let that page *read* the reply, but the write has already happened — and the
+        // panel is on by **default** for the `vigil` CLI (`--no-panel` turns it off), so
+        // `vigil --auto` alone is enough.
+        //
+        // Cost of the attack is a recalibration, not a breach; that is why this is small. But the
+        // fix is one comparison, and the endpoint is one an attacker can aim at without ever seeing
+        // an answer.
+        ("POST", "/api/forget") => {
+            if query_value(query, "token").as_deref() != Some(v.token) {
+                return (Response::forbidden("bad or missing token"), Action::None);
             }
-            Some(_) => (
-                Response::bad_request("host must not be empty"),
-                Action::None,
-            ),
-            None => (Response::ok_json(r#"{"ok":true}"#), Action::ForgetAll),
-        },
+            match query_value(query, "host") {
+                Some(h) if !h.is_empty() => {
+                    (Response::ok_json(r#"{"ok":true}"#), Action::ForgetHost(h))
+                }
+                Some(_) => (
+                    Response::bad_request("host must not be empty"),
+                    Action::None,
+                ),
+                None => (Response::ok_json(r#"{"ok":true}"#), Action::ForgetAll),
+            }
+        }
         ("GET", _) | ("POST", _) => (Response::not_found(), Action::None),
         _ => (Response::bad_request("unsupported method"), Action::None),
     }
+}
+
+/// What the served page carries the token in.
+pub const TOKEN_PLACEHOLDER: &str = "__VIGIL_TOKEN__";
+
+/// A per-process token for the panel.
+///
+/// Not a cryptographic identity — it only has to be unguessable by a page that can write to the
+/// panel but can never read from it. Process id, wall clock and a stack address through SHA-256,
+/// which this crate already has from `vigil-core`; adding a random-number dependency for this would
+/// cost more than the thing it protects.
+pub fn new_token() -> String {
+    let mut seed = Vec::with_capacity(32);
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        seed.extend_from_slice(&d.as_nanos().to_le_bytes());
+    }
+    let here = 0u8;
+    seed.extend_from_slice(&(&here as *const u8 as usize).to_le_bytes());
+    vigil_core::sha256::hex(&vigil_core::sha256::hash(&seed))[..32].to_string()
 }
 
 fn query_value(query: &str, key: &str) -> Option<String> {
@@ -244,6 +295,8 @@ use std::sync::Mutex;
 /// The shared state the panel reads and mutates.
 pub struct PanelState {
     pub listen: String,
+    /// See [`new_token`]. Made once per process and never logged.
+    pub token: String,
     pub mode: Mode,
     pub fixed: Strategy,
     pub stats: Arc<Stats>,
@@ -291,6 +344,7 @@ fn handle(request_line: &str, state: &PanelState) -> Response {
             stats: &state.stats,
             cache: &cache,
             rules: &state.rules,
+            token: &state.token,
         };
         route(request_line, &view)
     };
@@ -330,6 +384,9 @@ pub fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 mod tests {
     use super::*;
 
+    /// A fixed token for the pure tests. The real one is per process.
+    const TEST_TOKEN: &str = "testtoken";
+
     fn view<'a>(
         stats: &'a Stats,
         cache: &'a Cache,
@@ -344,7 +401,66 @@ mod tests {
             stats,
             cache,
             rules,
+            token: TEST_TOKEN,
         }
+    }
+
+    /// **A page in the user's browser must not be able to wipe the learned cache.**
+    ///
+    /// The panel listens on loopback, which stops another *machine* and stops no page in this
+    /// browser: any site can `fetch("http://127.0.0.1:1081/api/forget", {method:"POST"})`. The
+    /// browser refuses to let it read the reply, but the write has already happened — and the panel
+    /// is on by **default** for the `vigil` CLI, so `vigil --auto` alone is enough. The cost is a
+    /// recalibration rather than a breach, which is why the fix is one comparison.
+    #[test]
+    fn changing_state_needs_the_token_the_page_was_served_with() {
+        let (st, ca, ru) = (Stats::default(), Cache::new(), HostRules::default());
+        let (m, f) = (Mode::Auto, Strategy::measured_default());
+        let v = view(&st, &ca, &ru, &m, &f);
+
+        for line in [
+            // What a cross-site POST looks like: no token at all.
+            "POST /api/forget HTTP/1.1",
+            "POST /api/forget?host=discord.com HTTP/1.1",
+            // And a guess.
+            "POST /api/forget?token=wrong HTTP/1.1",
+            "POST /api/forget?token= HTTP/1.1",
+        ] {
+            let (r, a) = route(line, &v);
+            assert_eq!(r.status, 403, "{line} should be refused");
+            assert_eq!(a, Action::None, "{line} must change nothing");
+        }
+
+        // With the token, the same request works.
+        let (r, a) = route("POST /api/forget?token=testtoken HTTP/1.1", &v);
+        assert_eq!(r.status, 200);
+        assert_eq!(a, Action::ForgetAll);
+    }
+
+    /// The page is served carrying the token, or its buttons cannot work at all.
+    #[test]
+    fn the_page_carries_the_token_and_not_the_placeholder() {
+        let (st, ca, ru) = (Stats::default(), Cache::new(), HostRules::default());
+        let (m, f) = (Mode::Auto, Strategy::measured_default());
+        let (r, _) = route("GET / HTTP/1.1", &view(&st, &ca, &ru, &m, &f));
+        assert!(
+            r.body.contains(TEST_TOKEN),
+            "the page was served without its token"
+        );
+        assert!(
+            !r.body.contains(TOKEN_PLACEHOLDER),
+            "the placeholder survived into the served page, so every button 403s"
+        );
+    }
+
+    /// A token nobody can guess, and a different one every process.
+    #[test]
+    fn the_token_is_long_and_not_a_constant() {
+        let a = new_token();
+        assert!(a.len() >= 32, "too short to be worth having: {a:?}");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // Two calls in the same process differ, so it cannot have been baked in at compile time.
+        assert_ne!(a, new_token());
     }
 
     #[test]
@@ -407,7 +523,7 @@ mod tests {
         let (st, ca, ru) = (Stats::default(), Cache::new(), HostRules::default());
         let (m, f) = (Mode::Auto, Strategy::measured_default());
         let (r, a) = route(
-            "POST /api/forget?host=discord.com HTTP/1.1",
+            "POST /api/forget?token=testtoken&host=discord.com HTTP/1.1",
             &view(&st, &ca, &ru, &m, &f),
         );
         assert_eq!(r.status, 200);
@@ -418,7 +534,10 @@ mod tests {
     fn forgetting_without_a_host_clears_everything() {
         let (st, ca, ru) = (Stats::default(), Cache::new(), HostRules::default());
         let (m, f) = (Mode::Auto, Strategy::measured_default());
-        let (_, a) = route("POST /api/forget HTTP/1.1", &view(&st, &ca, &ru, &m, &f));
+        let (_, a) = route(
+            "POST /api/forget?token=testtoken HTTP/1.1",
+            &view(&st, &ca, &ru, &m, &f),
+        );
         assert_eq!(a, Action::ForgetAll);
     }
 
@@ -427,7 +546,7 @@ mod tests {
         let (st, ca, ru) = (Stats::default(), Cache::new(), HostRules::default());
         let (m, f) = (Mode::Auto, Strategy::measured_default());
         let (_, a) = route(
-            "POST /api/forget?host=a%2Eb%2Ecom HTTP/1.1",
+            "POST /api/forget?token=testtoken&host=a%2Eb%2Ecom HTTP/1.1",
             &view(&st, &ca, &ru, &m, &f),
         );
         assert_eq!(a, Action::ForgetHost("a.b.com".into()));
@@ -514,10 +633,10 @@ mod tests {
             "",
             "GET",
             "GET ",
-            "GET /api/forget?host= HTTP/1.1",
+            "GET /api/forget?token=testtoken&host= HTTP/1.1",
             "GET /?a=%",
             "GET /?a=%zz",
-            "POST /api/forget?host=%",
+            "POST /api/forget?token=testtoken&host=%",
         ] {
             let _ = route(line, &v);
         }

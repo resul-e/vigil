@@ -304,8 +304,11 @@ fn install_update(lang: Lang) {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_default();
     let me = updater_path();
-    let runner = match std::fs::create_dir_all(folder.join(".vigil-update")).and_then(|_| {
-        let dst = folder.join(".vigil-update").join("runner.exe");
+    // The shared spelling, not a literal — see `vigil_platform::paths::STAGING_DIR`. The updater
+    // looks for the runner here, and the two used to name it independently.
+    let staging = folder.join(vigil_platform::paths::STAGING_DIR);
+    let runner = match std::fs::create_dir_all(&staging).and_then(|_| {
+        let dst = staging.join(vigil_platform::paths::RUNNER_EXE);
         std::fs::copy(&me, &dst).map(|_| dst)
     }) {
         Ok(p) => p,

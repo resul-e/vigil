@@ -590,6 +590,35 @@ mod batch_tests {
         assert!(cmd.contains("ipconfig /flushdns"), "{cmd}");
     }
 
+    /// **The running index keeps counting.** A separate test from the one above, deliberately:
+    /// that one uses `["127.0.0.1", "9.9.9.9"]`, which is exactly `sysdns::ours()`, and its name
+    /// says so — it pins the shape the engage path actually produces and must keep doing only that.
+    ///
+    /// This is the restore path, which writes back whatever the user had. `n + 2` was asserted only
+    /// at its first value, so `index=2` for every address after the first survived the suite — and
+    /// `netsh` rejects a duplicate index, which would fail the batch and leave the interface on a
+    /// partly-written list.
+    #[test]
+    fn restoring_more_than_two_servers_numbers_them_in_order() {
+        let cmd = batch(&one(
+            21,
+            Some(ips(&["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"])),
+        ))
+        .expect("some");
+        assert!(
+            cmd.contains("set dnsservers name=21 static 1.1.1.1 primary"),
+            "{cmd}"
+        );
+        for (i, a) in ["8.8.8.8", "9.9.9.9", "208.67.222.222"].iter().enumerate() {
+            let want = format!("add dnsservers name=21 {a} index={}", i + 2);
+            assert!(cmd.contains(&want), "missing {want:?} in {cmd}");
+        }
+        assert!(
+            !cmd.contains("index=5"),
+            "numbering ran past the addresses given: {cmd}"
+        );
+    }
+
     #[test]
     fn clearing_goes_back_to_dhcp_rather_than_to_an_empty_static_list() {
         let cmd = batch(&one(9, None)).expect("some");

@@ -84,6 +84,78 @@ pub struct HostFacts {
     pub resolvers: Vec<(String, String)>,
 }
 
+/// The `chromiumSwitches` value out of Discord's `settings.json`, as text.
+///
+/// **Electron's only proxy override.** It ships no policy engine — `policy_service()` returns
+/// `nullptr` — so this list is the one place an install can be told to ignore Windows' proxy
+/// setting (`--no-proxy-server`), to use a different one (`--proxy-server=`), to skip hosts
+/// (`--proxy-bypass-list=`), or to resolve names its own way (`--host-resolver-rules=`). Any of
+/// those answers "the setting was in force and Electron went direct anyway" without a driver, and
+/// nothing in this project has ever looked.
+///
+/// A deliberately small hand parse rather than a JSON dependency: the value is either an object or
+/// an array of strings, it is short, and the answer needed is "what does it say", not a typed tree.
+/// Anything unexpected is reported as unread rather than guessed at.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn chromium_switches(settings: &str) -> String {
+    let Some(at) = settings.find("\"chromiumSwitches\"") else {
+        return "yok (Electron proxy ayarini ezmiyor)".into();
+    };
+    let rest = &settings[at + "\"chromiumSwitches\"".len()..];
+    let Some(colon) = rest.find(':') else {
+        return "OKUNAMADI (bicim beklenmedik)".into();
+    };
+    let body = rest[colon + 1..].trim_start();
+
+    let (open, close) = match body.as_bytes().first() {
+        Some(b'{') => ('{', '}'),
+        Some(b'[') => ('[', ']'),
+        // A bare `null` is what a clean install has.
+        _ if body.starts_with("null") => return "bos".into(),
+        _ => return "OKUNAMADI (bicim beklenmedik)".into(),
+    };
+
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, c) in body.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(i + c.len_utf8());
+                break;
+            }
+        }
+    }
+    let Some(end) = end else {
+        return "OKUNAMADI (kapanmamis)".into();
+    };
+    let value: String = body[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.len() <= 2 {
+        return "bos".into();
+    }
+    // Bounded: this is quoted into a report a volunteer emails.
+    let shown = if value.len() > 400 {
+        format!("{}… ({} bayt)", &value[..400], value.len())
+    } else {
+        value
+    };
+    let loud = [
+        "--no-proxy-server",
+        "--proxy-server",
+        "--proxy-bypass-list",
+        "--host-resolver-rules",
+    ]
+    .iter()
+    .any(|k| shown.contains(k));
+    if loud {
+        format!("*** PROXY'YI ETKILIYOR *** {shown}")
+    } else {
+        shown
+    }
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 /// Replace the user's profile path with a placeholder wherever it appears.
 ///
@@ -490,6 +562,19 @@ mod imp {
                             t.contains("SKIP_MODULE_UPDATE")
                         ),
                     ));
+                    // **`chromiumSwitches` is the only proxy override Electron has.**
+                    //
+                    // Electron ships no policy engine at all — `policy_service()` returns
+                    // `nullptr` — so the Chromium command line in this file is the one place a
+                    // Discord install can be told to ignore Windows' proxy setting, or to use a
+                    // different one. `--no-proxy-server`, `--proxy-server=…`, `--proxy-bypass-list`
+                    // and `--host-resolver-rules` all live here, and any of them explains "the
+                    // setting was in force and Electron went direct anyway" without a driver.
+                    //
+                    // The value is quoted verbatim rather than summarised: this is a switch list a
+                    // person typed, it is short, and guessing which parts matter is how a report
+                    // omits the one that did.
+                    out.push(("chromiumSwitches".into(), super::chromium_switches(&t)));
                 }
                 Err(_) => out.push(("settings.json".into(), "yok".into())),
             }
@@ -827,5 +912,80 @@ mod tests {
         let text = render(&f);
         assert!(text.contains("NXDOMAIN"));
         assert!(text.contains("CEVAP VERDİ"));
+    }
+}
+#[cfg(test)]
+mod switch_tests {
+    use super::chromium_switches;
+
+    /// A clean install says nothing, and must read as "nothing", not as unread.
+    #[test]
+    fn an_install_without_the_key_is_reported_as_absent() {
+        for t in [
+            "{}",
+            r#"{"SKIP_HOST_UPDATE": true}"#,
+            r#"{"chromiumSwitche": {}}"#,
+        ] {
+            let out = chromium_switches(t);
+            assert!(out.starts_with("yok"), "{t} -> {out}");
+        }
+        assert_eq!(chromium_switches(r#"{"chromiumSwitches": null}"#), "bos");
+        assert_eq!(chromium_switches(r#"{"chromiumSwitches": {}}"#), "bos");
+        assert_eq!(chromium_switches(r#"{"chromiumSwitches": []}"#), "bos");
+    }
+
+    /// **The four that explain "the setting was in force and Electron went direct anyway."**
+    ///
+    /// Each must be quoted and each must be marked loudly, because the whole reason this is read
+    /// is that finding one of them replaces a kernel driver with an edit to a text file.
+    #[test]
+    fn a_switch_that_touches_the_proxy_is_quoted_and_flagged() {
+        for sw in [
+            "--no-proxy-server",
+            "--proxy-server=socks5://127.0.0.1:1080",
+            "--proxy-bypass-list=<local>;*.discord.com",
+            "--host-resolver-rules=MAP * 1.2.3.4",
+        ] {
+            let json = format!(r#"{{"chromiumSwitches": ["{sw}"]}}"#);
+            let out = chromium_switches(&json);
+            assert!(out.contains("PROXY'YI ETKILIYOR"), "{sw} -> {out}");
+            assert!(out.contains(sw), "the switch itself must be quoted: {out}");
+        }
+    }
+
+    /// A switch list that has nothing to do with the proxy is still reported, and not shouted at.
+    #[test]
+    fn an_unrelated_switch_list_is_reported_plainly() {
+        let out = chromium_switches(r#"{"chromiumSwitches": ["--disable-gpu"]}"#);
+        assert!(out.contains("--disable-gpu"), "{out}");
+        assert!(!out.contains("PROXY'YI ETKILIYOR"), "{out}");
+    }
+
+    /// Object form, nesting, and a value long enough to need bounding — this goes into a file
+    /// somebody emails.
+    #[test]
+    fn the_value_is_bounded_and_nesting_does_not_end_it_early() {
+        let nested = r#"{"chromiumSwitches": {"a": {"b": 1}, "c": "--no-proxy-server"}, "x": 1}"#;
+        let out = chromium_switches(nested);
+        assert!(out.contains("--no-proxy-server"), "{out}");
+        assert!(!out.contains("\"x\""), "it read past its own value: {out}");
+
+        let long = format!(r#"{{"chromiumSwitches": ["{}"]}}"#, "-".repeat(900));
+        let out = chromium_switches(&long);
+        assert!(out.len() < 500, "unbounded: {} bytes", out.len());
+        assert!(out.contains("bayt"), "it must say it was cut: {out}");
+    }
+
+    /// Malformed input is reported as unread rather than guessed at.
+    #[test]
+    fn something_unreadable_says_so() {
+        for t in [
+            r#"{"chromiumSwitches""#,
+            r#"{"chromiumSwitches": ["#,
+            r#"{"chromiumSwitches": 7}"#,
+        ] {
+            let out = chromium_switches(t);
+            assert!(out.contains("OKUNAMADI"), "{t} -> {out}");
+        }
     }
 }

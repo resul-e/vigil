@@ -49,6 +49,15 @@ pub struct Config {
     pub cache_path: Option<std::path::PathBuf>,
     pub connect_timeout: Duration,
     pub io_timeout: Duration,
+    /// How long to wait for the upstream's first word before giving up on deciding *now*.
+    ///
+    /// Expiring is not a verdict. On a silent-drop line the answer never comes, and on that
+    /// same line a healthy control host answered at **5984 ms** — under 2x this window — so
+    /// a strategy cannot be judged by whether this timer fired. What happens instead is that
+    /// the verdict is deferred to the end of the relay, where "did the upstream ever speak"
+    /// is a question with an answer. This value only decides how long the client waits
+    /// before its bytes start flowing.
+    pub first_flight_peek: Duration,
     pub max_connections: usize,
     /// How many times the first flight may be sent before giving up, on a fresh connection
     /// each time. 1 disables retrying. Only applies where the outcome is watched anyway.
@@ -72,6 +81,7 @@ impl Default for Config {
             cache_path: None,
             connect_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(60),
+            first_flight_peek: Duration::from_millis(2500),
             max_connections: 512,
             // Three: measured, not chosen. A single attempt reaches the Discord updater's
             // endpoint 9/20; three independent attempts at that rate leave roughly one start
@@ -422,19 +432,30 @@ fn refuse(client: &mut TcpStream, dialect: Dialect, why: Refusal) {
 }
 
 /// Read until the opening bytes identify a dialect, or the peer goes away.
-fn read_dialect(s: &mut TcpStream, buf: &mut Vec<u8>) -> Option<Dialect> {
+///
+/// Returns [`Sniff`] rather than `Option<Dialect>` so the caller can tell the three outcomes
+/// apart. It used to collapse them into `None` — an unrecognised first byte, a peer that closed
+/// before sending one, and *any* read error including the 60-second `io_timeout` — and the single
+/// call site counted all three as `unrecognised`. That counter is surfaced on the panel and in the
+/// field report, where it is read as "something spoke a protocol we do not answer", which is the
+/// evidence for adding a dialect. A port scanner, a health check that connects and hangs up, and a
+/// client that stalled all looked like that.
+///
+/// `Sniff::Need` is reused for "the peer went away before any byte decided anything", which is what
+/// it already means one layer down: we still need a byte and are never going to get one.
+fn read_dialect(s: &mut TcpStream, buf: &mut Vec<u8>) -> Sniff {
     let mut tmp = [0u8; 1024];
     loop {
         match sniff(buf) {
-            Sniff::Known(d) => return Some(d),
-            Sniff::Unrecognised(_) => return None,
+            Sniff::Known(d) => return Sniff::Known(d),
+            Sniff::Unrecognised(b) => return Sniff::Unrecognised(b),
             Sniff::Need => {}
         }
         match s.read(&mut tmp) {
-            Ok(0) => return None,
+            Ok(0) => return Sniff::Need,
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => return None,
+            Err(_) => return Sniff::Need,
         }
     }
 }
@@ -598,10 +619,18 @@ impl Shared {
         let _ = std::fs::write(p, c.to_text());
     }
 
-    fn record_outcome(&self, host: &str, reached: bool, mode: &Mode) {
+    fn record_outcome(&self, host: &str, trial: Trial, mode: &Mode) {
         if *mode != Mode::Auto {
             return;
         }
+        // A trial that proved nothing must not touch the cache or the sweep. Callers are
+        // expected to resolve silence before getting here; this is the backstop for the
+        // cases where even the deferred verdict cannot.
+        let reached = match trial {
+            Trial::Reached => true,
+            Trial::Failed => false,
+            Trial::Inconclusive => return,
+        };
         let key = host.to_ascii_lowercase();
         let known = self
             .cache
@@ -629,11 +658,7 @@ impl Shared {
             let cal = cals
                 .entry(key.clone())
                 .or_insert_with(Calibrator::with_builtin_candidates);
-            cal.record(if reached {
-                Trial::Reached
-            } else {
-                Trial::Failed
-            });
+            cal.record(trial);
             cal.result().cloned()
         };
         if let Some(s) = settled {
@@ -653,10 +678,22 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
 
     // --- which protocol is this? ---
     let mut buf = Vec::with_capacity(512);
-    let Some(dialect) = read_dialect(&mut client, &mut buf) else {
-        stats.unrecognised.fetch_add(1, Ordering::Relaxed);
-        stats.handshake_errors.fetch_add(1, Ordering::Relaxed);
-        return;
+    let dialect = match read_dialect(&mut client, &mut buf) {
+        Sniff::Known(d) => d,
+        // A first byte we do not speak. This is the one that means "something wanted a protocol
+        // vigil does not answer", and the only one worth reading as evidence for adding one.
+        Sniff::Unrecognised(_) => {
+            stats.unrecognised.fetch_add(1, Ordering::Relaxed);
+            stats.handshake_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // The peer went away, or stalled past the read timeout, before any byte decided anything.
+        // A port scanner and a health check both land here, and neither is a protocol we are
+        // missing — so it is a handshake error and *not* an unrecognised dialect.
+        Sniff::Need => {
+            stats.handshake_errors.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     };
     match dialect {
         Dialect::Socks5 => stats.by_socks5.fetch_add(1, Ordering::Relaxed),
@@ -810,6 +847,8 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
     let watch = eligible && (mode == Mode::Auto || attempts > 1);
     let mut early = Vec::new();
     let mut recorded = false;
+    // The first flight drew silence and the verdict is waiting on the relay below.
+    let mut deferred = false;
     for attempt in 0..attempts {
         if attempt > 0 {
             let _ = upstream.shutdown(Shutdown::Both);
@@ -843,31 +882,47 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
             break;
         }
         // A reset can land on the write as easily as on the read, and means the same thing.
-        let reached = wrote && {
-            let _ = upstream.set_read_timeout(Some(Duration::from_millis(2500)));
+        let verdict = if !wrote {
+            Trial::Failed
+        } else {
+            let _ = upstream.set_read_timeout(Some(cfg.first_flight_peek));
             let mut peek = [0u8; 8192];
-            let r = match upstream.read(&mut peek) {
-                Ok(0) => false,
+            let v = match upstream.read(&mut peek) {
+                Ok(0) => Trial::Failed,
                 Ok(n) => {
                     early.clear();
                     early.extend_from_slice(&peek[..n]);
-                    true
+                    Trial::Reached
                 }
-                // A timeout is not a reset: nothing killed the flight, so there is nothing to
-                // retry, and re-sending would only cost the client another 2.5 seconds.
-                Err(e) => !matches!(
-                    e.kind(),
-                    ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
-                ),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    Trial::Failed
+                }
+                // Silence, which is **not** a verdict. It is what a censor that drops looks
+                // like and it is also what a server slower than this window looks like, and
+                // nothing here can tell them apart yet. So decide nothing, retry nothing —
+                // nothing killed the flight — and let the relay answer it below.
+                Err(_) => Trial::Inconclusive,
             };
             let _ = upstream.set_read_timeout(Some(cfg.io_timeout));
-            r
+            v
         };
+        // Only the **first** attempt is ever reported, retry or not.
         if !recorded {
-            shared.record_outcome(&host_name, reached, &mode);
             recorded = true;
+            if verdict == Trial::Inconclusive {
+                deferred = true;
+            } else {
+                shared.record_outcome(&host_name, verdict, &mode);
+            }
         }
-        if reached {
+        // Only a reset or a bare close is worth another flight. Silence is not: re-sending
+        // into it would cost the client the whole window again and prove no more.
+        if verdict != Trial::Failed {
             break;
         }
     }
@@ -903,6 +958,20 @@ fn handle(mut client: TcpStream, cfg: &Config, stats: &Stats, shared: &Shared) {
     // silent-drop censor looks like from in here.
     if back == 0 {
         shared.stats.closed_empty.fetch_add(1, Ordering::Relaxed);
+    }
+    // **The verdict the peek could not reach.** Silence at 2500 ms means one of two things,
+    // and this is the point where they stop looking alike: a server merely slower than the
+    // window has spoken by now and `back` is non-zero, while a censor that swallowed the
+    // flight has said nothing for the whole life of the connection. That is the same signal
+    // `closed_empty` counts, read once more for the calibrator's benefit — and it is what
+    // keeps a host answering at 5984 ms from being walked off a strategy that works.
+    if deferred {
+        let late = if back == 0 {
+            Trial::Failed
+        } else {
+            Trial::Reached
+        };
+        shared.record_outcome(&host_name, late, &mode);
     }
     let _ = client.shutdown(Shutdown::Write);
     let _ = up.join();

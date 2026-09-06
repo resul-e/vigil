@@ -270,6 +270,7 @@ fn main() -> ExitCode {
                     let panel_addr = l.local_addr().unwrap_or(a);
                     eprintln!("  panel: http://{panel_addr}");
                     let state = std::sync::Arc::new(PanelState {
+                        token: ui::new_token(),
                         // The proxy's address, not the panel's. This field is what a user
                         // reads to point a client at vigil, so naming the panel here sends
                         // them to a port that speaks HTTP and no proxy protocol at all.

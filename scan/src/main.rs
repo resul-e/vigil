@@ -861,7 +861,10 @@ fn run(opts: Options) -> std::process::ExitCode {
                 && report::mechanism(&r.tally, &r.responses) == report::Mechanism::ResetInjection
         });
         if !resets {
-            eprintln!("  (sessiz düşürme tespit edildi — TTL taraması atlanıyor, ölçemez)");
+            eprintln!(
+                "  (sessiz düşürme tespit edildi — TTL taraması temel ölçümle yapılamaz, \
+                 stratejiler koştuktan sonra tekrar bakılacak)"
+            );
         }
         // Say what the sweep will not cover. Silence here would read as full coverage.
         let (_, unreachable) = plan::sizes_for(&blocked[0]);
@@ -878,6 +881,43 @@ fn run(opts: Options) -> std::process::ExitCode {
         let inv = plan::investigation(&blocked, plan::ttl_sweep_can_work(resets), d);
         let rest = execute(&inv, &mut counter, &mut done, total, &dns);
         results.extend(rest);
+
+        // **Second route to the hop count, for a line that drops silently.**
+        //
+        // The sweep above was skipped because the baseline said nothing, and a sweep against
+        // silence times out at every TTL — which is indistinguishable from the packet expiring
+        // early, so it answers nothing. But the strategy cells have now run, and on this family
+        // of networks one of them provokes what the baseline would not: a `split:*` flight is
+        // 0/300 on the second network *and turns its silent drop into an active reset*. A reset
+        // is precisely what the sweep looks for, so it can be carried by the strategy that
+        // causes one. The censor's own reaction is the ruler.
+        //
+        // The budget was already reserved: `total` is computed with the sweep assumed to run.
+        if !resets {
+            let provoker = results.iter().find(|r| {
+                r.cell.phase == plan::Phase::Strategy
+                    && r.cell.ttl.is_none()
+                    && !r.reached()
+                    && report::mechanism(&r.tally, &r.responses)
+                        == report::Mechanism::ResetInjection
+            });
+            match provoker {
+                Some(r) => {
+                    let (host, strategy) = (r.cell.host.clone(), r.cell.strategy.clone());
+                    eprintln!(
+                        "  (sessiz düşürme, ama '{strategy}' reset tetikliyor — TTL taraması \
+                         o strateji ile yapılıyor)"
+                    );
+                    let cells = plan::ttl_probe(&host, &strategy, d);
+                    let ttl = execute(&cells, &mut counter, &mut done, total, &dns);
+                    results.extend(ttl);
+                }
+                None => eprintln!(
+                    "  (sessiz düşürme, ve hiçbir strateji reset tetiklemedi — TTL taraması \
+                     ölçemez, atlandı)"
+                ),
+            }
+        }
     }
 
     let mut text = report::render(&ctx, &results, &dns);

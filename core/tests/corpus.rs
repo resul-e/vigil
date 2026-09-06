@@ -120,7 +120,15 @@ fn cutting_before_the_sni_reports_truncated() {
                     "{} {}: cut at {cut} (sni at {start}) claimed a complete parse",
                     f.client, f.host
                 ),
-                Err(_) => {}
+                // **`Truncated`, not merely "some error".** This arm used to accept any `Err`, so
+                // the header-layer branch that chooses between `Truncated` and `Malformed` was
+                // pinned by nothing in the workspace — and the whole point of the distinction is
+                // that a caller must be able to tell "read more bytes" from "this is not a
+                // ClientHello".
+                Err(e) => panic!(
+                    "{} {}: cut at {cut} (sni at {start}) reported {e:?} instead of Truncated",
+                    f.client, f.host
+                ),
             }
         }
     }

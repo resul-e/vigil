@@ -116,6 +116,152 @@ fn attempt(proxy: SocketAddr, host: &str, port: u16) -> bool {
 
 /// [`start`] with per-host recording on, so a test can read which strategy each connection
 /// actually put on the wire rather than only what the calibrator ended up believing.
+/// Like [`start_recording`] but with the first-flight peek and the relay timeout dialled down,
+/// so a test can put a server on the far side of the peek window without waiting seconds for it.
+///
+/// The ratio is what matters, not the constants: the line this was written for answers at
+/// **5984 ms** against a **2500 ms** peek, and every assertion below holds for any pair with the
+/// same shape.
+fn start_peek(mode: Mode, peek: Duration, io: Duration) -> (SocketAddr, Arc<Server>) {
+    let cfg = Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        strategy: Strategy::passthrough(),
+        mode,
+        io_timeout: io,
+        first_flight_peek: peek,
+        record_hosts: true,
+        ..Default::default()
+    };
+    let server = Arc::new(Server::new(cfg));
+    let l = server.bind().expect("bind");
+    let addr = l.local_addr().expect("addr");
+    let s2 = Arc::clone(&server);
+    std::thread::spawn(move || s2.serve(l));
+    (addr, server)
+}
+
+/// **Alive, and slower than the peek.** Accepts the flight, says nothing until `delay` has
+/// passed, then answers properly and serves.
+///
+/// This is the double that stops the third trial state from being "score a timeout as failure".
+/// A control host on the second network answered at 5984 ms against a 2500 ms peek — under 2x of
+/// headroom — so a healthy server *does* land on the far side of that window in the field.
+fn slow_upstream(delay: Duration) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut s) = c else { continue };
+            std::thread::spawn(move || {
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(4)));
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf);
+                std::thread::sleep(delay);
+                let _ = s.write_all(b"\x16\x03\x03\x00\x02\x02\x00");
+                let mut sink = [0u8; 4096];
+                while let Ok(k) = s.read(&mut sink) {
+                    if k == 0 || s.write_all(&sink[..k]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Drive one connection and let its relay run to completion, so the deferred verdict lands.
+fn drive(proxy: SocketAddr, port: u16, wait: Duration) {
+    if let Ok(mut c) = socks_connect(proxy, "127.0.0.1", port) {
+        let hello = vigil_core::synth::client_hello("silent.example", 300, [11u8; 32])
+            .expect("a 300 byte hello");
+        let _ = c.write_all(&hello);
+        let mut buf = [0u8; 64];
+        let _ = c.set_read_timeout(Some(wait));
+        let _ = c.read(&mut buf);
+    }
+    // The verdict is recorded when the relay ends, not when the client leaves.
+    std::thread::sleep(wait);
+}
+
+/// **Gate for the third trial state, half one: silence must not confirm anything.**
+///
+/// Against an upstream that swallows every flight and answers nothing, the calibrator has to
+/// keep *moving*. With the two-state boolean a read timeout scored as `Reached`, so five
+/// connections settled candidate #0 permanently and `ABANDON` could never fire however
+/// completely the strategy had stopped working — on the one network whose entire mechanism is
+/// silence.
+#[test]
+fn against_a_silent_upstream_the_calibrator_advances_instead_of_settling() {
+    let up = silent_upstream();
+    let (proxy, server) = start_peek(
+        Mode::Auto,
+        Duration::from_millis(120),
+        Duration::from_millis(500),
+    );
+
+    for _ in 0..8 {
+        drive(proxy, up.port(), Duration::from_millis(500));
+    }
+
+    assert!(
+        server
+            .cache
+            .lock()
+            .expect("cache")
+            .get("127.0.0.1")
+            .is_none(),
+        "silence settled a strategy: the calibrator confirmed a candidate that never worked"
+    );
+    let detail = server.seen_detail();
+    let rec = detail
+        .iter()
+        .find(|(h, _)| h == "127.0.0.1")
+        .map(|(_, r)| r)
+        .expect("the host was seen");
+    let distinct: std::collections::BTreeSet<&String> = rec.applied.iter().collect();
+    assert!(
+        distinct.len() >= 2,
+        "the sweep never advanced past {:?} — silence is still being read as success",
+        rec.applied
+    );
+}
+
+/// **Gate for the third trial state, half two: a slow server must not be walked off a working
+/// strategy.**
+///
+/// This is the failure the tempting one-line fix causes. Scoring the peek's timeout as
+/// `Failed` would advance the sweep every time a healthy server answered late, and on the
+/// second network a control host answered at **5984 ms** against a **2500 ms** peek. The
+/// upstream here is deliberately slower than the peek and perfectly healthy: the calibrator
+/// must settle on the *first* candidate, having never advanced.
+#[test]
+fn a_server_slower_than_the_peek_is_not_walked_off_a_working_strategy() {
+    let up = slow_upstream(Duration::from_millis(260));
+    let (proxy, server) = start_peek(
+        Mode::Auto,
+        Duration::from_millis(120),
+        Duration::from_millis(600),
+    );
+
+    for _ in 0..8 {
+        drive(proxy, up.port(), Duration::from_millis(600));
+    }
+
+    let cache = server.cache.lock().expect("cache");
+    let settled = cache.get("127.0.0.1");
+    assert!(
+        settled.is_some(),
+        "a healthy upstream never settled, because answering late was read as failing"
+    );
+    assert_eq!(
+        settled.map(|s| s.to_string()),
+        Some("tlsrec:64+split:1".to_string()),
+        "the sweep advanced past a candidate that was working the whole time"
+    );
+}
+
 fn start_recording(mode: Mode) -> (SocketAddr, Arc<Server>) {
     let cfg = Config {
         listen: "127.0.0.1:0".parse().unwrap(),
