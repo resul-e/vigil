@@ -5,6 +5,7 @@
 
 pub mod dialect;
 pub mod dnsserver;
+pub mod doh;
 pub mod http_connect;
 pub mod resolver;
 pub mod server;

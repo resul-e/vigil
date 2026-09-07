@@ -39,13 +39,31 @@ pub struct Deadlines {
     pub stall: Duration,
 }
 
+/// The largest single file an update may carry.
+///
+/// **The unit is the largest file, never the zip.** `body` is applied per attempt of one URL and
+/// the stager fetches each `file=` entry separately; the two zips exist for people to download by
+/// hand and this code never touches one. The comment here used to say "a 2.5 MB binary", which was
+/// true of `vigil-update.exe` and stopped being the largest file when DoH put rustls into
+/// `vigil-app.exe` and `vigil-scan.exe` — 3.4 MB apiece.
+pub const MAX_FILE_BYTES: u64 = 4_000_000;
+
+/// The slowest line an update is still expected to finish on.
+///
+/// Not a wish: it is the number that turns `MAX_FILE_BYTES` into a deadline, and a test asserts
+/// `body` is at least the quotient. Raise the files and this arithmetic goes red before a release
+/// rather than after it — which matters more than it sounds, because **the code that performs an
+/// apply is always the old version's code**. A download deadline that is too short cannot be fixed
+/// by an update for anybody who already has it; this edit protects the release *after* this one.
+pub const FLOOR_BYTES_PER_SEC: u64 = 12_000;
+
 impl Default for Deadlines {
     fn default() -> Self {
         Deadlines {
             connect: Duration::from_secs(5),
             head: Duration::from_secs(10),
-            // A 2.5 MB binary on a slow Turkish line, with room to spare.
-            body: Duration::from_secs(300),
+            // `MAX_FILE_BYTES / FLOOR_BYTES_PER_SEC` = 334 s, per attempt, of three.
+            body: Duration::from_secs(340),
             stall: Duration::from_secs(20),
         }
     }
@@ -356,7 +374,17 @@ mod tests {
             d.stall < d.body,
             "a stall must be caught before the body deadline"
         );
-        assert!(d.body >= Duration::from_secs(120), "a slow line needs room");
+        // **Arithmetic, not a number somebody liked.** The largest file an update may carry,
+        // divided by the slowest line it must still finish on. Raising the binaries without
+        // raising this goes red here, before the release rather than after it.
+        assert!(
+            d.body.as_secs() >= MAX_FILE_BYTES / FLOOR_BYTES_PER_SEC,
+            "body is {} s; {} B at {} B/s needs {} s",
+            d.body.as_secs(),
+            MAX_FILE_BYTES,
+            FLOOR_BYTES_PER_SEC,
+            MAX_FILE_BYTES / FLOOR_BYTES_PER_SEC
+        );
     }
 
     /// Build the first flight offline — no network — and measure it. Same shape as

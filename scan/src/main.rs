@@ -229,6 +229,8 @@ fn main() -> std::process::ExitCode {
     match args.first().map(String::as_str) {
         Some("cell") => cell(&args[1..]),
         Some("dns") => dns_report(),
+        Some("dnsburst") => dnsburst(&args[1..]),
+        Some("dns65") => dns65(&args[1..]),
         Some("teshis") | Some("diag") => diag_report(),
         None => {
             // The double-click path. Anything that goes wrong from here is printed into a window
@@ -539,7 +541,7 @@ fn honest_addrs(dns: &[dns::Comparison], host: &str) -> Option<Vec<std::net::IpA
     }
     c.public
         .iter()
-        .find_map(|(_, r)| r.as_ref().ok())
+        .find_map(|a| a.got.as_ref().ok())
         .filter(|v| !v.is_empty())
         .map(|v| v.iter().map(|a| std::net::IpAddr::V4(*a)).collect())
 }
@@ -647,25 +649,42 @@ fn execute(
 /// Print the DNS comparison on its own. Diagnostic, and fast enough to run before deciding
 /// whether a full scan is even worth starting.
 fn dns_report() -> std::process::ExitCode {
-    for c in check_dns() {
-        let verdict = match dns::integrity(&c) {
+    let all = check_dns();
+    for c in &all {
+        let verdict = match dns::integrity(c) {
             dns::Integrity::Agrees => "ok",
             dns::Integrity::Tampered => "TAMPERED",
             dns::Integrity::Unknown => "unknown",
         };
         let sys: Vec<String> = c.system.iter().map(|a| a.to_string()).collect();
         println!("{:<26} {:<9} system={}", c.host, verdict, sys.join(","));
-        for (name, r) in &c.public {
-            let got = match r {
-                Ok(a) => a
+        for a in &c.public {
+            let got = match &a.got {
+                Ok(v) => v
                     .iter()
                     .map(|x| x.to_string())
                     .collect::<Vec<_>>()
                     .join(","),
                 Err(e) => format!("<{e}>"),
             };
-            println!("    {name:<12} {got}");
+            println!("    {:<14} {got}", a.name);
         }
+        for (name, up) in dns::public_upstreams() {
+            if !c.public.iter().any(|a| a.via == up) {
+                println!("    {name:<14} <never asked>");
+            }
+        }
+    }
+    // **Per transport, and never one combined number.** Whether the transport this line is being
+    // asked to adopt works at all is not visible in a total.
+    println!();
+    println!("{}", dns::provenance_line(&configured_resolvers(), &all));
+    println!();
+    for t in dns::tally(&all) {
+        println!(
+            "transport {:<4} answered {}/{}  (timeout {} tls {} http {})",
+            t.transport, t.answered, t.asked, t.timeout, t.tls, t.http
+        );
     }
     std::process::ExitCode::SUCCESS
 }
@@ -686,35 +705,334 @@ fn diag_report() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// The names `dnsburst` uses when none are given. Distinct on purpose — one name asked twenty
+/// times measures the cache, not the resolver.
+const BURST_NAMES: &[&str] = &[
+    "discord.com",
+    "updates.discord.com",
+    "cdn.discordapp.com",
+    "gateway.discord.gg",
+    "media.discordapp.net",
+    "roblox.com",
+    "www.roblox.com",
+    "apis.roblox.com",
+    "clientsettingscdn.roblox.com",
+    "example.com",
+    "github.com",
+    "wikipedia.org",
+    "cloudflare.com",
+    "mozilla.org",
+    "kernel.org",
+    "rust-lang.org",
+    "crates.io",
+    "docs.rs",
+    "archive.org",
+    "openstreetmap.org",
+];
+
+/// What a `dnsburst` command line asks for. **Pure**, so the parsing is testable.
+///
+/// Extracted after the first version read the count from the wrong index and silently ran the
+/// default twenty instead of the five it was asked for. The numbers happened to be right for
+/// twenty and would have been quietly wrong for anything else — which is the whole argument for
+/// not leaving an argument parser inside an I/O function.
+#[derive(Debug, PartialEq, Eq)]
+struct BurstPlan {
+    n: usize,
+    upstreams: Vec<vigil_proxy::resolver::Upstream>,
+    names: Vec<String>,
+}
+
+fn burst_plan(args: &[String]) -> Result<BurstPlan, String> {
+    use vigil_proxy::resolver::Upstream;
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    // `args` starts *after* the subcommand, so the count is at index 0.
+    let n: usize = args
+        .first()
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.parse().map_err(|_| format!("{s:?} is not a count")))
+        .transpose()?
+        .unwrap_or(20);
+
+    let mut upstreams = Vec::new();
+    if let Some(ip) = flag("--doh") {
+        upstreams.push(Upstream::Doh {
+            addr: vigil_proxy::resolver::parse_doh_endpoint(&ip)?,
+            path: "/dns-query",
+            alpn: true,
+        });
+    }
+    for (i, a) in args.iter().enumerate() {
+        if a == "--resolver" {
+            let addr = args
+                .get(i + 1)
+                .and_then(|x| x.parse().ok())
+                .ok_or_else(|| "--resolver needs a HOST:PORT".to_string())?;
+            upstreams.push(Upstream::Udp(addr));
+        }
+    }
+    if upstreams.is_empty() {
+        upstreams = vigil_proxy::resolver::default_upstreams();
+    }
+
+    let pool: Vec<String> = match flag("--names") {
+        // Empty entries dropped: `--names ""` and `--names "a.test,,b.test"` would otherwise ask
+        // the resolver about the empty name, which is meaningless and would be counted as a
+        // failure against the transport under test.
+        Some(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => BURST_NAMES.iter().map(|s| (*s).to_string()).collect(),
+    };
+    if pool.is_empty() {
+        return Err("--names is empty".into());
+    }
+    let names = pool.into_iter().cycle().take(n).collect();
+    Ok(BurstPlan {
+        n,
+        upstreams,
+        names,
+    })
+}
+
+/// **`vigil-scan dns65 NAME [--to ADDR]…`** — what a resolver says about a name's HTTPS record.
+///
+/// Nothing on Windows can ask this. `nslookup`'s type table has no `HTTPS`, and PowerShell's
+/// `Resolve-DnsName` refuses the number outright — measured 2026-09-07, it prints its accepted
+/// values and 65 is not among them. So this is the only way to find out whether vigil's own DNS
+/// server is handing a browser an answer that turns ECH off.
+///
+/// Header-only: rcode, answer count, and the length of the first answer's rdata. That is enough to
+/// tell "here is an HTTPS record" from "this name has none", which is the whole question.
+fn dns65(args: &[String]) -> std::process::ExitCode {
+    let Some(name) = args.first().filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: vigil-scan dns65 NAME [--to ADDR]...");
+        return std::process::ExitCode::from(2);
+    };
+    let mut targets: Vec<std::net::SocketAddr> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| *a == "--to")
+        .filter_map(|(i, _)| args.get(i + 1))
+        .filter_map(|a| a.parse().ok())
+        .collect();
+    if targets.is_empty() {
+        targets = ["1.1.1.1:53", "127.0.0.1:53"]
+            .iter()
+            .filter_map(|a| a.parse().ok())
+            .collect();
+    }
+
+    println!("dns65  name={name}");
+    for to in targets {
+        let q = match vigil_core::dnsmsg::encode_query_type(
+            name,
+            0x6500,
+            vigil_core::dnsmsg::TYPE_HTTPS,
+        ) {
+            Ok(q) => q,
+            Err(e) => {
+                println!("  {to:<20} bad name: {e:?}");
+                continue;
+            }
+        };
+        let bind = if to.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let Ok(sock) = bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| ())
+            .and_then(|a| std::net::UdpSocket::bind(a).map_err(|_| ()))
+        else {
+            println!("  {to:<20} could not open a socket");
+            continue;
+        };
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(3)));
+        if sock.send_to(&q, to).is_err() {
+            println!("  {to:<20} could not send");
+            continue;
+        }
+        let mut buf = [0u8; 1500];
+        match sock.recv_from(&mut buf) {
+            Err(_) => println!("  {to:<20} <no reply>"),
+            Ok((n, _)) if n < 12 => println!("  {to:<20} <short reply, {n} B>"),
+            Ok((n, _)) => {
+                let rcode = buf[3] & 0x0F;
+                let ancount = u16::from_be_bytes([buf[6], buf[7]]);
+                let truncated = buf[2] & 0x02 != 0;
+                // **The keys, not just the length.** "the same number of bytes" is plausible;
+                // "key 5 is in there" is the claim — RFC 9460 §14.3.2 makes 5 `ech`.
+                let keys = first_answer_rdata(&buf[..n])
+                    .and_then(|rd| vigil_core::dnsmsg::https_svcparam_keys(rd).ok())
+                    .map(|k| format!(" keys={k:?}{}", if k.contains(&5) { " <- ech" } else { "" }))
+                    .unwrap_or_default();
+                println!(
+                    "  {to:<20} rcode={rcode} answers={ancount} tc={truncated} bytes={n}{keys}{}",
+                    if ancount == 0 && rcode == 0 {
+                        "   <- NODATA: 'this name has no HTTPS record', which turns ECH off"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// The rdata of the first answer record, if there is one.
+///
+/// A small hand walk rather than a parser: skip the question, then the record's name, then its ten
+/// bytes of header. Bounds-checked at every step because this runs on whatever came back.
+fn first_answer_rdata(buf: &[u8]) -> Option<&[u8]> {
+    if buf.len() < 12 || u16::from_be_bytes([buf[6], buf[7]]) == 0 {
+        return None;
+    }
+    let mut at = 12usize;
+    // The question's name: no compression is legal here.
+    loop {
+        let len = *buf.get(at)? as usize;
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        at += 1;
+        if len == 0 {
+            break;
+        }
+        at = at.checked_add(len)?;
+    }
+    at = at.checked_add(4)?; // qtype, qclass
+                             // The answer's name, which usually is a pointer.
+    let len = *buf.get(at)? as usize;
+    at = if len & 0xC0 == 0xC0 {
+        at.checked_add(2)?
+    } else {
+        loop {
+            let l = *buf.get(at)? as usize;
+            at += 1;
+            if l == 0 {
+                break at;
+            }
+            at = at.checked_add(l)?;
+        }
+    };
+    let head = buf.get(at..at + 10)?;
+    let rdlen = u16::from_be_bytes([head[8], head[9]]) as usize;
+    buf.get(at + 10..at + 10 + rdlen)
+}
+
+/// What each interface is configured to ask, and whether DHCP chose it.
+///
+/// The provenance is the point: Windows' "DNS over HTTPS" setting replaces the provider's resolver
+/// with a public one, so a machine with it on is not measuring its provider at all.
+fn configured_resolvers() -> Vec<dns::Configured> {
+    vigil_platform::dnsclient::read_interfaces()
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .map(|i| (i.alias.clone(), i.servers.clone(), i.is_dhcp()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **`vigil-scan dnsburst [N] [--doh IP] [--resolver ADDR]… [--names a,b,c]`**
+///
+/// N distinct names, asked at once, one thread each. Prints the wall time, `k/N`, and the
+/// resolver's own per-upstream counters.
+///
+/// Nothing in this tree measured these numbers before. They matter now for one reason: the
+/// 2026-08-09 rewrite turned twenty names from 1.79 s into 0.13 s by making the sweep parallel,
+/// and DoH puts a TCP connection and a TLS handshake behind every one of those queries. If a lock
+/// or a shared connection ever creeps onto that path, this is where it shows.
+fn dnsburst(args: &[String]) -> std::process::ExitCode {
+    let plan = match burst_plan(args) {
+        Ok(p) => p,
+        Err(why) => {
+            eprintln!("{why}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    // `allow_system: false` — the operating system's resolver is the thing this tool exists
+    // because of, and letting it answer would make every number here a measurement of it.
+    let r = std::sync::Arc::new(vigil_proxy::resolver::Resolver::with_upstreams(
+        plan.upstreams,
+        false,
+    ));
+
+    println!("dnsburst  n={}  upstreams:", plan.n);
+    for u in r.upstreams() {
+        println!("  {u}");
+    }
+
+    let started = std::time::Instant::now();
+    let mut hands = Vec::new();
+    for name in plan.names {
+        let r = std::sync::Arc::clone(&r);
+        hands.push(std::thread::spawn(move || {
+            !r.resolve_no_system(&name, 443).is_empty()
+        }));
+    }
+    let ok = hands
+        .into_iter()
+        .map(|h| h.join().unwrap_or(false))
+        .filter(|x| *x)
+        .count();
+    let took = started.elapsed();
+
+    println!();
+    println!(
+        "answered {ok}/{}   wall {:.3} s",
+        plan.n,
+        took.as_secs_f64()
+    );
+    println!("{}", r.counts_line());
+    std::process::ExitCode::SUCCESS
+}
+
 /// Ask the system resolver and the public ones the same questions.
+///
+/// The loop itself lives in `dns::compare` with its two I/O halves injected, so it can be tested
+/// without a socket. What is left here is the I/O.
 fn check_dns() -> Vec<dns::Comparison> {
     let hosts: Vec<&str> = plan::CANDIDATES
         .iter()
         .chain(plan::CONTROLS.iter())
         .copied()
         .collect();
-    let mut out = Vec::new();
-    for (i, host) in hosts.iter().enumerate() {
-        let system: Vec<std::net::IpAddr> = resolve(host, 443)
-            .map(|a| a.into_iter().map(|s| s.ip()).collect())
-            .unwrap_or_default();
-        let public = dns::PUBLIC_RESOLVERS
-            .iter()
-            .map(|(name, addr)| {
-                let r = match addr.parse() {
-                    Ok(a) => dns::query(a, host, 0x4000 + i as u16, Duration::from_secs(3)),
-                    Err(_) => Err(dns::Error::NoReply),
-                };
-                ((*name).to_string(), r)
-            })
-            .collect();
-        out.push(dns::Comparison {
-            host: (*host).to_string(),
-            system,
-            public,
-        });
-    }
-    out
+    // **The machine's own configured resolver, asked directly.**
+    //
+    // Not one of the public resolvers — see `Comparison::adapter` — but the thing the `system=`
+    // column is *supposed* to be coming from. Without it the report cannot tell a poisoned line
+    // from a machine that is quietly resolving somewhere else, and those look identical.
+    let adapter = vigil_platform::dnsclient::read_interfaces()
+        .ok()
+        .and_then(|ifaces| {
+            ifaces
+                .into_iter()
+                .find(|i| !i.servers.is_empty())
+                .and_then(|i| i.servers.first().cloned())
+        })
+        .and_then(|s| format!("{s}:53").parse().ok())
+        .map(vigil_proxy::resolver::Upstream::Udp);
+
+    dns::compare(
+        &hosts,
+        &dns::public_upstreams(),
+        adapter.as_ref(),
+        |host| {
+            resolve(host, 443)
+                .map(|a| a.into_iter().map(|s| s.ip()).collect())
+                .unwrap_or_default()
+        },
+        |up, host, i| dns::query_upstream(up, host, 0x4000 + i as u16, Duration::from_secs(3)),
+    )
 }
 
 fn run(opts: Options) -> std::process::ExitCode {
@@ -800,6 +1118,7 @@ fn run(opts: Options) -> std::process::ExitCode {
         platform: std::env::consts::OS.into(),
         network,
         host_warning: hostdiag::warning(&facts.proxy),
+        resolvers: configured_resolvers(),
     };
 
     // DNS first. Everything after this assumes the addresses are honest, and on 2026-08-04
@@ -989,6 +1308,78 @@ fn run(opts: Options) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// **The count comes from index 0, because `args` starts after the subcommand.**
+    ///
+    /// It was read from index 1 for one run: `dnsburst 5 --doh …` silently ran twenty. The numbers
+    /// were right for twenty and would have been quietly wrong for anything else, which is why the
+    /// parsing is a pure function now instead of the first ten lines of an I/O function.
+    #[test]
+    fn the_burst_count_is_the_first_argument() {
+        assert_eq!(burst_plan(&a(&["5"])).expect("parses").n, 5);
+        assert_eq!(
+            burst_plan(&a(&["5", "--doh", "1.1.1.1"]))
+                .expect("parses")
+                .n,
+            5
+        );
+        // Absent, and absent-because-a-flag-came-first, both mean the default.
+        assert_eq!(burst_plan(&a(&[])).expect("parses").n, 20);
+        assert_eq!(burst_plan(&a(&["--doh", "1.1.1.1"])).expect("parses").n, 20);
+        assert!(burst_plan(&a(&["five"])).is_err(), "a bad count is refused");
+    }
+
+    /// Named upstreams replace the shipped list; none means the shipped list.
+    #[test]
+    fn the_burst_upstreams_are_the_shipped_ones_unless_named() {
+        use vigil_proxy::resolver::Upstream;
+        assert_eq!(
+            burst_plan(&a(&[])).expect("parses").upstreams,
+            vigil_proxy::resolver::default_upstreams()
+        );
+        let named = burst_plan(&a(&[
+            "5",
+            "--doh",
+            "192.0.2.1",
+            "--resolver",
+            "192.0.2.2:53",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            named.upstreams,
+            vec![
+                Upstream::Doh {
+                    addr: "192.0.2.1:443".parse().expect("literal"),
+                    path: "/dns-query",
+                    alpn: true,
+                },
+                Upstream::Udp("192.0.2.2:53".parse().expect("literal")),
+            ],
+            "an explicit list replaces the default rather than joining it"
+        );
+        // A hostname is refused here too — it would be the recursion the type prevents.
+        assert!(burst_plan(&a(&["--doh", "dns.example"])).is_err());
+    }
+
+    /// Distinct names, cycled only when more are asked for than given.
+    #[test]
+    fn the_burst_names_are_distinct_until_they_have_to_repeat() {
+        let p = burst_plan(&a(&["3", "--names", "a.test,b.test,c.test,d.test"])).expect("parses");
+        assert_eq!(p.names, a(&["a.test", "b.test", "c.test"]));
+        let p = burst_plan(&a(&["5", "--names", "a.test,b.test"])).expect("parses");
+        assert_eq!(p.names.len(), 5);
+        let p = burst_plan(&a(&["25"])).expect("parses");
+        assert_eq!(p.names.len(), 25);
+        let mut first20 = p.names[..20].to_vec();
+        first20.sort();
+        first20.dedup();
+        assert_eq!(first20.len(), 20, "the default pool has no duplicates");
+        assert!(burst_plan(&a(&["5", "--names", ""])).is_err());
+    }
 
     /// **No report names an internet provider.** The label has to be stable — two runs on the same
     /// line must line up column by column, which is the whole reason the header carries anything at

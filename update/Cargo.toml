@@ -5,9 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-# The only crate that links rustls and a signature verifier, and the reason neither ever reaches
-# `vigil-app.exe` — which every user runs — or `vigil-repair.exe`, which is the safety net and must
-# keep working when everything else has gone wrong. See docs/18-auto-update.md §1.
+# The only crate that links the **signature verifier**, and — until 2026-09-07 — the only one that
+# linked rustls. That changed deliberately: the resolver in `vigil-proxy` speaks DoH, so rustls now
+# reaches `vigil.exe` and `vigil-app.exe` too. `vigil-repair.exe` is unaffected and must stay that
+# way: it is the safety net and has to keep working when everything else has gone wrong.
+# See docs/18-auto-update.md §1 and docs/19-dns.md §6.
 #
 # The direction is `update -> proxy -> platform`, never the reverse, and a test asserts it.
 [dependencies]
@@ -20,8 +22,9 @@ vigil-proxy = { path = "../proxy" }
 # restore `vigil-repair` runs. Still the allowed direction — `update -> platform`, never the
 # reverse — and platform gains nothing, which is what keeps `vigil-repair.exe` small.
 vigil-platform = { path = "../platform" }
-# Already in [workspace.dependencies] for probe/. New only in that they now reach a shipping
-# binary — and only this one.
+# Already in [workspace.dependencies] for probe/, and since 2026-09-07 for proxy/ as well. Three
+# doors and no fourth: `update/tests/dependency_isolation.rs` asserts exactly which crates may
+# name rustls, so a fifth hand-rolled TLS loop cannot appear without the guard saying so.
 rustls.workspace = true
 rustls-pki-types.workspace = true
 webpki-roots.workspace = true

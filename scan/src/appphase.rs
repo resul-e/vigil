@@ -545,6 +545,16 @@ pub fn run(
         ("socks4".into(), st.by_socks4.load(Relaxed)),
         ("socks5".into(), st.by_socks5.load(Relaxed)),
     ];
+    // **Which transport actually answered.** The engine counters above say what the relay did; a
+    // per-upstream count says whether the resolver in front of it was DoH or the odd port, and
+    // whether the one that was asked first is the one that answered. Read only — nothing branches
+    // on these, and adaptive selection was rejected on 2026-09-07 (docs/19-dns.md §6).
+    for (i, up) in server.resolver.upstreams().iter().enumerate() {
+        let c = server.resolver.counts_of(i);
+        out.counters
+            .push((format!("cozumleyici {up} soruldu"), c.0));
+        out.counters.push((format!("cozumleyici {up} cevap"), c.1));
+    }
     Some(out)
 }
 

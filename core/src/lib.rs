@@ -15,6 +15,7 @@ pub mod calibrate;
 pub mod clienthello;
 pub mod clock;
 pub mod dnsmsg;
+pub mod doh;
 pub mod hostlist;
 pub mod reader;
 pub mod sha256;

@@ -36,6 +36,7 @@ fn main() -> ExitCode {
     let mut set_proxy = false;
     let mut system_dns = false;
     let mut resolvers: Vec<std::net::SocketAddr> = Vec::new();
+    let mut doh: Option<std::net::SocketAddr> = None;
     // Off by default. Serving DNS for the whole machine is a bigger promise than proxying for
     // the programs that opted in, and it is only useful once something points at it.
     let mut dns_listen: Option<String> = None;
@@ -67,6 +68,22 @@ fn main() -> ExitCode {
             "--no-panel" => panel = None,
             "--set-proxy" => set_proxy = true,
             "--system-dns" => system_dns = true,
+            // **DoH, off by default and reachable only here.** `default_upstreams()` is untouched,
+            // so a half-landed step leaves every machine resolving exactly as it does today.
+            "--doh" => {
+                let Some(a) = args.get(i) else {
+                    eprintln!("--doh needs an IP address");
+                    return ExitCode::from(2);
+                };
+                i += 1;
+                match vigil_proxy::resolver::parse_doh_endpoint(a) {
+                    Ok(x) => doh = Some(x),
+                    Err(why) => {
+                        eprintln!("{why}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--resolver" => {
                 let Some(a) = args.get(i) else {
                     eprintln!("--resolver needs a HOST:PORT");
@@ -184,8 +201,35 @@ fn main() -> ExitCode {
         );
     }
 
+    // Asking for both is asking for opposite things, and the old shape let one win silently.
+    if system_dns && doh.is_some() {
+        eprintln!(
+            "--doh and --system-dns ask for opposite things: one routes DNS through an encrypted \
+             transport, the other hands it back to the operating system's resolver — which on the \
+             measured line is the one that lies."
+        );
+        return ExitCode::from(2);
+    }
     let resolver = if system_dns {
         vigil_proxy::resolver::Resolver::system_only()
+    } else if let Some(addr) = doh {
+        // Prepended, not substituted: the odd-port path stays behind it as the fallback, which is
+        // the whole shape of the design — which of the two survives on which line is a
+        // measurement, not a preference.
+        let mut ups = vec![vigil_proxy::resolver::Upstream::Doh {
+            addr,
+            path: "/dns-query",
+            alpn: true,
+        }];
+        ups.extend(if resolvers.is_empty() {
+            vigil_proxy::resolver::default_upstreams()
+        } else {
+            resolvers
+                .into_iter()
+                .map(vigil_proxy::resolver::Upstream::Udp)
+                .collect()
+        });
+        vigil_proxy::resolver::Resolver::with_upstreams(ups, true)
     } else if resolvers.is_empty() {
         vigil_proxy::resolver::Resolver::default()
     } else {
@@ -340,6 +384,9 @@ fn main() -> ExitCode {
     }
 
     let stats = std::sync::Arc::clone(&server.stats);
+    // Cloned before the loop takes it: the thread outlives this scope and `server` is consumed by
+    // `serve` below.
+    let resolver = std::sync::Arc::clone(&server.resolver);
     let dns_line = dns_stats.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
@@ -364,6 +411,11 @@ fn main() -> ExitCode {
         if let Some(d) = &dns_line {
             eprintln!("{}", d.line());
         }
+        // Which upstream actually answered, per upstream. Read only — nothing branches on it, and
+        // adaptive selection was rejected on 2026-09-07 with the measurement recorded in
+        // docs/19-dns.md §6. It is here because "the odd port is first" was a claim and this makes
+        // it a number.
+        eprintln!("  cozumleyici: {}", resolver.counts_line());
         // Worth its own line: if every client is arriving on a dialect we did not expect,
         // that is the difference between "the tool is running" and "the tool is being used".
         eprintln!(

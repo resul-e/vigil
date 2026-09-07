@@ -25,7 +25,6 @@ sormaz.
 2. **Çıkartın:** ZIP'i bir klasöre çıkartın. Masaüstü olur, başka bir yer de olur.
 3. **Dosyaları kontrol edin:**
    * `vigil-app.exe` — ana program (masaüstü sürümü)
-   * `vigil.exe` — aynı motor, komut satırında
    * `vigil-repair.exe` — **acil durum aracı**
    * `vigil-update.exe` — güncellemeleri indirir; siz çalıştırmıyorsunuz, program kendi çağırıyor
 4. **Çalıştırın:** `vigil-app.exe`'ye çift tıklayın. Sağ altta, saatin yanında bir kalkan simgesi
@@ -175,7 +174,6 @@ and the program never asks.
 2. **Extract** it anywhere.
 3. **Check the files:**
    * `vigil-app.exe` — the main program (desktop version)
-   * `vigil.exe` — the same engine on the command line
    * `vigil-repair.exe` — **the emergency tool**
    * `vigil-update.exe` — fetches updates; you never run it, the program calls it
 4. **Run** `vigil-app.exe`. A shield icon appears in the system tray.

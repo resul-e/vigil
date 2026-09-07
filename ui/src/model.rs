@@ -32,6 +32,18 @@ pub struct Snapshot {
     pub dns_failures: usize,
     /// First flights re-sent after a reset. See `proxy::Stats::first_flight_retries`.
     pub first_flight_retries: usize,
+    /// What happened to the curl-convention environment variables — the channel that reaches
+    /// applications which ignore the registry setting.
+    ///
+    /// It went to an `eprintln!` and nowhere else until 2026-09-07, which in a GUI app with no
+    /// console is a silent failure of the one channel Roblox depends on and the Discord updater
+    /// reads: `Occupied` looked exactly like success.
+    pub env: EnvChannel,
+    /// The system proxy names a **vigil-shaped loopback address that is not ours** — the scanner's
+    /// `:1085`, or a previous run on another port. `engaged` is an exact compare, so this state
+    /// read as plain `Idle` and the menu offered to engage over it without saying anything was
+    /// wrong. `None` when there is nothing of the sort.
+    pub other_listener: Option<String>,
     /// Whether vigil is answering DNS on loopback at all.
     pub dns_serving: bool,
     /// Whether Windows' own resolver is pointed at us.
@@ -118,6 +130,52 @@ impl Health {
             Health::Idle => t(lang, "health.idle"),
             Health::Stranded => t(lang, "health.stranded"),
         }
+    }
+}
+
+/// The state of the environment-variable channel, as of the last engage attempt.
+///
+/// Separate from [`Health`] on purpose: the registry setting decides whether the machine is
+/// stranded, and this one decides whether the applications that read *only* these variables —
+/// Roblox, curl, git, pip, the Discord updater — are being reached at all. A machine can be
+/// perfectly `Protecting` on one channel and reaching nothing on the other.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum EnvChannel {
+    /// Nothing of ours is set, and nothing needed to be.
+    #[default]
+    Clear,
+    /// Ours, as written.
+    Ours,
+    /// Set by something that is not us, so vigil left them alone — which is right, and invisible.
+    Occupied,
+    /// The write itself failed.
+    Failed(String),
+}
+
+impl EnvChannel {
+    pub fn line(&self, lang: Lang) -> String {
+        match self {
+            EnvChannel::Clear => t(lang, "env.clear").to_string(),
+            EnvChannel::Ours => t(lang, "env.ours").to_string(),
+            EnvChannel::Occupied => t(lang, "env.occupied").to_string(),
+            EnvChannel::Failed(e) => tf(lang, "env.failed", &[("error", e)]),
+        }
+    }
+
+    /// The same state in the length a tray tooltip has. Windows truncates at 128 characters and
+    /// the body already uses most of them, so the full sentence belongs in the details window and
+    /// only the alarm belongs here.
+    pub fn short(&self, lang: Lang) -> String {
+        match self {
+            EnvChannel::Clear | EnvChannel::Ours => String::new(),
+            EnvChannel::Occupied => t(lang, "env.occupied_short").to_string(),
+            EnvChannel::Failed(_) => t(lang, "env.failed_short").to_string(),
+        }
+    }
+
+    /// Worth putting in front of somebody who has not clicked anything.
+    pub fn wants_attention(&self) -> bool {
+        matches!(self, EnvChannel::Occupied | EnvChannel::Failed(_))
     }
 }
 
@@ -607,6 +665,20 @@ pub fn tooltip(s: &Snapshot) -> String {
     } else {
         body
     };
+    // Both of these were states the interface knew about and never said. The environment one
+    // reached a console a tray app does not have; the other was not computed at all.
+    let body = if s.env.wants_attention() {
+        format!("{body}\n{}", s.env.short(s.lang))
+    } else {
+        body
+    };
+    let body = match &s.other_listener {
+        Some(addr) => format!(
+            "{body}\n{}",
+            tf(s.lang, "line.other_listener_short", &[("addr", addr)])
+        ),
+        None => body,
+    };
     clip(&body, TOOLTIP_MAX)
 }
 
@@ -894,19 +966,30 @@ pub fn dns_line(s: &Snapshot) -> &'static str {
 }
 
 pub fn full_view(s: &Snapshot) -> Vec<Section> {
+    let mut status = vec![
+        reading(status_line(s)),
+        reading(tf(s.lang, "line.address", &[("listen", &s.listen)])),
+        reading(tf(
+            s.lang,
+            "line.strategy",
+            &[("strategy", &s.mode.label(s.lang))],
+        )),
+        reading(tf(s.lang, "line.dns", &[("state", dns_line(s))])),
+        reading(tf(s.lang, "line.env", &[("state", &s.env.line(s.lang))])),
+    ];
+    // Only when there is one: this is not a counter, it is an alarm, and an alarm that is
+    // permanently on screen saying "no" is one nobody reads when it says "yes".
+    if let Some(addr) = &s.other_listener {
+        status.push(reading(tf(
+            s.lang,
+            "line.other_listener",
+            &[("addr", addr)],
+        )));
+    }
     let mut out = vec![
         Section {
             title: t(s.lang, "section.status").into(),
-            rows: vec![
-                reading(status_line(s)),
-                reading(tf(s.lang, "line.address", &[("listen", &s.listen)])),
-                reading(tf(
-                    s.lang,
-                    "line.strategy",
-                    &[("strategy", &s.mode.label(s.lang))],
-                )),
-                reading(tf(s.lang, "line.dns", &[("state", dns_line(s))])),
-            ],
+            rows: status,
         },
         Section {
             title: t(s.lang, "section.counters").into(),
@@ -1970,6 +2053,135 @@ mod tests {
             // interface and its tests already refer to.
             assert_eq!(titles[4], t(lang, "update.section"));
         }
+    }
+
+    /// **The environment channel must be visible without a console.**
+    ///
+    /// `Occupied` is the honest and correct refusal — somebody else's variables are not ours to
+    /// overwrite — but it means the applications that read *only* those variables are not being
+    /// reached, and until 2026-09-07 it reached an `eprintln!` in a GUI app: nothing on screen,
+    /// nothing in the tooltip, and a tray icon still saying "Protection on".
+    #[test]
+    fn an_occupied_environment_is_on_screen_and_in_the_tooltip() {
+        for lang in [Lang::Turkish, Lang::English] {
+            let s = Snapshot {
+                lang,
+                env: EnvChannel::Occupied,
+                ..snap()
+            };
+            let status = &full_view(&s)[0];
+            let text = status
+                .rows
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains(t(lang, "env.occupied")),
+                "the details window must say it: {text}"
+            );
+            assert!(
+                tooltip(&s).contains(t(lang, "env.occupied_short")),
+                "and so must the tooltip — in the length Windows will actually show"
+            );
+        }
+    }
+
+    /// And the ordinary states must not shout. An alarm that is always on is not an alarm.
+    #[test]
+    fn a_healthy_environment_adds_nothing_to_the_tooltip() {
+        for env in [EnvChannel::Ours, EnvChannel::Clear] {
+            let quiet = Snapshot {
+                env: env.clone(),
+                ..snap()
+            };
+            assert_eq!(
+                tooltip(&quiet),
+                tooltip(&Snapshot {
+                    env: EnvChannel::default(),
+                    ..snap()
+                }),
+                "{env:?} is not news"
+            );
+            // But it is still stated where somebody looking for it will find it.
+            let status = &full_view(&quiet)[0];
+            assert!(status
+                .rows
+                .iter()
+                .any(|r| r.text.contains(&env.line(quiet.lang))));
+        }
+    }
+
+    /// A failed write says **why**, because "the variables are not set" and "the variables could
+    /// not be set" are different problems with different answers. The reason goes where there is
+    /// room for it — the tooltip has 127 characters and carries the alarm alone.
+    #[test]
+    fn a_failed_environment_write_carries_its_reason() {
+        let s = Snapshot {
+            env: EnvChannel::Failed("access denied".into()),
+            ..snap()
+        };
+        let status = &full_view(&s)[0];
+        assert!(
+            status.rows.iter().any(|r| r.text.contains("access denied")),
+            "the details window is where the reason belongs"
+        );
+        assert!(
+            tooltip(&s).contains(t(s.lang, "env.failed_short")),
+            "and the tooltip still raises it"
+        );
+    }
+
+    /// **The strand that reads as `Idle`.**
+    ///
+    /// `engaged` is an exact compare against our own listen address, so a machine left pointing at
+    /// the scanner's `:1085` — or at a previous run on another port — showed as merely off, with
+    /// the menu politely offering to engage and nothing saying the machine may have no internet.
+    #[test]
+    fn a_vigil_on_another_port_is_named_where_a_user_will_see_it() {
+        for lang in [Lang::Turkish, Lang::English] {
+            let s = Snapshot {
+                lang,
+                engaged: false,
+                other_listener: Some("127.0.0.1:1085".into()),
+                ..snap()
+            };
+            let status = &full_view(&s)[0];
+            assert!(
+                status
+                    .rows
+                    .iter()
+                    .any(|r| r.text.contains("127.0.0.1:1085")),
+                "the address is the whole point — a warning without it cannot be acted on"
+            );
+            assert!(
+                tooltip(&s).contains("127.0.0.1:1085"),
+                "{lang:?}: the address must survive the tooltip's 127-character limit"
+            );
+
+            // And it is absent when there is nothing to warn about.
+            let clean = Snapshot {
+                other_listener: None,
+                ..s.clone()
+            };
+            assert!(!full_view(&clean)[0]
+                .rows
+                .iter()
+                .any(|r| r.text.contains("1085")));
+        }
+    }
+
+    /// It does **not** claim `Stranded`. That word means "the system points at *us* and we are not
+    /// listening", which is a fact; whether something is listening on the other port is not known
+    /// here, and a scanner running its own proxy for three minutes is not a broken machine.
+    #[test]
+    fn another_vigils_address_is_reported_without_being_diagnosed() {
+        let s = Snapshot {
+            engaged: false,
+            other_listener: Some("127.0.0.1:1085".into()),
+            ..snap()
+        };
+        assert_eq!(Health::of(&s), Health::Idle);
     }
 
     #[test]

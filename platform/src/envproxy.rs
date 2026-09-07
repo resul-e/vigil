@@ -202,16 +202,61 @@ pub enum Stop {
     NotOurs,
 }
 
-pub fn start(current: &EnvProxy, listen: &str) -> Start {
-    if points_at_us(current, listen) {
-        return Start::AlreadyEngaged;
+/// Exactly our address, by the same comparison [`points_at_us`] makes.
+fn is_ours(v: &Option<String>, want: &str) -> bool {
+    v.as_deref()
+        .is_some_and(|s| s.trim().trim_end_matches('/') == want)
+}
+
+/// The snapshot with our own leftovers removed.
+///
+/// **A snapshot must never carry our own address.** Restoring it points the machine at a listener
+/// that is not running, which is the 2026-08-06 failure written into the environment instead of the
+/// registry. The registry half has had this rule since that night; this half did not, because it
+/// could not reach the `Engage` arm while any one variable was ours.
+fn without_us(current: &EnvProxy, want: &str) -> EnvProxy {
+    let keep = |v: &Option<String>| if is_ours(v, want) { None } else { v.clone() };
+    EnvProxy {
+        http: keep(&current.http),
+        https: keep(&current.https),
+        all: keep(&current.all),
+        // Our own `NO_PROXY` goes too, and only when it is ours verbatim: a user who extended the
+        // list has a value of their own and it is theirs to keep.
+        no_proxy: match current.no_proxy.as_deref() {
+            Some(v) if v == NO_PROXY_VALUE => None,
+            other => other.map(str::to_string),
+        },
     }
-    if belongs_to_someone_else(current, listen) {
+}
+
+pub fn start(current: &EnvProxy, listen: &str) -> Start {
+    let url = url_for(listen);
+    let want = url.trim_end_matches('/');
+
+    // Foreign first, and that order is the fix. A machine can carry one of our own leftovers *and*
+    // somebody else's variable at once; `points_at_us` is an **any**, so that state read as
+    // `AlreadyEngaged` — which both hid the foreign value and left our leftover in place.
+    if [&current.http, &current.https, &current.all]
+        .iter()
+        .any(|v| v.is_some() && !is_ours(v, want))
+    {
         return Start::Occupied;
     }
+
+    // `AlreadyEngaged` means the three proxy variables are **exactly** what [`ours`] writes, and
+    // that includes `HTTP_PROXY` being absent. It used to mean "any one of them is our address",
+    // and the cost was measured: the build of 2026-08-06 wrote `HTTP_PROXY`, a machine that still
+    // has it short-circuited engage, nothing was written, and `HTTPS_PROXY`/`ALL_PROXY` were never
+    // set at all. `HTTP_PROXY` alone stalls Discord at five processes with 0/3 to the gateway — so
+    // engaging left the machine in the one state that is worse than not engaging, and only `stop()`
+    // could clear it.
+    if current.http.is_none() && is_ours(&current.https, want) && is_ours(&current.all, want) {
+        return Start::AlreadyEngaged;
+    }
+
     Start::Engage {
         apply: ours(listen),
-        snapshot: current.clone(),
+        snapshot: without_us(current, want),
     }
 }
 
@@ -340,7 +385,11 @@ mod tests {
     }
 
     /// But it must still be *managed*: a machine that has it set from the build that shipped
-    /// it stays broken until something clears it, and engaging is what clears it.
+    /// it stays broken until something clears it, and **engaging is what clears it**.
+    ///
+    /// This test asserted `AlreadyEngaged` until 2026-09-07 — it was named for the behaviour it
+    /// wanted and pinned the behaviour it had, which is worse than having no test, because the
+    /// suite stayed green over a machine that engaging could not repair.
     #[test]
     fn an_http_proxy_left_by_an_older_build_is_recognised_and_cleared() {
         let stale = EnvProxy {
@@ -350,12 +399,63 @@ mod tests {
             no_proxy: Some(NO_PROXY_VALUE.into()),
         };
         assert!(points_at_us(&stale, LISTEN), "it is still our own setting");
-        assert_eq!(start(&stale, LISTEN), Start::AlreadyEngaged);
+        match start(&stale, LISTEN) {
+            Start::Engage { apply, snapshot } => {
+                assert_eq!(apply, ours(LISTEN));
+                assert_eq!(apply.http, None, "engaging deletes it");
+                assert!(
+                    snapshot.is_empty(),
+                    "and never records our own address as the user's: {snapshot:?}"
+                );
+            }
+            other => panic!("a stale HTTP_PROXY must be cleared by engaging, got {other:?}"),
+        }
         assert!(
             NAMES.contains(&"HTTP_PROXY"),
             "it has to stay on the managed list"
         );
         assert_eq!(ours(LISTEN).pairs()[0], ("HTTP_PROXY", None));
+    }
+
+    /// The same defect at its smallest: `HTTP_PROXY` alone, nothing else set.
+    ///
+    /// This is the state a 2026-08-06 build leaves after a restore that only half ran, and it is
+    /// the state in which vigil looks engaged and reaches nothing: the one variable that is set is
+    /// the one measured to stall Discord, and the two that would have worked are absent.
+    #[test]
+    fn a_lone_stale_http_proxy_is_engaged_over_and_not_remembered() {
+        let stale = EnvProxy {
+            http: Some(url_for(LISTEN)),
+            ..EnvProxy::default()
+        };
+        match start(&stale, LISTEN) {
+            Start::Engage { apply, snapshot } => {
+                assert_eq!(apply.http, None);
+                assert_eq!(apply.https, ours(LISTEN).https);
+                assert_eq!(apply.all, ours(LISTEN).all);
+                assert_eq!(
+                    snapshot.http, None,
+                    "restoring it would re-break the machine"
+                );
+            }
+            other => panic!("expected Engage, got {other:?}"),
+        }
+    }
+
+    /// One of ours and one of theirs at the same time is **theirs**.
+    ///
+    /// It used to be `AlreadyEngaged`, on the strength of our own leftover — so a corporate
+    /// `HTTPS_PROXY` beside a stale `HTTP_PROXY` of ours was reported as an engaged vigil, and
+    /// neither value was touched or shown.
+    #[test]
+    fn our_leftover_beside_someone_elses_value_is_not_ours() {
+        let mixed = EnvProxy {
+            http: Some(url_for(LISTEN)),
+            https: Some("http://proxy.corp.local:8080".into()),
+            ..EnvProxy::default()
+        };
+        assert!(points_at_us(&mixed, LISTEN), "one of them is still ours");
+        assert_eq!(start(&mixed, LISTEN), Start::Occupied);
     }
 
     /// The one thing a client must never do is send `localhost` through us.

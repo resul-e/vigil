@@ -84,6 +84,122 @@ pub struct HostFacts {
     pub resolvers: Vec<(String, String)>,
 }
 
+/// What Discord's **current** updater log says, in four lines.
+///
+/// **`SquirrelSetup.log` is the wrong log**, and it was the only one this file read. Measured
+/// 2026-09-07 on a stock install: the host updater is `app-1.0.9256/updater.node` (a Rust
+/// `reqwest 0.11.9` / `hyper 0.14` binary, dated 2026-08-31) and it writes
+/// `%APPDATA%\discord\logs\Discord_updater_r*.log` — 2 699 lines on that machine, `SquirrelSetup.log`
+/// carrying nothing about any of it. Every attempt logs the request and then its outcome, so this
+/// file answers, retroactively and for every launch a person ever made, the question no measurement
+/// of ours can reach: **when the updater talked to `updates.discord.com`, what came back?**
+///
+/// Four rows, because four is what decides something:
+/// - the last request, which names the endpoint actually used;
+/// - what happened *after* it — and a request with nothing after it is the interesting case, since
+///   `reqwest 0.11.9` defaults to no request timeout and no connect timeout, so a swallowed flight
+///   is an infinite wait rather than an error;
+/// - the distribution of failure kinds over the whole file (`ConnectionReset` is a reset,
+///   `TimedOut` is an unACKed drop, `UnexpectedEof` is a proxy closing the tunnel) — a distribution
+///   rather than a last value, because one line is one observation;
+/// - the last version actually installed, which dates every "it used to work" against a build.
+///
+/// Pure, so it is tested on Linux against real log text. The caller scrubs.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn updater_log_digest(text: &str) -> Vec<(String, String)> {
+    /// Long enough to carry a URL and a failure kind, short enough for a report column.
+    const WIDTH: usize = 150;
+    fn clip(s: &str) -> String {
+        let t = s.trim();
+        if t.chars().count() <= WIDTH {
+            return t.to_string();
+        }
+        t.chars().take(WIDTH - 1).chain(['…']).collect()
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+
+    let last_request = lines
+        .iter()
+        .rposition(|l| l.contains("Requesting manifest"))
+        .map(|i| (i, lines[i]));
+
+    match last_request {
+        Some((i, line)) => {
+            out.push(("son istek".into(), clip(line)));
+            // The first line after it that says how it ended. Anything else in between is the
+            // updater talking to its own database, which decides nothing.
+            let outcome = lines[i + 1..].iter().find(|l| {
+                l.contains("Already up to date")
+                    || l.contains("Failed")
+                    || l.contains("Host to be installed")
+                    || l.contains("Downloading")
+                    || l.contains("Update to latest complete")
+            });
+            out.push((
+                "sonuc".into(),
+                match outcome {
+                    Some(l) => clip(l),
+                    // The shape that matters: the request went out and the file ends.
+                    None => "CEVAP YOK — istek gonderildi ve bu dosyada sonrasi yok".into(),
+                },
+            ));
+        }
+        None => out.push((
+            "son istek".into(),
+            "yok — bu gunlukte hic manifest istegi gecmiyor".into(),
+        )),
+    }
+
+    // `kind: X` over the whole file. One failure is an anecdote; the distribution is evidence.
+    let mut kinds: Vec<(String, usize)> = Vec::new();
+    for line in &lines {
+        let mut rest = *line;
+        while let Some(at) = rest.find("kind: ") {
+            rest = &rest[at + "kind: ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            match kinds.iter_mut().find(|(k, _)| *k == name) {
+                Some((_, n)) => *n += 1,
+                None => kinds.push((name, 1)),
+            }
+        }
+    }
+    kinds.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out.push((
+        "hata cesitleri".into(),
+        if kinds.is_empty() {
+            "yok".into()
+        } else {
+            kinds
+                .iter()
+                .map(|(k, n)| format!("{k} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    ));
+
+    if let Some(v) = lines
+        .iter()
+        .rev()
+        .find_map(|l| l.split("HostVersionTriple(").nth(1))
+        .and_then(|r| r.split(')').next())
+    {
+        out.push((
+            "kurulan surum".into(),
+            v.split(',').map(|p| p.trim()).collect::<Vec<_>>().join("."),
+        ));
+    }
+
+    out
+}
+
 /// The `chromiumSwitches` value out of Discord's `settings.json`, as text.
 ///
 /// **Electron's only proxy override.** It ships no policy engine — `policy_service()` returns
@@ -537,6 +653,34 @@ mod imp {
             ));
         }
         let p = profile();
+
+        // **The log that answers the question, read before the one that does not.**
+        // `SquirrelSetup.log` is the *installer's* log; the running host updater is `updater.node`
+        // and it writes here. Until 2026-09-07 this section printed only the installer's, so a
+        // report could say nothing at all about what `updates.discord.com` answered — the one
+        // exchange that gates Discord's startup.
+        if let Ok(roaming) = std::env::var("APPDATA") {
+            let log = std::path::Path::new(&roaming)
+                .join("discord")
+                .join("logs")
+                .join("Discord_updater_rCURRENT.log");
+            match std::fs::read_to_string(&log) {
+                Ok(text) => {
+                    out.push((
+                        "Discord_updater_rCURRENT.log".into(),
+                        format!("var, {} satir", text.lines().count()),
+                    ));
+                    for (k, v) in super::updater_log_digest(&text) {
+                        out.push((format!("  {k}"), scrub(&v, p.as_deref())));
+                    }
+                }
+                Err(_) => out.push((
+                    "Discord_updater_rCURRENT.log".into(),
+                    "yok (guncelleyici hic calismamis olabilir)".into(),
+                )),
+            }
+        }
+
         for log in ["SquirrelSetup.log", "SquirrelTemp\\SquirrelSetup.log"] {
             let path = root.join(log);
             if let Ok(text) = std::fs::read_to_string(&path) {
@@ -562,14 +706,24 @@ mod imp {
                             t.contains("SKIP_MODULE_UPDATE")
                         ),
                     ));
-                    // **`chromiumSwitches` is the only proxy override Electron has.**
+                    // **`chromiumSwitches` explains a direct Electron; it cannot redirect one.**
                     //
                     // Electron ships no policy engine at all — `policy_service()` returns
-                    // `nullptr` — so the Chromium command line in this file is the one place a
-                    // Discord install can be told to ignore Windows' proxy setting, or to use a
-                    // different one. `--no-proxy-server`, `--proxy-server=…`, `--proxy-bypass-list`
-                    // and `--host-resolver-rules` all live here, and any of them explains "the
-                    // setting was in force and Electron went direct anyway" without a driver.
+                    // `nullptr` — so this file is the only proxy knob *inside* the installed app.
+                    // But read the bundle before treating it as a remedy. Measured 2026-09-07 in
+                    // `app-1.0.9256/resources/app.asar`: the list is taken as `Object.keys()` for
+                    // the object form, filtered by `0 !== validSwitches[s]` — which passes every
+                    // unknown key, since `undefined !== 0` — and then handed to
+                    // `app.commandLine.appendSwitch(s)` **with one argument**. The value is
+                    // dropped. `{"proxy-server": "http://127.0.0.1:1080"}` reaches Chromium as a
+                    // bare `--proxy-server`, so nothing here can ever name vigil.
+                    //
+                    // That makes it diagnostic and only diagnostic: a `--no-proxy-server`, or a
+                    // valueless `--proxy-server` that Chromium may read as "fixed servers: none",
+                    // is a standing explanation for "the setting was in force and Electron went
+                    // direct anyway" — with no driver, and no fix available on this channel. The
+                    // channel that *can* carry a value is the command line of the shortcut
+                    // (`Update.exe --process-start-args`), which is step 7a of the plan.
                     //
                     // The value is quoted verbatim rather than summarised: this is a switch list a
                     // person typed, it is short, and guessing which parts matter is how a report
@@ -759,6 +913,95 @@ mod tests {
             scrub(s, Some(r"C:\Users\resul")),
             r"%USERPROFILE%\AppData\Local\Discord and %USERPROFILE%\x"
         );
+    }
+
+    /// Real lines, copied from a stock install's `Discord_updater_rCURRENT.log` on 2026-09-07.
+    const HEALTHY: &str = concat!(
+        "[2026-09-06 23:32:47.265853 +03:00] INFO [updater_client::db]: Opening installer database (exclusive: true, caller: update_to_latest).\n",
+        "[2026-09-06 23:32:47.266376 +03:00] INFO [updater_client::install]: Requesting manifest for HostIdentifier { name: APP, release_channel: STABLE, platform: WIN, arch: X64 }, from \"https://updates.discord.com/\"\n",
+        "[2026-09-06 23:32:47.531929 +03:00] INFO [updater_client::install]: hosts_req_modules_installed: true\n",
+        "[2026-09-06 23:32:47.532184 +03:00] INFO [updater_client::install]: Already up to date. Nothing to do.\n",
+    );
+
+    /// **The shape the whole row exists for**: the request went out and the file ends there.
+    /// `reqwest 0.11.9` has no default request or connect timeout, so this is an infinite wait —
+    /// a Discord that sits on its logo screen with no error and no countdown.
+    #[test]
+    fn a_request_that_never_came_back_is_named_and_not_left_blank() {
+        let hanging = HEALTHY.lines().take(2).collect::<Vec<_>>().join("\n");
+        let rows = updater_log_digest(&hanging);
+        let outcome = &rows
+            .iter()
+            .find(|(k, _)| k == "sonuc")
+            .expect("a verdict")
+            .1;
+        assert!(
+            outcome.contains("CEVAP YOK"),
+            "silence must be stated, not omitted: {outcome}"
+        );
+        // And the healthy file must not read as silence, or the row says nothing.
+        let ok = updater_log_digest(HEALTHY);
+        let ok_outcome = &ok.iter().find(|(k, _)| k == "sonuc").expect("a verdict").1;
+        assert!(ok_outcome.contains("Already up to date"), "{ok_outcome}");
+    }
+
+    /// A distribution, not a last value: one failure is an anecdote, and the kinds mean different
+    /// mechanisms — `ConnectionReset` is a reset, `TimedOut` an unACKed drop, `UnexpectedEof` a
+    /// proxy closing the tunnel.
+    #[test]
+    fn failure_kinds_are_counted_over_the_whole_file() {
+        let failing = concat!(
+            "[..] INFO [updater_client::install]: Requesting manifest for HostIdentifier { }, from \"https://updates.discord.com/\"\n",
+            "[..] ERROR [updater_client]: Failed 1: Other(Reqwest(reqwest::Error { kind: Request, source: Custom { kind: UnexpectedEof } }))\n",
+            "[..] ERROR [updater_client]: Failed 2: Other(Reqwest(reqwest::Error { kind: Request, source: Os { kind: TimedOut } }))\n",
+        );
+        let rows = updater_log_digest(failing);
+        let kinds = &rows
+            .iter()
+            .find(|(k, _)| k == "hata cesitleri")
+            .expect("kinds")
+            .1;
+        assert!(kinds.contains("Request 2"), "{kinds}");
+        assert!(kinds.contains("UnexpectedEof 1"), "{kinds}");
+        assert!(kinds.contains("TimedOut 1"), "{kinds}");
+        // The outcome row must find the failure, not walk past it.
+        let outcome = &rows
+            .iter()
+            .find(|(k, _)| k == "sonuc")
+            .expect("a verdict")
+            .1;
+        assert!(outcome.contains("Failed 1"), "{outcome}");
+    }
+
+    /// The version dates every "it used to work" against a build. Discord shipped a new
+    /// `updater.node` on 2026-08-31, so "then" and "now" can be two different programs.
+    #[test]
+    fn the_installed_version_is_pulled_out_when_the_log_has_one() {
+        let with_version = concat!(
+            "[..] INFO [updater_client::install]: Host to be installed: HostVersionTriple(1, 0, 9256)\n",
+            "[..] INFO [updater_client::install]: Requesting manifest, from \"https://updates.discord.com/\"\n",
+            "[..] INFO [updater_client::install]: Already up to date. Nothing to do.\n",
+        );
+        let rows = updater_log_digest(with_version);
+        assert_eq!(
+            rows.iter()
+                .find(|(k, _)| k == "kurulan surum")
+                .map(|(_, v)| v.as_str()),
+            Some("1.0.9256")
+        );
+        // Absent rather than invented when the log does not carry one.
+        assert!(updater_log_digest(HEALTHY)
+            .iter()
+            .all(|(k, _)| k != "kurulan surum"));
+    }
+
+    /// A log with nothing in it must say so rather than produce empty rows a reader fills in.
+    #[test]
+    fn a_log_with_no_request_in_it_says_that() {
+        let rows =
+            updater_log_digest("[..] INFO [updater_client::db]: Opened installer database.\n");
+        let first = &rows.iter().find(|(k, _)| k == "son istek").expect("row").1;
+        assert!(first.contains("hic manifest istegi gecmiyor"), "{first}");
     }
 
     #[test]

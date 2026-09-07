@@ -150,6 +150,16 @@ pub const STRINGS: &[Entry] = &[
     Entry { key: "dns.stopped_while_in_use",  tr: "DNS DURDU — Windows hâlâ bizi gösteriyor",
                                               en: "DNS HAS STOPPED — Windows still points at us" },
 
+    Entry { key: "env.clear",                 tr: "ayarlanmadı",                 en: "not set" },
+    Entry { key: "env.failed",                tr: "YAZILAMADI ({{error}})",      en: "COULD NOT BE WRITTEN ({{error}})" },
+    Entry { key: "env.failed_short",          tr: "ORTAM DEĞİŞKENLERİ YAZILAMADI",
+                                              en: "ENVIRONMENT VARIABLES FAILED" },
+    Entry { key: "env.occupied",              tr: "BAŞKASINA AİT — vigil dokunmadı, proxy ayarını okumayan programlara ulaşılamıyor",
+                                              en: "BELONGS TO SOMETHING ELSE — vigil left them alone, so programs that ignore the proxy setting are not reached" },
+    Entry { key: "env.occupied_short",        tr: "ORTAM DEĞİŞKENLERİ BİZDE DEĞİL",
+                                              en: "ENVIRONMENT VARIABLES NOT OURS" },
+    Entry { key: "env.ours",                  tr: "vigil'i gösteriyor",          en: "pointed at vigil" },
+
     Entry { key: "err.autostart",             tr: "Windows ile başlatma ayarlanamadı:\n{{error}}",
                                               en: "Could not set start-with-Windows:\n{{error}}" },
     Entry { key: "err.dns",                   tr: "DNS ayarlanamadı:\n{{error}}",
@@ -169,7 +179,13 @@ pub const STRINGS: &[Entry] = &[
 
     Entry { key: "line.address",              tr: "Adres: {{listen}}",           en: "Address: {{listen}}" },
     Entry { key: "line.dns",                  tr: "DNS: {{state}}",              en: "DNS: {{state}}" },
+    Entry { key: "line.env",                  tr: "Ortam değişkenleri: {{state}}",
+                                              en: "Environment variables: {{state}}" },
     Entry { key: "line.learned_row",          tr: "{{host}} → {{strategy}}",     en: "{{host}} → {{strategy}}" },
+    Entry { key: "line.other_listener",       tr: "SORUN: sistem proxy'si başka bir vigil'i gösteriyor ({{addr}}) — orada dinleyen yoksa internet yok",
+                                              en: "PROBLEM: the system proxy points at another vigil ({{addr}}) — if nothing listens there, there is no internet" },
+    Entry { key: "line.other_listener_short", tr: "SORUN: sistem {{addr}} gösteriyor",
+                                              en: "PROBLEM: system points at {{addr}}" },
     Entry { key: "line.strategy",             tr: "Strateji: {{strategy}}",      en: "Strategy: {{strategy}}" },
 
     Entry { key: "menu.autostart",            tr: "Windows ile başlat",          en: "Start with Windows" },

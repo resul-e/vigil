@@ -6,7 +6,7 @@
 
 use vigil_core::{Tally, Verdict};
 
-use crate::dns::{integrity, selectively_blocked, Comparison, Integrity};
+use crate::dns::{self, integrity, selectively_blocked, Comparison, Integrity};
 use crate::plan::{Cell, Phase};
 
 #[derive(Debug, Clone)]
@@ -157,6 +157,10 @@ pub struct Context {
     /// `hostdiag::warning`, for the case where Windows' proxy setting is not actually in force
     /// and every application verdict below it would therefore be misread.
     pub host_warning: String,
+    /// What each interface is configured to ask, and whether DHCP chose it. Supplied by the caller
+    /// so this module stays pure. Empty when it could not be read — which the DNS section says
+    /// rather than treating as reassurance.
+    pub resolvers: Vec<crate::dns::Configured>,
 }
 
 fn bar(width: usize) -> String {
@@ -215,6 +219,15 @@ pub fn render(ctx: &Context, results: &[CellResult], dns: &[Comparison]) -> Stri
         s.push_str(&bar(78));
         s.push('\n');
         s.push_str("What the system resolver said, against public resolvers asked directly.\n");
+        // **Whether the verdict column is about this line at all.**
+        //
+        // Measured 2026-09-07, same machine minutes apart: with Windows' own DoH enabled this
+        // section read `discord.com  ok  system=162.159.138.232`, and with it off,
+        // `discord.com  TAMPERED  system=195.175.254.2`. The column is about the operating
+        // system's resolver, and a machine bypassing its own says nothing about the provider —
+        // while looking exactly like a clean line.
+        s.push_str(&dns::provenance_line(&ctx.resolvers, dns));
+        s.push('\n');
         for c in dns {
             let verdict = match integrity(c) {
                 Integrity::Agrees => "ok",
@@ -232,17 +245,36 @@ pub fn render(ctx: &Context, results: &[CellResult], dns: &[Comparison]) -> Stri
                     sys.join(",")
                 }
             ));
-            for (name, r) in &c.public {
-                let got = match r {
-                    Ok(a) => a
+            for a in &c.public {
+                let got = match &a.got {
+                    Ok(v) => v
                         .iter()
                         .map(|x| x.to_string())
                         .collect::<Vec<_>>()
                         .join(","),
+                    // The layer, not a shrug. `<tls: ...>` and `<http 403>` say the resolver was
+                    // reached and refused us; `<no reply>` says nothing came back at all. Those
+                    // were the same string until 2026-09-07.
                     Err(e) => format!("<{e}>"),
                 };
-                s.push_str(&format!("      {name:<12} {got}\n"));
+                s.push_str(&format!("      {:<14} {got}\n", a.name));
             }
+            // **A transport that was never asked must say so.** An absent row reads as a clean
+            // sheet, and the guard this protects is the one written after `77.88.8.1:1253` shipped
+            // for the life of the project without appearing in a single report.
+            for (name, up) in dns::public_upstreams() {
+                if !c.public.iter().any(|a| a.via == up) {
+                    s.push_str(&format!("      {name:<14} <never asked>\n"));
+                }
+            }
+        }
+        // **Per transport, and never one combined number.** "the resolvers answered 47 of 60" says
+        // nothing about whether the transport this line is being asked to adopt works at all.
+        for t in dns::tally(dns) {
+            s.push_str(&format!(
+                "  transport {:<4} answered {}/{}  (timeout {} tls {} http {})\n",
+                t.transport, t.answered, t.asked, t.timeout, t.tls, t.http
+            ));
         }
         s.push('\n');
     }
@@ -488,6 +520,43 @@ mod tests {
         t
     }
 
+    /// **A transport that was never asked says so, in the row where its answer would have been.**
+    ///
+    /// An absent row reads as a clean sheet. That is the shape of the defect this guard exists
+    /// for: `77.88.8.1:1253` shipped for the life of the project and appeared in no report, and
+    /// nothing said it was missing because nothing was there to say it.
+    #[test]
+    fn a_transport_that_was_never_asked_is_named_in_the_report() {
+        let dns = vec![Comparison {
+            host: "example.com".into(),
+            system: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                93, 184, 216, 34,
+            ))],
+            public: vec![crate::dns::Answer {
+                name: "yandex:1253".into(),
+                via: vigil_proxy::resolver::Upstream::Udp(
+                    "77.88.8.8:1253".parse().expect("literal"),
+                ),
+                got: Ok(vec![std::net::Ipv4Addr::new(93, 184, 216, 34)]),
+            }],
+            adapter: None,
+        }];
+        let text = render(&Context::default(), &[], &dns);
+        assert!(
+            text.contains("doh:1.1.1.1") && text.contains("<never asked>"),
+            "a missing transport must be named, not silently absent:\n{text}"
+        );
+        // And a transport that *was* asked must not get a placeholder as well.
+        assert_eq!(
+            text.matches("<never asked>").count(),
+            crate::dns::public_upstreams().len() - 1,
+            "one placeholder per transport that was not asked, and no more"
+        );
+        // The per-transport totals are printed, and separately.
+        assert!(text.contains("transport doh"), "{text}");
+        assert!(text.contains("transport udp"), "{text}");
+    }
+
     fn cell(phase: Phase, host: &str) -> Cell {
         Cell {
             phase,
@@ -710,6 +779,7 @@ mod tests {
             platform: "p".into(),
             network: "n".into(),
             host_warning: String::new(),
+            resolvers: Vec::new(),
         };
         assert_eq!(render(&ctx, &rs, &[]), render(&ctx, &rs, &[]));
 

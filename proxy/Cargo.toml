@@ -17,3 +17,17 @@ path = "src/lib.rs"
 vigil-core = { path = "../core" }
 # Pure on Linux (the registry calls are cfg(windows) stubs), so the proxy still tests in WSL.
 vigil-platform = { path = "../platform" }
+# **The tax, paid deliberately on 2026-09-07.** DoH needs TLS, and the resolver lives here, so
+# rustls reaches `vigil.exe` and `vigil-app.exe` — about 2 MB each. `update/tests/dependency_isolation.rs`
+# was written to keep exactly this out of the application, and its rule was changed rather than
+# routed around: the reason it gave was "the updater's weight", and a resolver that still works when
+# the odd-port trick dies is not the updater's weight, it is the product. The two alternatives were
+# weighed and rejected in docs/10-v6-plan.md — a separate process puts an IPC hop in the hot path of
+# every connection, and SChannel costs the Linux test loop the whole discipline rests on.
+#
+# No `features` list on purpose: `probe` depends on this crate, so any feature named here reaches
+# every `probe` build, and asking for `ring` beside the workspace's `aws-lc-rs` compiles both
+# providers and makes the auto-detecting `ClientConfig::builder()` panic at runtime.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+webpki-roots.workspace = true

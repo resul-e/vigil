@@ -93,6 +93,8 @@ pub struct DnsStats {
     pub empty: AtomicUsize,
     /// Packets refused: not from loopback, or not a question we will answer.
     pub refused: AtomicUsize,
+    /// Type-65 questions handed to an upstream instead of being answered NODATA.
+    pub forwarded: AtomicUsize,
     /// Set when [`DnsServer::serve`] returns, for any reason.
     ///
     /// The tray used to compute "DNS is being served" once, at bind time, and never look again —
@@ -347,6 +349,26 @@ impl DnsServer {
                 }
             }
         }
+        // **HTTPS/SVCB is forwarded, not answered.**
+        //
+        // Measured 2026-09-07: `1.1.1.1` answers `cloudflare.com`/65 with a real record and vigil
+        // answered NODATA — and NODATA is not "I did not look", it is *"this name has no HTTPS
+        // record"*. A browser told that turns ECH off and loses whatever else the SVCB record was
+        // advertising. So on any machine with the DNS option ticked, vigil was removing ECH from
+        // every name. This branch stops that; it does not add anything.
+        //
+        // Only type 65, and only IN. AAAA and the rest keep NODATA: forwarding AAAA would make
+        // vigil dual-stack and `is_block_page` has no IPv6 list, so a poisoned AAAA would go
+        // straight through.
+        if q.qtype == dnsmsg::TYPE_HTTPS && q.qclass == dnsmsg::CLASS_IN {
+            self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
+            if let Some(answer) = self.resolver.forward(query, &q) {
+                self.stats.answered.fetch_add(1, Ordering::Relaxed);
+                return Some(answer);
+            }
+            // Nothing came back. Answer exactly what this server answered before the feature
+            // existed — the fallback is today's behaviour at today's cost.
+        }
         // Anything that is not an internet A question gets NODATA: the name may well exist,
         // we simply have no record of that kind. NXDOMAIN here would make Windows stop asking
         // for the A record too, and the name would go dark on a machine we are fixing.
@@ -480,6 +502,43 @@ mod tests {
             vec![Ipv4Addr::new(127, 0, 0, 1)]
         );
         assert_eq!(s.stats.answered.load(Ordering::Relaxed), 1);
+    }
+
+    /// **A type-65 question is forwarded; an AAAA question is not.**
+    ///
+    /// With no upstreams both come back NODATA, so the *answer* cannot tell the two apart — only
+    /// the counter can. That is what makes the AAAA half of this non-vacuous: a change that
+    /// forwarded AAAA too would leave every assertion about the reply green.
+    ///
+    /// Forwarding AAAA would also make vigil dual-stack, and `is_block_page` has no IPv6 list.
+    #[test]
+    fn an_https_question_is_forwarded_and_an_aaaa_question_is_not() {
+        let s = server();
+        let https =
+            dnsmsg::encode_query_type("cloudflare.com", 7, dnsmsg::TYPE_HTTPS).expect("encodes");
+        let reply = s.answer(&https).expect("an answer");
+        assert_eq!(s.stats.forwarded.load(Ordering::Relaxed), 1);
+        // No upstream, so it falls back to exactly what it answered before the feature existed.
+        assert_eq!(
+            reply[3] & 0x0F,
+            dnsmsg::RCODE_NOERROR,
+            "NODATA, not NXDOMAIN"
+        );
+        assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 0, "no answers");
+
+        let aaaa =
+            dnsmsg::encode_query_type("cloudflare.com", 8, dnsmsg::TYPE_AAAA).expect("encodes");
+        let reply = s.answer(&aaaa).expect("an answer");
+        assert_eq!(
+            s.stats.forwarded.load(Ordering::Relaxed),
+            1,
+            "AAAA must not be forwarded — only the counter can see this"
+        );
+        assert_eq!(reply[3] & 0x0F, dnsmsg::RCODE_NOERROR);
+
+        let a = dnsmsg::encode_query("cloudflare.com", 9).expect("encodes");
+        let _ = s.answer(&a);
+        assert_eq!(s.stats.forwarded.load(Ordering::Relaxed), 1, "nor A");
     }
 
     /// The AAAA question, which is the one that decides whether a machine keeps working.

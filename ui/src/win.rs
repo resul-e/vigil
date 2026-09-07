@@ -450,6 +450,18 @@ struct App {
     /// Whether Windows' own resolver is pointed at us. Cached rather than read per refresh: the
     /// tray refreshes once a second, and this only changes when the user asks it to.
     dns_engaged: bool,
+    /// What happened to the environment variables the last time engaging was attempted. Cached
+    /// for the same reason `engaged` is: it changes when the user acts, not once a second.
+    ///
+    /// It used to go to `eprintln!` and nowhere else, which in a program with no console is the
+    /// same as not computing it — and the state it hides, `Occupied`, is precisely "the channel
+    /// Roblox and the Discord updater depend on is not ours" under an icon that says everything
+    /// is fine.
+    env: model::EnvChannel,
+    /// A vigil-shaped loopback address in the system proxy that is **not ours** — the scanner's
+    /// `:1085`, or a run that moved off 1080. Read at startup and after every engage, because it
+    /// is a startup-shaped problem: it is what a previous process left behind.
+    other_listener: Option<String>,
 }
 
 thread_local! {
@@ -498,6 +510,8 @@ impl App {
             first_flight_retries: self.stats.first_flight_retries.load(Relaxed),
             dns_serving: self.dns.as_ref().is_some_and(|d| d.serving()),
             dns_engaged: self.dns_engaged,
+            env: self.env.clone(),
+            other_listener: self.other_listener.clone(),
             by_socks5: self.stats.by_socks5.load(Relaxed),
             by_socks4: self.stats.by_socks4.load(Relaxed),
             by_http_connect: self.stats.by_http_connect.load(Relaxed),
@@ -1027,37 +1041,74 @@ fn engage(on: bool, listen: &str) -> Result<(), String> {
         (engage_env(on, listen), r)
     };
     // Both are reported, but the registry's failure is the one that decides the outcome: it
-    // is what the interface's engaged/stranded state is read from.
-    match (&r, env) {
-        (_, Err(e)) => eprintln!("environment proxy: {e}"),
-        (_, Ok(())) => {}
+    // is what the interface's engaged/stranded state is read from. The environment half is no
+    // longer *only* printed — a tray app has no console, so `eprintln!` was the same as silence.
+    if let model::EnvChannel::Failed(e) = &env {
+        eprintln!("environment proxy: {e}");
     }
+    set_env_channel(env);
+    refresh_other_listener(listen);
     r
+}
+
+fn set_env_channel(v: model::EnvChannel) {
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.env = v;
+        }
+    });
+}
+
+/// Is the system proxy naming a vigil that is not this one?
+///
+/// Read here rather than in `snapshot()`: the tray paints once a second and this changes when
+/// somebody acts, which is the same rule `engaged` and `dns_engaged` already follow.
+fn other_vigil_setting(listen: &str) -> Option<String> {
+    let current = vigil_platform::registry::read_current().ok()?;
+    let addr = vigil_platform::sysproxy::our_address(&current)?;
+    (addr != listen).then(|| addr.to_string())
+}
+
+fn refresh_other_listener(listen: &str) {
+    let found = other_vigil_setting(listen);
+    APP.with(|a| {
+        if let Some(app) = a.borrow_mut().as_mut() {
+            app.other_listener = found;
+        }
+    });
 }
 
 /// The curl-convention variables, which are how applications that ignore the system proxy are
 /// reached. Measured 2026-08-05: the Roblox client opens five direct sockets and none to the
 /// proxy with the registry setting alone, and 64 to the proxy with these set.
-fn engage_env(on: bool, listen: &str) -> Result<(), String> {
+fn engage_env(on: bool, listen: &str) -> model::EnvChannel {
+    use model::EnvChannel;
     use vigil_platform::{envproxy, envreg, paths};
-    let current = envreg::read_current().map_err(|x| x.to_string())?;
+    let current = match envreg::read_current() {
+        Ok(c) => c,
+        Err(e) => return EnvChannel::Failed(e.to_string()),
+    };
     if on {
         match envproxy::start(&current, listen) {
-            envproxy::Start::AlreadyEngaged => Ok(()),
+            envproxy::Start::AlreadyEngaged => EnvChannel::Ours,
             // Somebody else's proxy variables. Overwriting them would break whatever set them
             // — a corporate policy, or the user's own tooling — so vigil stays out and says so.
-            envproxy::Start::Occupied => {
-                Err("HTTP_PROXY is already set by something else; left alone".to_string())
-            }
+            // Saying so is the part that was missing: the applications this channel exists for
+            // are not being reached, and the rest of the interface reads as healthy.
+            envproxy::Start::Occupied => EnvChannel::Occupied,
             envproxy::Start::Engage { apply, snapshot } => {
                 if let Some(p) = paths::env_snapshot() {
                     if let Some(d) = p.parent() {
                         let _ = std::fs::create_dir_all(d);
                     }
-                    std::fs::write(&p, envproxy::snapshot_to_text(&snapshot))
-                        .map_err(|x| x.to_string())?;
+                    if let Err(e) = std::fs::write(&p, envproxy::snapshot_to_text(&snapshot)) {
+                        return EnvChannel::Failed(e.to_string());
+                    }
                 }
-                envreg::apply(&apply).map_err(|x| x.to_string())
+                match envreg::apply(&apply) {
+                    Ok(()) => EnvChannel::Ours,
+                    Err(e) => EnvChannel::Failed(e.to_string()),
+                }
             }
         }
     } else {
@@ -1065,14 +1116,16 @@ fn engage_env(on: bool, listen: &str) -> Result<(), String> {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|t| envproxy::snapshot_from_text(&t));
         match envproxy::stop(&current, snap.as_ref(), listen) {
-            envproxy::Stop::NotOurs => Ok(()),
-            envproxy::Stop::Restore(s) => {
-                envreg::apply(&s).map_err(|x| x.to_string())?;
-                if let Some(p) = paths::env_snapshot() {
-                    let _ = std::fs::remove_file(p);
+            envproxy::Stop::NotOurs => EnvChannel::Clear,
+            envproxy::Stop::Restore(s) => match envreg::apply(&s) {
+                Ok(()) => {
+                    if let Some(p) = paths::env_snapshot() {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    EnvChannel::Clear
                 }
-                Ok(())
-            }
+                Err(e) => EnvChannel::Failed(e.to_string()),
+            },
         }
     }
 }
@@ -1635,6 +1688,10 @@ pub fn run() {
         let engaged = vigil_platform::registry::read_current()
             .map(|c| vigil_platform::sysproxy::points_at_us(&c, &actual))
             .unwrap_or(false);
+        // Read here for the same reason `engaged` is: a machine that boots pointing at a vigil on
+        // another port was left that way by a previous process, so startup is exactly when it is
+        // true and exactly when nobody is looking.
+        let other_listener = other_vigil_setting(&actual);
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
@@ -1660,6 +1717,10 @@ pub fn run() {
                 // quit and hand that adapter back to DHCP. The tray must not claim an engagement
                 // it has no record of and therefore cannot undo.
                 dns_engaged: read_back_dns_engaged().unwrap_or(false),
+                // Nothing has been attempted yet, and saying "occupied" before trying would be a
+                // guess. The first engage fills it in.
+                env: model::EnvChannel::default(),
+                other_listener,
             })
         });
 

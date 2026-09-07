@@ -59,11 +59,26 @@ impl core::fmt::Display for Error {
     }
 }
 
+/// HTTPS/SVCB. **Carries the ECH parameter**, and vigil's own DNS server answers it with NODATA
+/// today — which is not "we did not look", it is "this name has no HTTPS record", and a browser
+/// told that turns ECH off.
+pub const TYPE_HTTPS: u16 = 65;
+
 /// Build a standard recursive A query for `host`.
 ///
 /// `id` is supplied rather than generated so the encoder stays pure and a golden test can
 /// pin the exact bytes.
 pub fn encode_query(host: &str, id: u16) -> Result<Vec<u8>, Error> {
+    encode_query_type(host, id, TYPE_A)
+}
+
+/// The same, for any question type.
+///
+/// Separate because nothing on Windows can ask a type-65 question: `nslookup`'s type table has no
+/// `HTTPS`, and PowerShell's `Resolve-DnsName` refuses the number — measured 2026-09-07, it lists
+/// its accepted values and 65 is not among them. So the only way to find out what a resolver says
+/// about an HTTPS record on this machine is to build the query here.
+pub fn encode_query_type(host: &str, id: u16, qtype: u16) -> Result<Vec<u8>, Error> {
     if host.is_empty() || host.len() > 253 {
         return Err(Error::BadName);
     }
@@ -81,7 +96,7 @@ pub fn encode_query(host: &str, id: u16) -> Result<Vec<u8>, Error> {
         q.extend_from_slice(label.as_bytes());
     }
     q.push(0); // root
-    q.extend_from_slice(&[0x00, 0x01]); // A
+    q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0x00, 0x01]); // IN
     Ok(q)
 }
@@ -200,6 +215,176 @@ pub const CLASS_IN: u16 = 1;
 pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_SERVFAIL: u8 = 2;
 
+/// EDNS(0)'s pseudo-record. **Its TTL field is not a TTL** — it carries EXTENDED-RCODE, VERSION,
+/// the DO bit and Z (RFC 6891 §6.1.3) — so anything that walks records rewriting TTLs has to skip
+/// it or it corrupts the flags into a duration.
+pub const TYPE_OPT: u16 = 41;
+
+/// Put a different id on a message already on the wire.
+///
+/// `Err` under two bytes rather than a panic: this runs on whatever a resolver sent back.
+pub fn set_id(buf: &mut [u8], id: u16) -> Result<(), Error> {
+    let head = buf.get_mut(..2).ok_or(Error::Malformed)?;
+    head.copy_from_slice(&id.to_be_bytes());
+    Ok(())
+}
+
+/// Is this response an answer to **this** question, safe to hand back unchanged?
+///
+/// **Not `parse_question`**, and that is the landmine on this path: `parse_question` refuses a
+/// message with QR set, because it exists to read *queries*. Everything here has QR set. So the
+/// question is read at offset 12 by hand.
+///
+/// `TC` is refused: a truncated answer is a *partial* SvcParams set, and forwarding one as complete
+/// is worse than not forwarding at all — a browser would act on half a record.
+pub fn validate_response(buf: &[u8], expected_id: u16, q: &Question) -> Result<(), Error> {
+    if buf.len() < 12 {
+        return Err(Error::Malformed);
+    }
+    if u16::from_be_bytes([buf[0], buf[1]]) != expected_id {
+        return Err(Error::Malformed);
+    }
+    if buf[2] & 0x80 == 0 {
+        return Err(Error::Malformed); // not a response
+    }
+    if buf[2] & 0x02 != 0 {
+        return Err(Error::Malformed); // truncated
+    }
+    match buf[3] & 0x0F {
+        0 | 3 => {}
+        // The server answered about itself, not about the name. Same distinction the A path draws.
+        _ => return Err(Error::SoftFailure),
+    }
+    if u16::from_be_bytes([buf[4], buf[5]]) != 1 {
+        return Err(Error::Malformed);
+    }
+    // The echoed question, read by hand because the response has QR set.
+    let mut name = String::new();
+    let mut at = 12usize;
+    loop {
+        let len = *buf.get(at).ok_or(Error::Malformed)? as usize;
+        if len & 0xC0 != 0 {
+            return Err(Error::Malformed);
+        }
+        at += 1;
+        if len == 0 {
+            break;
+        }
+        if len > 63 || name.len() + len > 253 {
+            return Err(Error::BadName);
+        }
+        let label = buf.get(at..at + len).ok_or(Error::Malformed)?;
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(&String::from_utf8_lossy(label).to_ascii_lowercase());
+        at += len;
+    }
+    let tail = buf.get(at..at + 4).ok_or(Error::Malformed)?;
+    if name != q.name
+        || u16::from_be_bytes([tail[0], tail[1]]) != q.qtype
+        || u16::from_be_bytes([tail[2], tail[3]]) != q.qclass
+    {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
+/// Cap every record's TTL at `max`, in place, without touching anything else.
+///
+/// **`min`, never assignment**: a TTL of 0 means "do not cache this" and raising it to `max` would
+/// be inventing a promise the origin refused to make.
+///
+/// **`TYPE_OPT` is skipped**, because its TTL field is not a TTL.
+///
+/// Compression pointers and record data are never rewritten, so an `ech` SvcParam survives by
+/// construction — this function moves four bytes per record and nothing else.
+pub fn clamp_ttls(buf: &mut [u8], max: u32) -> Result<(), Error> {
+    if buf.len() < 12 {
+        return Err(Error::Malformed);
+    }
+    let qd = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let records = (u16::from_be_bytes([buf[6], buf[7]]) as usize)
+        + (u16::from_be_bytes([buf[8], buf[9]]) as usize)
+        + (u16::from_be_bytes([buf[10], buf[11]]) as usize);
+
+    let mut at = 12usize;
+    for _ in 0..qd {
+        at = skip_name(buf, at)?;
+        at = at.checked_add(4).ok_or(Error::Malformed)?;
+        if at > buf.len() {
+            return Err(Error::Malformed);
+        }
+    }
+    for _ in 0..records {
+        at = skip_name(buf, at)?;
+        // type(2) class(2) ttl(4) rdlength(2)
+        let head = buf.get(at..at + 10).ok_or(Error::Malformed)?;
+        let rtype = u16::from_be_bytes([head[0], head[1]]);
+        let rdlen = u16::from_be_bytes([head[8], head[9]]) as usize;
+        if rtype != TYPE_OPT {
+            let ttl = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+            let capped = ttl.min(max);
+            if capped != ttl {
+                buf[at + 4..at + 8].copy_from_slice(&capped.to_be_bytes());
+            }
+        }
+        at = at
+            .checked_add(10 + rdlen)
+            .filter(|end| *end <= buf.len())
+            .ok_or(Error::Malformed)?;
+    }
+    Ok(())
+}
+
+/// Make an upstream's response safe to hand to the client that asked.
+///
+/// **The order is the whole function.** Validate against the id the *upstream* was asked with,
+/// then put the client's id on, then clamp. Validating after restoring the id checks the message
+/// against an id it was never sent with, which is no check at all.
+pub fn rewrite_forwarded(
+    buf: &mut [u8],
+    upstream_id: u16,
+    client_id: u16,
+    q: &Question,
+    max_ttl: u32,
+) -> Result<(), Error> {
+    validate_response(buf, upstream_id, q)?;
+    set_id(buf, client_id)?;
+    clamp_ttls(buf, max_ttl)
+}
+
+/// The SvcParamKeys in an HTTPS/SVCB record's rdata, in order.
+///
+/// Only for looking: it proves a fixture really carries key 5 (`ech`) rather than being assumed to,
+/// and it lets an instrument say what a record contained. Nothing rewrites these.
+pub fn https_svcparam_keys(rdata: &[u8]) -> Result<Vec<u16>, Error> {
+    // priority(2), then an uncompressed TargetName, then (key, len, value) triples.
+    let mut at = 2usize;
+    loop {
+        let len = *rdata.get(at).ok_or(Error::Malformed)? as usize;
+        if len & 0xC0 != 0 {
+            return Err(Error::Malformed); // no compression in SVCB TargetName
+        }
+        at += 1;
+        if len == 0 {
+            break;
+        }
+        at = at.checked_add(len).ok_or(Error::Malformed)?;
+    }
+    let mut keys = Vec::new();
+    while at < rdata.len() {
+        let head = rdata.get(at..at + 4).ok_or(Error::Malformed)?;
+        keys.push(u16::from_be_bytes([head[0], head[1]]));
+        let vlen = u16::from_be_bytes([head[2], head[3]]) as usize;
+        at = at
+            .checked_add(4 + vlen)
+            .filter(|end| *end <= rdata.len())
+            .ok_or(Error::Malformed)?;
+    }
+    Ok(keys)
+}
+
 /// Read the question out of a query.
 ///
 /// Refuses compression pointers in a *question*: no real client sends one — there is nothing
@@ -302,6 +487,205 @@ pub fn encode_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------- forwarding type 65
+
+    /// A hand-built HTTPS/SVCB response with all four sections, an **`ech` parameter**, and an
+    /// EDNS OPT record whose TTL field is not a TTL.
+    ///
+    /// Offsets, computed by hand and asserted below so a mistake here cannot pass quietly:
+    ///   12   question `cloudflare.com` / 65 / IN, 16 name bytes + 4 = 20 -> ends at 32
+    ///   32   AN  ptr(2) type(2) class(2) TTL@38 rdlen@42 rdata@44..86   (rdlen 42)
+    ///   86   NS  ptr(2) type(2) class(2) TTL@92 rdlen@96 rdata@98..100
+    ///  100   AR  A   ptr(2) type(2) class(2) TTL@106 rdlen@110 rdata@112..116
+    ///  116   AR  OPT root(1) type(2) class(2) "TTL"@121 rdlen@125 -> ends at 127
+    fn https_fixture() -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(&[0x00, 0x00]); // id 0 — what a DoH query sends
+        b.extend_from_slice(&[0x81, 0x80]); // QR, RD, RA, rcode 0
+        b.extend_from_slice(&[0x00, 0x01]); // qd 1
+        b.extend_from_slice(&[0x00, 0x01]); // an 1
+        b.extend_from_slice(&[0x00, 0x01]); // ns 1
+        b.extend_from_slice(&[0x00, 0x02]); // ar 2 (an A, and the OPT)
+        b.extend_from_slice(b"\x0acloudflare\x03com\x00");
+        b.extend_from_slice(&[0x00, 0x41, 0x00, 0x01]); // type 65, IN
+
+        // AN: the HTTPS record.
+        let mut rdata: Vec<u8> = vec![0x00, 0x01, 0x00]; // priority 1, TargetName "."
+        rdata.extend_from_slice(&[0x00, 0x01, 0x00, 0x03, 0x02, b'h', b'2']); // key 1 alpn
+        rdata.extend_from_slice(&[0x00, 0x05, 0x00, 0x10]); // key 5 ech, 16 bytes
+        rdata.extend_from_slice(&[0xAA; 16]);
+        rdata.extend_from_slice(&[0x00, 0x04, 0x00, 0x08]); // key 4 ipv4hint
+        rdata.extend_from_slice(&[104, 16, 132, 229, 104, 16, 133, 229]);
+        b.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x41, 0x00, 0x01]);
+        b.extend_from_slice(&[0x00, 0x00, 0x0E, 0x10]); // ttl 3600
+        b.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        b.extend_from_slice(&rdata);
+
+        // NS, so the walk has to leave the answer section.
+        b.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x02, 0x00, 0x01]);
+        b.extend_from_slice(&[0x00, 0x00, 0x0E, 0x10]); // ttl 3600
+        b.extend_from_slice(&[0x00, 0x02, 0xC0, 0x0C]);
+
+        // AR: an A record, and then the OPT.
+        b.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+        b.extend_from_slice(&[0x00, 0x00, 0x0E, 0x10]); // ttl 3600
+        b.extend_from_slice(&[0x00, 0x04, 104, 16, 132, 229]);
+        b.extend_from_slice(&[0x00]); // OPT name is root
+        b.extend_from_slice(&[0x00, 0x29, 0x10, 0x00]); // type 41, "class" = 4096 udp size
+        b.extend_from_slice(&[0x00, 0x00, 0x80, 0x00]); // EXTENDED-RCODE|VERSION|DO — NOT a ttl
+        b.extend_from_slice(&[0x00, 0x00]); // rdlen 0
+        b
+    }
+
+    fn https_question() -> Question {
+        Question {
+            id: 0,
+            name: "cloudflare.com".into(),
+            qtype: TYPE_HTTPS,
+            qclass: CLASS_IN,
+            end: 32,
+            recursion_desired: true,
+        }
+    }
+
+    /// **The record is forwarded intact, only the id and the TTLs move — and the OPT is left
+    /// alone.**
+    ///
+    /// The expected bytes are a *second* copy patched at hand-computed offsets rather than
+    /// anything derived from the function under test, so a builder that is wrong in the same way
+    /// cannot cancel out. It catches, and this list is the reason each part is here: a wrong TTL
+    /// offset; a walk that stops after the answer section (the NS and AR TTLs would stay 3600 and
+    /// the stranded-cache defence would be quietly gone for them); the OPT not being skipped
+    /// (`00 00 80 00` would become `00 00 00 3C`, turning EDNS flags into a duration); and any
+    /// byte of rdata being touched, which would break `ech`.
+    #[test]
+    fn a_forwarded_https_record_keeps_its_ech_and_loses_only_its_ttls() {
+        let mut got = https_fixture();
+
+        // The offsets this test is written against, asserted rather than trusted.
+        assert_eq!(&got[34..36], &[0x00, 0x41], "AN type at 34");
+        assert_eq!(&got[38..42], &[0x00, 0x00, 0x0E, 0x10], "AN ttl at 38");
+        assert_eq!(&got[92..96], &[0x00, 0x00, 0x0E, 0x10], "NS ttl at 92");
+        assert_eq!(&got[106..110], &[0x00, 0x00, 0x0E, 0x10], "AR A ttl at 106");
+        assert_eq!(&got[117..119], &[0x00, 0x29], "OPT type at 117");
+        assert_eq!(
+            &got[121..125],
+            &[0x00, 0x00, 0x80, 0x00],
+            "OPT flags at 121"
+        );
+        assert_eq!(got.len(), 127);
+
+        // The fixture is *proven* to carry ech rather than assumed to.
+        let rdlen = u16::from_be_bytes([got[42], got[43]]) as usize;
+        assert_eq!(
+            https_svcparam_keys(&got[44..44 + rdlen]).expect("parses"),
+            vec![1, 5, 4],
+            "alpn, ech, ipv4hint — in the order the record carries them"
+        );
+
+        let mut want = https_fixture();
+        want[0..2].copy_from_slice(&[0xBE, 0xEF]);
+        for at in [38usize, 92, 106] {
+            want[at..at + 4].copy_from_slice(&60u32.to_be_bytes());
+        }
+
+        rewrite_forwarded(&mut got, 0, 0xBEEF, &https_question(), 60).expect("rewrites");
+        assert_eq!(got, want, "only the id and the three real TTLs may move");
+    }
+
+    /// A TTL of zero means "do not cache this" and must survive a clamp, because raising it would
+    /// invent a promise the origin refused to make.
+    #[test]
+    fn clamping_never_raises_a_ttl() {
+        let mut b = https_fixture();
+        b[38..42].copy_from_slice(&0u32.to_be_bytes());
+        clamp_ttls(&mut b, 60).expect("clamps");
+        assert_eq!(&b[38..42], &[0, 0, 0, 0]);
+    }
+
+    /// Each refusal by variant. `Malformed` and `SoftFailure` are different answers to the caller:
+    /// one is "this is not our answer", the other is "the server spoke about itself".
+    #[test]
+    fn a_response_that_is_not_ours_is_refused() {
+        let q = https_question();
+
+        let mut truncated = https_fixture();
+        truncated[2] |= 0x02;
+        assert_eq!(
+            validate_response(&truncated, 0, &q),
+            Err(Error::Malformed),
+            "a truncated answer is a partial SvcParams set"
+        );
+
+        // The id is checked against what the *upstream* was asked with. This is the arm that
+        // catches "validated after restoring the client's id".
+        let wrong_id = https_fixture();
+        assert_eq!(
+            validate_response(&wrong_id, 0x1234, &q),
+            Err(Error::Malformed)
+        );
+
+        let mut not_a_response = https_fixture();
+        not_a_response[2] &= !0x80;
+        assert_eq!(
+            validate_response(&not_a_response, 0, &q),
+            Err(Error::Malformed)
+        );
+
+        let mut servfail = https_fixture();
+        servfail[3] = (servfail[3] & 0xF0) | 2;
+        assert_eq!(validate_response(&servfail, 0, &q), Err(Error::SoftFailure));
+
+        // NXDOMAIN is an answer about the name and is allowed through.
+        let mut nxdomain = https_fixture();
+        nxdomain[3] = (nxdomain[3] & 0xF0) | 3;
+        assert_eq!(validate_response(&nxdomain, 0, &q), Ok(()));
+
+        // A different question entirely.
+        let other = Question {
+            name: "example.com".into(),
+            ..https_question()
+        };
+        assert_eq!(
+            validate_response(&https_fixture(), 0, &other),
+            Err(Error::Malformed)
+        );
+        let other_type = Question {
+            qtype: TYPE_A,
+            ..https_question()
+        };
+        assert_eq!(
+            validate_response(&https_fixture(), 0, &other_type),
+            Err(Error::Malformed),
+            "an A answer is not an answer to a type-65 question"
+        );
+    }
+
+    /// Every one of these runs on whatever a resolver sent back, so none may panic.
+    #[test]
+    fn the_forwarding_helpers_never_panic() {
+        let full = https_fixture();
+        for i in 0..full.len() {
+            let mut prefix = full[..i].to_vec();
+            let _ = validate_response(&prefix, 0, &https_question());
+            let _ = clamp_ttls(&mut prefix, 60);
+            let _ = set_id(&mut prefix, 1);
+            let _ = https_svcparam_keys(&prefix);
+        }
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for _ in 0..2000 {
+            let mut b = full.clone();
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let at = (seed >> 33) as usize % b.len();
+            b[at] ^= 0xFF;
+            let _ = validate_response(&b, 0, &https_question());
+            let _ = clamp_ttls(&mut b, 60);
+            let _ = https_svcparam_keys(&b);
+        }
+        assert!(set_id(&mut [], 1).is_err());
+        assert!(set_id(&mut [0], 1).is_err());
+    }
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)

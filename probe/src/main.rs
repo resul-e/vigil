@@ -7,6 +7,7 @@
 //! Usage:  probe [trials] [small|default] [--via HOST:PORT]
 
 mod attempt;
+mod doh;
 mod profile;
 mod socks_client;
 
@@ -30,6 +31,11 @@ fn strategies() -> Vec<(&'static str, SplitPoint)> {
 }
 
 fn main() {
+    // `probe doh ...` — the DoH reachability sweep. A subcommand rather than a flag because it
+    // shares none of the run below: different targets, different arms, different verdict.
+    if std::env::args().nth(1).as_deref() == Some("doh") {
+        std::process::exit(doh_main());
+    }
     let trials: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -179,5 +185,61 @@ fn main() {
             );
         }
         std::process::exit(1);
+    }
+}
+
+/// `probe doh [ip,ip,...] [--n N] [--name HOST] [--control IP]`
+///
+/// Defaults are the three resolvers whose certificates are expected to carry IP SANs, with the
+/// fourth held back as the control: **a candidate may never vouch for itself.**
+fn doh_main() -> i32 {
+    let args: Vec<String> = std::env::args().collect();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let candidates: Vec<std::net::IpAddr> = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| {
+            ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        });
+    if candidates.is_empty() {
+        eprintln!("probe doh: no usable candidate address");
+        return 2;
+    }
+    let control: std::net::IpAddr = match flag("--control") {
+        Some(s) => match s.parse() {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("--control needs an IP address");
+                return 2;
+            }
+        },
+        None => "77.88.8.8".parse().expect("literal"),
+    };
+    if candidates.contains(&control) {
+        eprintln!("the control is one of the candidates: a candidate may not vouch for itself");
+        return 2;
+    }
+    let n: usize = flag("--n")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MIN_TRIALS);
+    if n < MIN_TRIALS {
+        eprintln!("refusing {n} trials: the minimum is {MIN_TRIALS}");
+        return 2;
+    }
+    let name = flag("--name").unwrap_or_else(|| "discord.com".to_string());
+
+    if doh::sweep(&candidates, control, n, &name) {
+        0
+    } else {
+        1
     }
 }

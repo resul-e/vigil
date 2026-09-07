@@ -134,6 +134,23 @@ pub fn looks_like_our_own_writing(s: &ProxySettings) -> bool {
     loopback && *s == settings_for(addr)
 }
 
+/// The one address in a setting **vigil itself wrote**, whichever of its listeners wrote it.
+///
+/// The interface needs this and not [`points_at_us`]. `points_at_us` is an exact compare against
+/// *this* process's listen address, so a machine left pointing at the scanner's `:1085` — or at a
+/// previous run that moved off 1080 because something held it — reads as plain `Idle`, and the menu
+/// offers to engage over it without a word about a machine that may have no internet. `vigil-repair`
+/// has always caught that case through [`is_stranded`]; the tray never did.
+///
+/// Narrow on purpose, because [`looks_like_our_own_writing`] is: a value that is *nearly* ours
+/// belongs to somebody else and saying otherwise is how a user's own proxy gets blamed.
+pub fn our_address(s: &ProxySettings) -> Option<&str> {
+    if !looks_like_our_own_writing(s) {
+        return None;
+    }
+    addresses(&s.server).next()
+}
+
 /// A machine is left broken when the proxy is enabled and points somewhere nothing listens.
 ///
 /// **Deliberately a prefix test, and no longer the same function as [`points_at_us`].** The repair
@@ -216,6 +233,43 @@ mod tests {
                  this is exactly the inversion that made primitive_dpibypassapp useless"
             );
         }
+    }
+
+    /// **The strand the interface could not see.**
+    ///
+    /// Our own address on our own port, our own address on *another* port, and somebody else's
+    /// local proxy — three states the tray read as two, because `engaged` is an exact compare and
+    /// everything that was not it was "off".
+    #[test]
+    fn our_own_writing_is_recognised_on_any_port_and_nobody_elses_is() {
+        assert_eq!(
+            our_address(&settings_for("127.0.0.1:1080")),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            our_address(&settings_for("127.0.0.1:1085")),
+            Some("127.0.0.1:1085"),
+            "the scanner's port is still a vigil, and still ours to warn about"
+        );
+
+        // Somebody else's local proxy: the address is loopback and nothing else matches.
+        let theirs = ProxySettings {
+            enabled: true,
+            server: "127.0.0.1:7890".into(),
+            bypass: "localhost".into(),
+        };
+        assert_eq!(
+            our_address(&theirs),
+            None,
+            "a value that is nearly ours is somebody else's"
+        );
+
+        // A leftover that is switched off routes nothing, so it is not a strand.
+        let off = ProxySettings {
+            enabled: false,
+            ..settings_for("127.0.0.1:1080")
+        };
+        assert_eq!(our_address(&off), None);
     }
 
     #[test]

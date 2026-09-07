@@ -107,16 +107,47 @@ fn the_committed_manifest_parses_and_is_internally_consistent() {
     });
 }
 
-/// The base URL must point at the release for *this* version, or the client downloads the previous
+/// **Every file the manifest carries must fit the download deadline.**
+///
+/// The deadline is `MAX_FILE_BYTES / FLOOR_BYTES_PER_SEC`, and this is the other half of that
+/// arithmetic: the constant bounds what a file *may* be, and this asserts what the files *are*.
+/// Without it the bound is a number in a comment and a release could ship a file nobody on a slow
+/// line could finish — and never fix it, because the code that performs an apply is always the old
+/// version's code.
+#[test]
+fn every_file_in_the_committed_manifest_fits_the_body_deadline() {
+    let Some(text) = manifest_text() else { return };
+    let m = manifest::parse(&text).expect("parses");
+    for f in &m.files {
+        assert!(
+            f.size <= vigil_update::fetch::MAX_FILE_BYTES,
+            "{} is {} B, over the {} B a single file may be — the download deadline is sized \
+             from that constant and would no longer cover it",
+            f.name,
+            f.size,
+            vigil_update::fetch::MAX_FILE_BYTES
+        );
+    }
+}
+
+/// The base URL must point at **this version's** payload, or the client downloads the previous
 /// release's binaries and every hash fails.
+///
+/// Since 2026-09-07 the payload lives under its own `-payload` tag, so that the release a person
+/// opens carries four files instead of twelve. Both spellings are accepted here on purpose: the
+/// tag is a publishing decision, the version in it is the correctness one, and pinning the exact
+/// tag would turn a future change of that decision into a red test rather than a review.
 #[test]
 fn the_base_url_names_this_versions_release() {
     let Some(text) = manifest_text() else { return };
     let m = manifest::parse(&text).expect("parses");
+    let plain = format!("/v{}/", m.version);
+    let payload = format!("/v{}-payload/", m.version);
     assert!(
-        m.base.ends_with(&format!("/v{}/", m.version)),
-        "base {:?} does not name v{}",
+        m.base.ends_with(&plain) || m.base.ends_with(&payload),
+        "base {:?} names neither v{} nor v{}-payload",
         m.base,
+        m.version,
         m.version
     );
     assert!(m

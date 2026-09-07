@@ -34,8 +34,32 @@ const MEMBERS: &[(&str, &str)] = &[
     ("vigil-update", include_str!("../../update/Cargo.toml")),
 ];
 
-/// The crates that must not be reachable from a binary every user runs.
-const FORBIDDEN: &[&str] = &["vigil-update", "rustls", "minisign-verify"];
+/// **Exactly** what the safety net is allowed to reach.
+///
+/// An allowlist and not a forbidden list. A forbidden list is the set of things somebody
+/// remembered; this is the set that is true. `vigil-repair.exe` is built from `platform/` and is
+/// what gets a machine's internet back when everything else has gone wrong — it must stay small
+/// and it must keep building when nothing else does.
+///
+/// The byte size is *not* asserted by this: the `windows` crate's feature list can grow the binary
+/// with this set unchanged. That number belongs to the release gate.
+const SAFETY_NET_MAY_REACH: &[&str] = &["windows", "winreg"];
+
+/// The crates that may name rustls as a **direct** dependency.
+///
+/// Three doors, and no fourth. `vigil-ui` and `vigil-scan` reach TLS through `vigil-proxy` — that
+/// is the intended path since the tax was paid on 2026-09-07 — but a fourth crate naming rustls
+/// itself would be somebody writing a fifth TLS loop, and this project already has three.
+const RUSTLS_DOORS: &[&str] = &["probe", "vigil-proxy", "vigil-update"];
+
+/// The crates that may name the signature verifier. One, and there is no argument for a second.
+///
+/// The rule this file replaced listed `minisign-verify` among the forbidden names, and the
+/// replacement nearly dropped it: the new rules covered the safety net exactly and rustls by door,
+/// and nothing would have caught a `minisign-verify` added to `proxy/`, which reaches
+/// `vigil-app.exe`. Noticed while writing the mutations for the new rules, which is what mutations
+/// are for.
+const MINISIGN_DOORS: &[&str] = &["vigil-update"];
 
 /// Direct dependencies of one manifest: both `name = { path = ... }` and `name = "1.2"` /
 /// `name.workspace = true` forms, from every `[dependencies]`-family table.
@@ -51,7 +75,22 @@ fn direct_deps(manifest: &str) -> BTreeSet<String> {
         }
         if line.starts_with('[') {
             // `[dependencies]`, `[dev-dependencies]`, `[target.'cfg(windows)'.dependencies]`, …
-            in_deps = line.contains("dependencies]");
+            let header = line.trim_start_matches('[').trim_end_matches(']').trim();
+            in_deps = header.ends_with("dependencies");
+            // **Cargo's dotted-table form, invisible here until 2026-09-07.**
+            //
+            // `[dependencies.rustls]` followed by `workspace = true` is exactly equivalent to
+            // `rustls.workspace = true`, and this parser walked straight past it: the old test was
+            // `line.contains("dependencies]")`, which is false for `[dependencies.rustls]` — so the
+            // crate was never recorded *and* the section was closed, hiding everything after it
+            // too. Every mutation anybody would think to write uses the one form the parser saw,
+            // which is how a guard stays green whether or not it works.
+            if let Some((_, name)) = header.rsplit_once("dependencies.") {
+                let name = name.trim().trim_matches('"');
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            }
             continue;
         }
         if !in_deps {
@@ -95,6 +134,11 @@ fn reachable(g: &BTreeMap<String, BTreeSet<String>>, root: &str) -> BTreeSet<Str
 fn the_manifests_parse_into_the_graph_we_expect() {
     let g = graph();
     assert!(
+        g["vigil-proxy"].contains("rustls"),
+        "the tax was paid on 2026-09-07: {:?}",
+        g["vigil-proxy"]
+    );
+    assert!(
         g["vigil-update"].contains("rustls") && g["vigil-update"].contains("minisign-verify"),
         "update should link both: {:?}",
         g["vigil-update"]
@@ -108,39 +152,159 @@ fn the_manifests_parse_into_the_graph_we_expect() {
     );
 }
 
-/// **`vigil-app.exe` and `vigil-repair.exe` must not link rustls, minisign, or the updater.**
+/// **The safety net reaches exactly two crates, and they are Windows API bindings.**
 ///
-/// `vigil-repair.exe` is the safety net — the thing that gets a machine's internet back when
-/// everything else has gone wrong — and `vigil-app.exe` is what every user runs. Neither has any
-/// business carrying a TLS stack or a signature verifier.
+/// `vigil-repair.exe` is built from `platform/`. Asserted as an exact set rather than as an
+/// absence of known-bad names: the day somebody adds a TLS stack, a logging framework or an
+/// async runtime to `platform/`, this goes red without anybody having predicted that particular
+/// crate. The old version could only refuse the three names it had been told about.
 #[test]
-fn the_shipped_gui_and_the_safety_net_do_not_reach_the_updater() {
+fn the_safety_net_reaches_exactly_what_it_is_allowed_to() {
     let g = graph();
-    for crate_name in ["vigil-ui", "vigil-platform"] {
-        let r = reachable(&g, crate_name);
-        for bad in FORBIDDEN {
-            assert!(
-                !r.contains(*bad),
-                "{crate_name} reaches {bad}. That is what `update/Cargo.toml`, `update/src/lib.rs` \
-                 and docs/18-auto-update.md all promise it does not — vigil-app.exe and \
-                 vigil-repair.exe are built from it. Reached: {r:?}"
-            );
-        }
+    let got = reachable(&g, "vigil-platform");
+    let want: BTreeSet<String> = SAFETY_NET_MAY_REACH.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        got, want,
+        "vigil-repair.exe is built from platform/ and is the thing that gets a machine's internet \
+         back. Its dependency set changed."
+    );
+}
+
+/// **The updater is reachable from nothing but itself.**
+///
+/// One assertion over every member, so a single mutation names every crate it reaches rather than
+/// stopping at the first. `update → proxy → platform` is the one direction this layering has;
+/// reversing it anywhere drags rustls and minisign into every binary built from that crate,
+/// including `vigil-app.exe` and `vigil-repair.exe`.
+#[test]
+fn only_the_updater_reaches_the_updater() {
+    let g = graph();
+    let offenders: Vec<&str> = MEMBERS
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| *n != "vigil-update")
+        .filter(|n| reachable(&g, n).contains("vigil-update"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these reach vigil-update: {offenders:?}. That reverses the layering and puts rustls and \
+         a signature verifier into every binary built from them."
+    );
+}
+
+/// **rustls has exactly three doors.**
+///
+/// Since 2026-09-07 `vigil-proxy` is one of them, deliberately: the resolver speaks DoH and DoH is
+/// TLS. `vigil-ui` and `vigil-scan` reach it *through* the proxy, which is the intended path and
+/// is why this checks direct dependencies rather than reachability. A fourth door would be a
+/// fourth hand-rolled TLS loop, and three is already two more than anybody wants to maintain.
+#[test]
+fn rustls_has_exactly_three_doors() {
+    let g = graph();
+    for (name, _) in MEMBERS {
+        let direct = g[*name].contains("rustls");
+        let expected = RUSTLS_DOORS.contains(name);
+        assert_eq!(
+            direct, expected,
+            "{name} names rustls directly = {direct}, expected {expected}. The doors are \
+             {RUSTLS_DOORS:?} — everything else reaches TLS through vigil-proxy."
+        );
     }
 }
 
-/// The direction is `update → proxy → platform`, never the reverse. Stated in two comments and,
-/// until now, asserted nowhere.
+/// The signature verifier has exactly one door, for the same reason rustls has three.
 #[test]
-fn nothing_below_the_updater_depends_on_it() {
+fn the_signature_verifier_has_exactly_one_door() {
     let g = graph();
-    for crate_name in ["vigil-core", "vigil-platform", "vigil-proxy"] {
-        assert!(
-            !reachable(&g, crate_name).contains("vigil-update"),
-            "{crate_name} depends on vigil-update, which reverses the one direction this layering \
-             has — and drags rustls and minisign into every binary built from it"
+    for (name, _) in MEMBERS {
+        let direct = g[*name].contains("minisign-verify");
+        let expected = MINISIGN_DOORS.contains(name);
+        assert_eq!(
+            direct, expected,
+            "{name} names minisign-verify directly = {direct}, expected {expected}"
         );
     }
+    // And nothing reaches it but the updater itself.
+    let offenders: Vec<&str> = MEMBERS
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| *n != "vigil-update")
+        .filter(|n| reachable(&g, n).contains("minisign-verify"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "these reach minisign-verify: {offenders:?}"
+    );
+}
+
+/// The parser must see Cargo's dotted-table form, or every rule above is vacuously true for
+/// anybody who writes their dependency the other way. It could not until 2026-09-07.
+#[test]
+fn the_parser_sees_cargos_dotted_table_form() {
+    let dotted = "[dependencies.rustls]\nworkspace = true\n";
+    assert!(
+        direct_deps(dotted).contains("rustls"),
+        "`[dependencies.rustls]` is exactly equivalent to `rustls.workspace = true` and must be \
+         seen as the same edge: {:?}",
+        direct_deps(dotted)
+    );
+    let targeted = "[target.'cfg(windows)'.dependencies.rustls]\nworkspace = true\n";
+    assert!(
+        direct_deps(targeted).contains("rustls"),
+        "{:?}",
+        direct_deps(targeted)
+    );
+    // And the plain forms still work, or the fix broke what it was protecting.
+    assert!(direct_deps("[dependencies]\nrustls.workspace = true\n").contains("rustls"));
+    assert!(direct_deps("[dependencies]\nfoo = { path = \"../foo\" }\n").contains("foo"));
+    // A table that is not a dependency table must not contribute a name.
+    assert!(direct_deps("[package.metadata.rustls]\nx = 1\n").is_empty());
+}
+
+/// Every workspace member is in the graph, so a crate added tomorrow cannot be invisible to every
+/// rule above by simply not being listed.
+#[test]
+fn every_workspace_member_is_in_the_graph() {
+    let root = include_str!("../../Cargo.toml");
+    let line = root
+        .lines()
+        .find(|l| l.trim_start().starts_with("members"))
+        .expect("the workspace lists its members");
+    for member in line
+        .split('[')
+        .nth(1)
+        .unwrap_or("")
+        .trim_end_matches(']')
+        .split(',')
+    {
+        let dir = member.trim().trim_matches('"');
+        if dir.is_empty() {
+            continue;
+        }
+        assert!(
+            MEMBERS
+                .iter()
+                .any(|(_, src)| src.contains(&format!("path = \"../{dir}\""))
+                    || crate_dir_matches(dir)),
+            "workspace member {dir:?} is not represented in MEMBERS, so no rule in this file \
+             covers it"
+        );
+    }
+}
+
+/// `MEMBERS` names crates; the workspace names directories. This maps the ones that differ.
+fn crate_dir_matches(dir: &str) -> bool {
+    let want = match dir {
+        "core" => "vigil-core",
+        "platform" => "vigil-platform",
+        "probe" => "probe",
+        "proxy" => "vigil-proxy",
+        "scan" => "vigil-scan",
+        "ui" => "vigil-ui",
+        "update" => "vigil-update",
+        _ => return false,
+    };
+    MEMBERS.iter().any(|(n, _)| *n == want)
 }
 
 /// `core/` and `probe/` are required to have no OS-specific dependencies, because the fast test
